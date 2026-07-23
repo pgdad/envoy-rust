@@ -7,7 +7,8 @@
 //! Phase 04.2.
 
 use crate::bootstrap::{
-    HeaderMatcher, HeaderMatcherMode, StringMatcher, StringMatcherMode, ValueMatcher,
+    HeaderMatcher, HeaderMatcherMode, MetadataMatcher, StringMatcher, StringMatcherMode,
+    ValueMatcher,
 };
 
 impl HeaderMatcher {
@@ -66,6 +67,40 @@ impl envoy_accesslog::HeaderMatch for HeaderMatcher {
         // engine, above) priority over this trait method, so this delegates —
         // it does NOT recurse.
         self.matches(headers)
+    }
+}
+
+/// Phase 74 (ADR-0150/ADR-0155): the sole `MetadataMatch` impl — the access-log
+/// `metadata_filter` resolution engine. `envoy-accesslog` cannot see
+/// `MetadataMatcher`'s `filter`/`path` fields (it must not depend on
+/// `envoy-config` — cycle), so resolution happens HERE and only the verdict
+/// crosses the seam.
+///
+/// The MEASURED rule (SPEC §0 R-0.3/R-0.4, `envoyproxy/envoy:v1.33.0`):
+/// `resolved = dynamic_metadata[filter][path[0].key]`; unresolved → `None` (the
+/// caller applies `match_if_key_not_found`, whose measured default is `true`);
+/// resolved → `Some(value.matches(v))`, reusing the phase-35/36
+/// `ValueMatcher::matches` engine VERBATIM.
+///
+/// NB `ValueMatcher::matches_resolved` — the RBAC-path sibling — is deliberately
+/// NOT used: it maps an unresolved path to `false`, which would drop every
+/// key-absent record instead of deferring to `match_if_key_not_found`.
+///
+/// `path.first()?` (rather than `path[0]`) keeps this total: the T2 validator
+/// guarantees `path.len() == 1` for every matcher that can reach here, so an
+/// empty path is unreachable in a booted proxy, and degrading to "unresolved"
+/// beats a panic.
+impl envoy_accesslog::MetadataMatch for MetadataMatcher {
+    fn matches(
+        &self,
+        dynamic_metadata: &std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, String>,
+        >,
+    ) -> Option<bool> {
+        let key = &self.path.first()?.key;
+        let resolved = dynamic_metadata.get(&self.filter)?.get(key)?;
+        Some(self.value.matches(resolved))
     }
 }
 
@@ -485,5 +520,120 @@ mod tests {
         assert!(sm.matches_resolved(Some("prod")));
         assert!(!sm.matches_resolved(Some("dev")));
         assert!(!sm.matches_resolved(None));
+    }
+}
+
+#[cfg(test)]
+mod metadata_match_tests {
+    use crate::bootstrap::{
+        MetadataMatcher, MetadataPathSegment, StringMatcher, StringMatcherMode, ValueMatcher,
+    };
+    use envoy_accesslog::MetadataMatch;
+    use std::collections::BTreeMap;
+
+    fn store(pairs: &[(&str, &str, &str)]) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut m: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for (ns, k, v) in pairs {
+            m.entry((*ns).to_string())
+                .or_default()
+                .insert((*k).to_string(), (*v).to_string());
+        }
+        m
+    }
+
+    fn matcher(value: ValueMatcher) -> MetadataMatcher {
+        MetadataMatcher {
+            filter: "com.example".into(),
+            path: vec![MetadataPathSegment { key: "k".into() }],
+            value,
+        }
+    }
+
+    fn exact(v: &str) -> ValueMatcher {
+        ValueMatcher::StringMatch(StringMatcher {
+            mode: StringMatcherMode::Exact(v.into()),
+            ignore_case: false,
+        })
+    }
+
+    #[test]
+    fn resolution_contract_is_option_bool() {
+        let m = matcher(exact("1"));
+        // Resolved + matches → Some(true).
+        assert_eq!(m.matches(&store(&[("com.example", "k", "1")])), Some(true));
+        // Resolved + mismatch → Some(false) — NOT None. The caller must be able
+        // to distinguish "value said no" from "path did not resolve", because
+        // only the latter falls back to `match_if_key_not_found` (R-0.4).
+        assert_eq!(m.matches(&store(&[("com.example", "k", "2")])), Some(false));
+        // Missing KEY → None.
+        assert_eq!(m.matches(&store(&[("com.example", "other", "1")])), None);
+        // Missing NAMESPACE → None (MEASURED R-0.4: identical to a missing key).
+        assert_eq!(m.matches(&store(&[("com.other", "k", "1")])), None);
+        // Empty store → None.
+        assert_eq!(m.matches(&store(&[])), None);
+    }
+
+    #[test]
+    fn reuses_the_value_matcher_engine_verbatim() {
+        // Every modelled StringMatcher mode routes through ValueMatcher::matches.
+        let md = store(&[("com.example", "k", "prod-1")]);
+        let case = |mode: StringMatcherMode, ignore_case: bool| {
+            matcher(ValueMatcher::StringMatch(StringMatcher { mode, ignore_case })).matches(&md)
+        };
+        assert_eq!(
+            case(StringMatcherMode::Exact("prod-1".into()), false),
+            Some(true)
+        );
+        assert_eq!(
+            case(StringMatcherMode::Prefix("prod".into()), false),
+            Some(true)
+        );
+        assert_eq!(
+            case(StringMatcherMode::Suffix("-1".into()), false),
+            Some(true)
+        );
+        assert_eq!(
+            case(StringMatcherMode::Contains("od-".into()), false),
+            Some(true)
+        );
+        assert_eq!(
+            case(StringMatcherMode::Exact("PROD-1".into()), true),
+            Some(true)
+        );
+        assert_eq!(
+            case(StringMatcherMode::Exact("PROD-1".into()), false),
+            Some(false)
+        );
+
+        // present_match (phase-36 §A1 semantics `match = present && want`): the
+        // path RESOLVED here, so it reduces to `want`. An ABSENT key returns
+        // None and takes `match_if_key_not_found` instead (CF-74-5: the
+        // present_match composition is pinned in-process, not live-probed).
+        assert_eq!(
+            matcher(ValueMatcher::PresentMatch(true)).matches(&md),
+            Some(true)
+        );
+        assert_eq!(
+            matcher(ValueMatcher::PresentMatch(false)).matches(&md),
+            Some(false)
+        );
+        assert_eq!(
+            matcher(ValueMatcher::PresentMatch(true)).matches(&store(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_path_resolves_to_none_rather_than_panicking() {
+        // The validator guarantees `path.len() == 1` for every matcher that can
+        // reach this impl (T2), so this is unreachable in a booted proxy — but
+        // the impl uses `path.first()?` so a mis-wired caller degrades to
+        // "unresolved" rather than panicking.
+        let m = MetadataMatcher {
+            filter: "com.example".into(),
+            path: vec![],
+            value: exact("1"),
+        };
+        assert_eq!(m.matches(&store(&[("com.example", "k", "1")])), None);
     }
 }
