@@ -35,6 +35,29 @@ pub trait HeaderMatch: std::fmt::Debug + Send + Sync {
     fn matches(&self, headers: &[(String, String)]) -> bool;
 }
 
+/// Phase 74 (ADR-0150/ADR-0155): the runtime seam for the `metadata_filter` arm.
+/// Same cycle constraint as `HeaderMatch` — this crate CANNOT depend on
+/// `envoy-config`, so the resolution engine is injected as a trait object:
+/// `envoy-config` impls `MetadataMatch` for its `MetadataMatcher` (resolving
+/// `filter` → `path[0].key` and delegating to `ValueMatcher::matches` VERBATIM),
+/// and the HCM compile step in `envoy-http1` boxes it into
+/// `LogFilter::Metadata`. `Send + Sync` because sinks cross async await points.
+///
+/// **Returns `Option<bool>`, NOT `bool`.** `None` iff the metadata path did NOT
+/// resolve, so the `match_if_key_not_found` policy — which lives on the FILTER,
+/// not the matcher — stays in `LogFilter`, expressing the MEASURED rule (SPEC §0
+/// R-0.4) exactly once. Collapsing `None` into `false` (as
+/// `ValueMatcher::matches_resolved` does for the RBAC path) would DROP every
+/// key-absent record, the opposite of the measured upstream default (`true`).
+pub trait MetadataMatch: std::fmt::Debug + Send + Sync {
+    /// `None` iff the configured metadata path did not resolve; otherwise
+    /// `Some(value_matcher_verdict)`.
+    fn matches(
+        &self,
+        dynamic_metadata: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Option<bool>;
+}
+
 /// The compiled access-log filter. `None`-carrying sinks skip this type
 /// entirely (they log every record); a `Some(LogFilter)` gates emission.
 ///
@@ -61,6 +84,18 @@ pub enum LogFilter {
     And(Vec<LogFilter>),
     /// Phase 73: emit iff ANY nested child predicate matches (`or_filter`).
     Or(Vec<LogFilter>),
+    /// Phase 74: emit a record iff its DYNAMIC METADATA satisfies the matcher —
+    /// or, when the metadata path does not resolve, iff
+    /// `match_if_key_not_found`. `matcher` is `Option` because upstream ACCEPTS
+    /// a matcher-less `metadata_filter: {}` (MEASURED R-0.2), in which case
+    /// every record takes the not-found policy. `match_if_key_not_found` is
+    /// already resolved to a concrete `bool` by the compile step
+    /// (`Option<bool>::unwrap_or(true)` — the MEASURED wrapper default, R-0.4).
+    /// Introduces no `Eq`/`PartialEq` and no `envoy-config` dep (ADR-0150 holds).
+    Metadata {
+        matcher: Option<Arc<dyn MetadataMatch>>,
+        match_if_key_not_found: bool,
+    },
 }
 
 impl LogFilter {
@@ -71,12 +106,6 @@ impl LogFilter {
     /// only `headers`; the phase-74 `Metadata` arm only `dynamic_metadata`. The
     /// status comparison is widened to `u32` (lossless; status is always in
     /// `u16` range).
-    // Phase 74 T3 (TRANSIENT): until T4 lands the `Metadata` arm, the new
-    // `dynamic_metadata` parameter is threaded through the `And`/`Or` recursion
-    // but consumed by no arm, which trips `only_used_in_recursion`. T3 is a
-    // deliberately behavior-neutral refactor, so the allow is scoped here and
-    // REMOVED in T4 when the consuming arm lands.
-    #[allow(clippy::only_used_in_recursion)]
     pub fn should_log(
         &self,
         status: u16,
@@ -118,6 +147,20 @@ impl LogFilter {
             LogFilter::Or(filters) => filters
                 .iter()
                 .any(|f| f.should_log(status, response_flags, headers, dynamic_metadata)),
+            // Phase 74: the MEASURED decision rule (SPEC §0 R-0.3/R-0.4) —
+            // resolve `dynamic_metadata[filter][path[0].key]`; unresolved (or no
+            // matcher at all) → `match_if_key_not_found`; resolved →
+            // `value.matches(v)`. A missing NAMESPACE behaves identically to a
+            // missing KEY (the trait impl returns `None` for both).
+            LogFilter::Metadata {
+                matcher,
+                match_if_key_not_found,
+            } => match matcher {
+                None => *match_if_key_not_found,
+                Some(m) => m
+                    .matches(dynamic_metadata)
+                    .unwrap_or(*match_if_key_not_found),
+            },
         }
     }
 }
@@ -302,5 +345,113 @@ mod tests {
         let or = LogFilter::Or(vec![le(199), ge(500)]);
         assert!(or.should_log(503, "-", &[], &md));
         assert!(!or.should_log(200, "-", &[], &md));
+    }
+
+    // --- phase 74: LogFilter::Metadata + the injected MetadataMatch seam ---
+
+    /// A local `MetadataMatch` stub. The accesslog crate cannot build a real
+    /// `envoy_config::MetadataMatcher` (it must not depend on `envoy-config` —
+    /// ADR-0150 cycle), so this proves the `should_log` PLUMBING and the
+    /// `Option<bool>` contract: `None` iff the path did not resolve, so
+    /// `LogFilter` applies `match_if_key_not_found`. The real resolution +
+    /// value-matcher coverage lives in `envoy-config` (T5) and `envoy-http1`
+    /// (T6) over the actual engine.
+    #[derive(Debug)]
+    struct NsKeyEquals(&'static str, &'static str, &'static str);
+    impl MetadataMatch for NsKeyEquals {
+        fn matches(
+            &self,
+            dynamic_metadata: &BTreeMap<String, BTreeMap<String, String>>,
+        ) -> Option<bool> {
+            let v = dynamic_metadata.get(self.0)?.get(self.1)?;
+            Some(v == self.2)
+        }
+    }
+
+    fn md(pairs: &[(&str, &str, &str)]) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut m: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for (ns, k, v) in pairs {
+            m.entry((*ns).to_string())
+                .or_default()
+                .insert((*k).to_string(), (*v).to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn metadata_arm_implements_the_measured_decision_rule() {
+        // MEASURED (SPEC §0 R-0.3/R-0.4, `envoyproxy/envoy:v1.33.0`):
+        //   resolved = dynamic_metadata[filter][path[0].key]
+        //   None    => match_if_key_not_found     (DEFAULT true)
+        //   Some(v) => value.matches(v)
+        let keep_default = LogFilter::Metadata {
+            matcher: Some(std::sync::Arc::new(NsKeyEquals("com.example", "k", "1"))),
+            match_if_key_not_found: true,
+        };
+        let drop_default = LogFilter::Metadata {
+            matcher: Some(std::sync::Arc::new(NsKeyEquals("com.example", "k", "1"))),
+            match_if_key_not_found: false,
+        };
+
+        // Value MATCHES → KEEP, regardless of the not-found policy.
+        let hit = md(&[("com.example", "k", "1")]);
+        assert!(keep_default.should_log(200, "-", &[], &hit));
+        assert!(drop_default.should_log(200, "-", &[], &hit));
+
+        // Value MISMATCH → DROP, regardless of the not-found policy (the value
+        // matcher is only consulted when the path RESOLVES).
+        let miss = md(&[("com.example", "k", "2")]);
+        assert!(!keep_default.should_log(200, "-", &[], &miss));
+        assert!(!drop_default.should_log(200, "-", &[], &miss));
+
+        // KEY absent inside a PRESENT namespace → the not-found policy decides.
+        let other_key = md(&[("com.example", "other", "1")]);
+        assert!(keep_default.should_log(200, "-", &[], &other_key));
+        assert!(!drop_default.should_log(200, "-", &[], &other_key));
+
+        // NAMESPACE absent behaves IDENTICALLY to a missing key (MEASURED R-0.4).
+        let other_ns = md(&[("com.other", "k", "1")]);
+        assert!(keep_default.should_log(200, "-", &[], &other_ns));
+        assert!(!drop_default.should_log(200, "-", &[], &other_ns));
+
+        // Wholly empty store → same not-found path.
+        let empty = md(&[]);
+        assert!(keep_default.should_log(200, "-", &[], &empty));
+        assert!(!drop_default.should_log(200, "-", &[], &empty));
+
+        // MATCHER-LESS filter (upstream accepts `metadata_filter: {}`, R-0.2):
+        // every record takes the not-found policy.
+        let no_matcher_keep = LogFilter::Metadata {
+            matcher: None,
+            match_if_key_not_found: true,
+        };
+        let no_matcher_drop = LogFilter::Metadata {
+            matcher: None,
+            match_if_key_not_found: false,
+        };
+        assert!(no_matcher_keep.should_log(200, "-", &[], &hit));
+        assert!(!no_matcher_drop.should_log(200, "-", &[], &hit));
+
+        // The arm ignores status / response_flags / headers.
+        assert!(keep_default.should_log(503, "UF", &[("x-a".into(), "1".into())], &hit));
+    }
+
+    #[test]
+    fn metadata_arm_composes_under_and_or() {
+        // The phase-73 composition arms thread the store through the recursion.
+        let meta = LogFilter::Metadata {
+            matcher: Some(std::sync::Arc::new(NsKeyEquals("com.example", "k", "1"))),
+            match_if_key_not_found: false,
+        };
+        let and = LogFilter::And(vec![meta.clone(), ge(500)]);
+        let hit = md(&[("com.example", "k", "1")]);
+        assert!(and.should_log(503, "-", &[], &hit)); // both true
+        assert!(!and.should_log(200, "-", &[], &hit)); // status false
+        assert!(!and.should_log(503, "-", &[], &md(&[]))); // metadata false
+
+        let or = LogFilter::Or(vec![meta, ge(500)]);
+        assert!(or.should_log(200, "-", &[], &hit)); // metadata true
+        assert!(or.should_log(503, "-", &[], &md(&[]))); // status true
+        assert!(!or.should_log(200, "-", &[], &md(&[]))); // neither
     }
 }

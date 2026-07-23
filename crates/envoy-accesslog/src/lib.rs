@@ -26,7 +26,7 @@ mod sink;
 pub use command_operator::{CompiledFormat, FormatParseError, parse_format};
 pub use error::AccessLogError;
 pub use file_sink::FileSink;
-pub use filter::{FilterOp, HeaderMatch, LogFilter, StatusCodeComparison};
+pub use filter::{FilterOp, HeaderMatch, LogFilter, MetadataMatch, StatusCodeComparison};
 pub use json_format::{CompiledJsonFormat, JsonValueInput};
 pub use log_format::LogFormat;
 pub use record::AccessLogRecord;
