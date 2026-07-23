@@ -2446,6 +2446,100 @@ backend. Pure cross-proxy equality on the kept lines AND the dropped absences.
 
 ---
 
+### Phase 74 (ADR-0154/0155): `metadata_filter` — the SIXTH emission-gate arm (the DYNAMIC-METADATA gate)
+
+> Fixtures `0081-accesslog-metadata-filter` + `0082-accesslog-metadata-filter-key-not-found`.
+> `filter: { metadata_filter: { matcher: <type.matcher.v3.MetadataMatcher>, match_if_key_not_found: <BoolValue> } }`
+> gates a sink on the request's DYNAMIC METADATA (MEASURED against
+> `envoyproxy/envoy:v1.33.0`, port-mapped runtime probes with graceful-stop flush).
+
+**§A Schema.** `matcher` is **OPTIONAL** upstream and here — `metadata_filter: {}`
+reports `configuration OK` and keeps every record; rejecting it would break LOAD
+PARITY. Inside `matcher`, upstream PGV requires `filter` (`min_len 1`), `path`
+(`min_items 1`, each segment `key` `min_len 1`) and `value`
+(`message.required`); envoy-rust enforces the same three fail-loud via
+`ConfigError::AccessLogMetadataMatcherInvalid` (plus `ConfigError::Yaml` for a
+missing `value`, which is a non-`Option` field). `match_if_key_not_found` is a
+`google.protobuf.BoolValue` **WRAPPER** (`{ value: true }` is accepted alongside
+a bare `true`), so absent and explicit-`false` are DISTINCT on the wire —
+modelled as `Option<bool>`. The message is CLOSED (an unknown key is a hard
+error on both sides). The `filter:` namespace is an OPAQUE, unvalidated string:
+neither proxy checks that any filter ever writes it.
+
+**§B Decision.** `resolved = dynamic_metadata[matcher.filter][matcher.path[0].key]`;
+`None` (unresolved, or no `matcher` at all) → `match_if_key_not_found`;
+`Some(v)` → `matcher.value.matches(v)`. **The `match_if_key_not_found` default is
+`true`** — MEASURED live by flipping absent → explicit `false` and watching the
+identical key-absent probe go KEPT → DROPPED (`--mode validate` provably cannot
+reach a proto3 wrapper default). On the phase-74 fixture config the two runs
+produced, respectively, `STATUS=200 PATH=/x M=-` + `STATUS=200 PATH=/x M=1`
+(absent → key-absent record KEPT, rendered `-`) and `STATUS=200 PATH=/x M=1`
+alone (explicit `false` → DROPPED). A missing NAMESPACE behaves identically to a
+missing KEY. Compiled to `LogFilter::Metadata { matcher: Option<Arc<dyn MetadataMatch>>,
+match_if_key_not_found: bool }` over an injected trait object whose `matches`
+returns **`Option<bool>`** (`None` = unresolved), so the not-found policy is
+expressed exactly once, in the crate that owns the field; the variant introduces
+NO `Eq`/`PartialEq` and NO `envoy-config` dependency (ADR-0150 holds).
+`should_log` gains a 4th parameter carrying the record's metadata store, threaded
+at both HCM emit gates and through the phase-73 `And`/`Or` recursion.
+
+**§C `invert` is accepted-but-INERT upstream on this path** (reproduced twice:
+`invert: true` produced a keep/drop set byte-identical to the non-inverted run,
+where honoring it would have produced the exact opposite; an `invertBOGUS`
+control field is REJECTED, proving `invert` is a genuine recognised field of the
+message that this evaluation path then ignores). envoy-rust's `MetadataMatcher`
+has no `invert` field under `deny_unknown_fields`, so a config carrying it is
+BOOT-FATAL here — a load-parity gap in the REJECT direction (ADR-0049 posture,
+carry-forward CF-74-1). **"Implementing" `invert` here would CREATE a
+divergence.** Note this is a DIFFERENT field on a DIFFERENT message from
+`HeaderMatcher.invert_match` (CF-72-1), whose divergence is mode-scoped.
+
+**§D Where envoy-rust is STRICTER** (the §E.1 precedent — all fail-loud at config
+load, never a silent runtime difference): no `invert` field (§C); single-segment
+`path` only (upstream accepts multi-segment; envoy-rust's metadata store is a
+FLAT `namespace → key → string`, in which a nested path is unrepresentable —
+CF-74-2); `ValueMatcher` limited to `string_match`/`present_match` (upstream also
+accepts `bool_match`, `double_match`, `list_match`, `null_match`, `or_match` —
+CF-74-3, blocked on the same string-only store). NB the RBAC-scoped
+`validate_metadata_matcher` does NOT check the empty path-segment `key` that this
+access-log validator does — an asymmetry recorded as CF-74-4, not fixed here.
+
+**§E Mutual exclusion.** `metadata_filter` joins the SIX-arm `AccessLogFilter`
+oneof (`status_code_filter`, `response_flag_filter`, `header_filter`,
+`and_filter`, `or_filter`, `metadata_filter`) — exactly one may be set at each
+level; zero arms and more-than-one arm are each
+`ConfigError::AmbiguousAccessLogFilter` (upstream rejects the multi-arm case one
+layer above PGV, in the JSON→proto parser).
+
+**§F Rendering the gating value.** Unlike the phase-72/73 fixtures, `0081`/`0082`
+render the gated metadata directly with `%DYNAMIC_METADATA(com.example:k)%` —
+that operator has its own parser and is NOT constrained by `REQ_ALLOW_LIST`
+(a `%REQ(X-A)%` would be boot-fatal, phase-73 §D). It renders the raw unquoted
+value when present and `-` when either the namespace or the key is absent, on
+both proxies.
+
+**§G Derived, not separately measured.** R-0.3/R-0.4 measured the decision rule
+with a `string_match` value. Because the value matcher is consulted ONLY when the
+path resolves, `present_match: true` → KEEP and `present_match: false` → DROP for
+a RESOLVED key, while an ABSENT key takes `match_if_key_not_found` in both cases.
+That composition is pinned in-process only — carry-forward CF-74-5.
+
+**§H Authoritative fixtures.** `0081`: `metadata_filter { matcher: { filter:
+com.example, path: [{key: k}], value: { string_match: { exact: "1" } } } }` over a
+`header_to_metadata` rule mapping `x-a` → `com.example:k` — `GET /x` with
+`x-a: 2` → DROPPED (value mismatch), with `x-a: 1` → KEPT (one line
+`STATUS=200 PATH=/x M=1`). `0082`: the same with `match_if_key_not_found: false`
+and NO `on_header_missing` — `GET /x` with no `x-a` → DROPPED (key not found),
+with `x-a: 1` → KEPT (one line). `0082`'s `on_header_missing` omission is
+load-bearing: envoy-rust requires a `value` on that block, and supplying one
+would WRITE the key on the no-header probe, so the key would RESOLVE and the
+probe would be dropped by the VALUE path — the fixture would pass while silently
+vacating the `match_if_key_not_found` witness. Both `direct_response` 200,
+`clusters: []`, no backend. Pure cross-proxy equality on the kept lines AND the
+dropped absences.
+
+---
+
 ## xDS wire state machine
 
 > **To be filled per-phase as needed.**
