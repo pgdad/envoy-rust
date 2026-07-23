@@ -5199,7 +5199,7 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      below. When a `filter` is present it must set EXACTLY ONE arm. Zero arms
 ///      (`filter: {}`) and more-than-one arm BOTH surface as
 ///      `ConfigError::AmbiguousAccessLogFilter { detail }` (the `detail`
-///      distinguishes the two). Phases 70/71/72/73 give FIVE arms, so the
+///      distinguishes the two). Phases 70/71/72/73/74 give SIX arms, so the
 ///      more-than-one branch is REACHABLE. Cardinality lives in the helper
 ///      (mirroring the `SubstitutionFormatString` / `AmbiguousLogFormat`
 ///      precedent), not serde. Phase 73's composition arms (`and_filter`/
@@ -5216,6 +5216,12 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      SafeRegex compiles, via `validate_header_matcher` (empty name →
 ///      `EmptyHeaderName`; bad regex → `InvalidRegex`; bad range →
 ///      `InvalidInt64Range`).
+///   7. Phase 74 — the `metadata_filter.matcher`, when present, validates via
+///      `validate_access_log_metadata_matcher` (empty namespace /
+///      non-single-segment path / empty segment key →
+///      `AccessLogMetadataMatcherInvalid`; bad regex → `InvalidRegex`) and its
+///      SafeRegex compiles in place. A matcher-less `metadata_filter` is
+///      ACCEPTED (upstream load parity, MEASURED R-0.2).
 ///
 /// Returns the first error encountered (validator-wide convention). Phase 72
 /// makes this `&mut` so the `header_filter.header` SafeRegex is compiled in
@@ -5351,6 +5357,49 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
             validate_access_log_filter(child)?;
         }
     }
+    // Phase 74: the `metadata_filter` arm. `matcher` is OPTIONAL upstream
+    // (MEASURED R-0.2 — `metadata_filter: {}` validates), so a matcher-less
+    // filter passes; when present it is validated fail-loud and its value's
+    // SafeRegex is compiled IN PLACE (this path holds `&mut`, unlike the RBAC
+    // one).
+    if let Some(mf) = metadata_filter
+        && let Some(mm) = mf.matcher.as_mut()
+    {
+        validate_access_log_metadata_matcher(mm)?;
+    }
+    Ok(())
+}
+
+/// Phase 74: validate an ACCESS-LOG `metadata_filter.matcher`. Mirrors upstream's
+/// PGV bounds (MEASURED, SPEC §0 R-0.2): `filter` `min_len 1`, `path`
+/// `min_items 1`, each segment `key` `min_len 1`; plus envoy-rust's inherited
+/// single-segment restriction (CF-74-2 — the record's metadata store is a FLAT
+/// `BTreeMap<String, BTreeMap<String, String>>`, in which a nested path is
+/// unrepresentable). Also compiles the value's SafeRegex IN PLACE so the runtime
+/// `ValueMatcher::matches` never hits its `.expect()`.
+///
+/// Deliberately NOT the RBAC `validate_metadata_matcher`: that one is
+/// RBAC-scoped (it takes `listener`/`policy_name` and yields
+/// `RbacMetadataMatcherInvalid`, whose variant carries both), it is called from
+/// an immutable-borrow walk so it cannot compile in place, and it does not check
+/// the segment `key` (CF-74-4).
+fn validate_access_log_metadata_matcher(m: &mut MetadataMatcher) -> Result<(), crate::ConfigError> {
+    let bad = |detail: String| crate::ConfigError::AccessLogMetadataMatcherInvalid { detail };
+    if m.filter.is_empty() {
+        return Err(bad("metadata matcher `filter` must not be empty".into()));
+    }
+    if m.path.len() != 1 {
+        return Err(bad(format!(
+            "metadata matcher path must have exactly one segment (got {}); multi-segment/nested paths are deferred (CF-74-2)",
+            m.path.len()
+        )));
+    }
+    if m.path[0].key.is_empty() {
+        return Err(bad(
+            "metadata matcher path segment `key` must not be empty".into(),
+        ));
+    }
+    m.value.compile_safe_regexes()?;
     Ok(())
 }
 
@@ -13512,6 +13561,175 @@ metadata_filter:
         assert!(matches!(
             err,
             crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
+        ));
+    }
+
+    // --- phase 74 t2: access-log-scoped MetadataMatcher validation ---
+
+    fn md_filter(matcher: Option<MetadataMatcher>) -> AccessLogFilter {
+        AccessLogFilter {
+            metadata_filter: Some(MetadataFilter {
+                matcher,
+                match_if_key_not_found: None,
+            }),
+            ..AccessLogFilter::default()
+        }
+    }
+
+    fn md_matcher(filter: &str, keys: &[&str]) -> MetadataMatcher {
+        MetadataMatcher {
+            filter: filter.into(),
+            path: keys
+                .iter()
+                .map(|k| MetadataPathSegment { key: (*k).into() })
+                .collect(),
+            value: ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::Exact("1".into()),
+                ignore_case: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn matcher_less_metadata_filter_is_accepted() {
+        // LOAD-PARITY PIN (MEASURED R-0.2): upstream `metadata_filter: {}`
+        // reports `configuration OK`. Rejecting it would break load parity.
+        validate_access_logs(&mut file_log_with_filter(md_filter(None)))
+            .expect("matcher-less metadata_filter must be accepted");
+    }
+
+    #[test]
+    fn metadata_filter_empty_namespace_is_rejected() {
+        let err = validate_access_logs(&mut file_log_with_filter(md_filter(Some(md_matcher(
+            "",
+            &["k"],
+        )))))
+        .expect_err("empty filter");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AccessLogMetadataMatcherInvalid { ref detail }
+                if detail.contains("filter")
+        ));
+    }
+
+    #[test]
+    fn metadata_filter_empty_path_is_rejected() {
+        let err = validate_access_logs(&mut file_log_with_filter(md_filter(Some(md_matcher(
+            "com.example",
+            &[],
+        )))))
+        .expect_err("empty path");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AccessLogMetadataMatcherInvalid { ref detail }
+                if detail.contains("segment")
+        ));
+    }
+
+    #[test]
+    fn metadata_filter_multi_segment_path_is_rejected() {
+        // CF-74-2: upstream ACCEPTS a multi-segment path (R-0.2); envoy-rust's
+        // FLAT string-only metadata store cannot represent one, so it is
+        // fail-loud (stricter, never silently different — ADR-0049).
+        let err = validate_access_logs(&mut file_log_with_filter(md_filter(Some(md_matcher(
+            "com.example",
+            &["a", "b"],
+        )))))
+        .expect_err("multi-segment path");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AccessLogMetadataMatcherInvalid { ref detail }
+                if detail.contains("segment")
+        ));
+    }
+
+    #[test]
+    fn metadata_filter_empty_segment_key_is_rejected() {
+        // Upstream PGV enforces `key` min_len 1 (R-0.2). NB the RBAC-scoped
+        // `validate_metadata_matcher` does NOT check this (CF-74-4).
+        let err = validate_access_logs(&mut file_log_with_filter(md_filter(Some(md_matcher(
+            "com.example",
+            &[""],
+        )))))
+        .expect_err("empty segment key");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AccessLogMetadataMatcherInvalid { ref detail }
+                if detail.contains("key")
+        ));
+    }
+
+    #[test]
+    fn metadata_filter_safe_regex_compiles_in_place_and_rejects_bad_pattern() {
+        // The access-log path takes `&mut`, so — unlike the RBAC path — it can
+        // compile the value's SafeRegex IN PLACE, so the runtime `matches` never
+        // hits its `.expect()`.
+        let ok = MetadataMatcher {
+            filter: "com.example".into(),
+            path: vec![MetadataPathSegment { key: "k".into() }],
+            value: ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::SafeRegex(SafeRegex {
+                    regex: "^[0-9]+$".into(),
+                    compiled: None,
+                }),
+                ignore_case: false,
+            }),
+        };
+        let mut logs = file_log_with_filter(md_filter(Some(ok)));
+        validate_access_logs(&mut logs).expect("valid regex compiles");
+        let compiled_in_place = match &logs[0]
+            .filter
+            .as_ref()
+            .unwrap()
+            .metadata_filter
+            .as_ref()
+            .unwrap()
+            .matcher
+            .as_ref()
+            .unwrap()
+            .value
+        {
+            ValueMatcher::StringMatch(sm) => match &sm.mode {
+                StringMatcherMode::SafeRegex(sr) => sr.compiled.is_some(),
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(compiled_in_place, "SafeRegex must be compiled in place");
+
+        let bad = MetadataMatcher {
+            filter: "com.example".into(),
+            path: vec![MetadataPathSegment { key: "k".into() }],
+            value: ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::SafeRegex(SafeRegex {
+                    regex: "([".into(),
+                    compiled: None,
+                }),
+                ignore_case: false,
+            }),
+        };
+        let err = validate_access_logs(&mut file_log_with_filter(md_filter(Some(bad))))
+            .expect_err("bad regex");
+        assert!(matches!(err, crate::ConfigError::InvalidRegex { .. }));
+    }
+
+    #[test]
+    fn metadata_filter_nested_in_or_filter_surfaces_through_recursion() {
+        // The phase-73 recursion must reach the new arm: a bad metadata matcher
+        // nested inside an `or_filter` child still fails-loud.
+        let f = AccessLogFilter {
+            or_filter: Some(OrFilter {
+                filters: vec![
+                    exact_header("x-a", "1"),
+                    md_filter(Some(md_matcher("", &["k"]))),
+                ],
+            }),
+            ..AccessLogFilter::default()
+        };
+        let err = validate_access_logs(&mut file_log_with_filter(f)).expect_err("nested bad");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AccessLogMetadataMatcherInvalid { .. }
         ));
     }
 

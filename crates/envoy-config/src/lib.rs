@@ -479,6 +479,17 @@ pub enum ConfigError {
     #[error("response_flag_filter flags must be a known response-flag token: {token}")]
     UnknownResponseFlag { token: String },
 
+    /// Phase 74: an access-log `metadata_filter.matcher` (`MetadataMatcher`) is
+    /// malformed — an empty `filter` namespace (upstream PGV `min_len 1`), a
+    /// `path` whose length is not exactly 1 (upstream accepts multi-segment;
+    /// envoy-rust's FLAT string-only metadata store cannot resolve one →
+    /// stricter boot-fatal, CF-74-2), or an empty path-segment `key` (upstream
+    /// PGV `min_len 1`). Distinct from `RbacMetadataMatcherInvalid`, which is
+    /// RBAC-scoped and carries `listener`/`policy_name` — the access-log
+    /// validator has neither in scope. Config-load-time fatal (ADR-0049).
+    #[error("access_log metadata_filter matcher is invalid: {detail}")]
+    AccessLogMetadataMatcherInvalid { detail: String },
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes
