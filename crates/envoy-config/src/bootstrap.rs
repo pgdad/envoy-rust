@@ -711,11 +711,12 @@ pub struct AccessLog {
 }
 
 /// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
-/// predicate carried by an `AccessLog` entry. This type now models THREE oneof
-/// arms — `status_code_filter` (phase 70), `response_flag_filter` (phase 71),
-/// and `header_filter` (phase 72); future filter-family phases add further
-/// `Option` arms here rather than reshaping the type. Cardinality (exactly one
-/// arm set) is enforced by `validate_access_logs`
+/// predicate carried by an `AccessLog` entry. This type models SIX oneof arms —
+/// `status_code_filter` (phase 70), `response_flag_filter` (phase 71),
+/// `header_filter` (phase 72), the recursive `and_filter` / `or_filter`
+/// composition (phase 73), and `metadata_filter` (phase 74); future
+/// filter-family phases add further `Option` arms here rather than reshaping the
+/// type. Cardinality (exactly one arm set) is enforced by `validate_access_logs`
 /// (`ConfigError::AmbiguousAccessLogFilter`), NOT by serde — mirroring the
 /// `SubstitutionFormatString` oneof precedent above.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -739,6 +740,9 @@ pub struct AccessLogFilter {
     /// Emit iff ANY nested child predicate matches. `min_items = 2`. Mutually
     /// exclusive with the other four arms.
     pub or_filter: Option<OrFilter>,
+    /// Phase 74: the SIXTH `AccessLogFilter` arm — gates emission on the
+    /// request's DYNAMIC METADATA. Mutually exclusive with the other arms.
+    pub metadata_filter: Option<MetadataFilter>,
 }
 
 /// Phase 73: `and_filter` — a boolean-AND composition of nested `AccessLogFilter`
@@ -756,6 +760,33 @@ pub struct AndFilter {
 #[serde(default, deny_unknown_fields)]
 pub struct OrFilter {
     pub filters: Vec<AccessLogFilter>,
+}
+
+/// Phase 74: `metadata_filter` — the SIXTH `AccessLogFilter` arm. Emits a record
+/// iff the request's dynamic metadata, resolved at `matcher.filter` →
+/// `matcher.path[0].key`, matches `matcher.value`; when the path does NOT
+/// resolve, iff `match_if_key_not_found` (MEASURED, `envoyproxy/envoy:v1.33.0`,
+/// SPEC §0 R-0.3/R-0.4).
+///
+/// BOTH fields are `Option` for MEASURED reasons:
+///   - `matcher` — upstream ACCEPTS a matcher-less `metadata_filter: {}`
+///     (`configuration OK`, R-0.2); rejecting it would break LOAD PARITY. A
+///     matcher-less filter keeps every record.
+///   - `match_if_key_not_found` — it is a `google.protobuf.BoolValue` WRAPPER
+///     (R-0.2: `{ value: true }` is accepted alongside a bare `true`), so absent
+///     and explicit-`false` are DISTINCT on the wire. `None` means "default",
+///     resolved to `true` at compile (R-0.4). A bare `bool` would lose that.
+///
+/// `MetadataMatcher` is REUSED VERBATIM from the phase-35/36 RBAC `metadata`
+/// condition — upstream's `metadata_filter.matcher` is the same
+/// `type.matcher.v3.MetadataMatcher` message. No `Clone` (all consumers take
+/// `&AccessLogFilter`); the nested `MetadataMatcher` derives `Clone` and is what
+/// the HCM compile step clones into the `MetadataMatch` trait object.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetadataFilter {
+    pub matcher: Option<MetadataMatcher>,
+    pub match_if_key_not_found: Option<bool>,
 }
 
 /// Models `envoy.config.accesslog.v3.HeaderFilter` — the THIRD `AccessLogFilter`
@@ -5244,7 +5275,7 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
 }
 
 /// Phase 73: recursively validate one `AccessLogFilter` oneof. Enforces exactly
-/// one arm is set (cardinality, all FIVE arms — no `..`, so a future arm cannot
+/// one arm is set (cardinality, all SIX arms — no `..`, so a future arm cannot
 /// be added without updating this [M70-R1]), the per-leaf checks (status-code
 /// runtime_key, response-flag token membership, header-matcher compile-in-place),
 /// and — for the composition arms — `filters.len() >= 2` plus a recursive descent
@@ -5257,6 +5288,7 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         header_filter,
         and_filter,
         or_filter,
+        metadata_filter,
     } = filter;
     let set_arms = [
         status_code_filter.is_some(),
@@ -5264,6 +5296,7 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         header_filter.is_some(),
         and_filter.is_some(),
         or_filter.is_some(),
+        metadata_filter.is_some(),
     ]
     .iter()
     .filter(|set| **set)
@@ -13208,6 +13241,7 @@ or_filter: null
                     filters: vec![AccessLogFilter::default(), AccessLogFilter::default()],
                 }),
                 or_filter: None,
+                metadata_filter: None,
             }),
         }];
         let err = validate_access_logs(&mut logs).expect_err("ambiguous");
@@ -13243,6 +13277,7 @@ or_filter: null
             }),
             and_filter: None,
             or_filter: None,
+            metadata_filter: None,
         }
     }
 
@@ -13302,6 +13337,7 @@ or_filter: null
             }),
             and_filter: None,
             or_filter: None,
+            metadata_filter: None,
         };
         let f = AccessLogFilter {
             or_filter: Some(OrFilter {
@@ -13334,6 +13370,148 @@ or_filter: null
         assert!(matches!(
             err,
             crate::ConfigError::InsufficientCompositeFilters { count: 1 }
+        ));
+    }
+
+    // --- phase 74 t1: MetadataFilter + metadata_filter oneof arm ---
+
+    #[test]
+    fn metadata_filter_deserialize_round_trip_and_defaults() {
+        // The full shape. `match_if_key_not_found` is a BoolValue WRAPPER
+        // (MEASURED R-0.2) written as a bare bool in YAML.
+        let yaml = r#"
+metadata_filter:
+  matcher:
+    filter: com.example
+    path:
+      - key: k
+    value:
+      string_match: { exact: "1" }
+  match_if_key_not_found: false
+"#;
+        let f: AccessLogFilter = serde_yaml::from_str(yaml).expect("deserializes");
+        let mf = f.metadata_filter.as_ref().expect("metadata_filter present");
+        let m = mf.matcher.as_ref().expect("matcher present");
+        assert_eq!(m.filter, "com.example");
+        assert_eq!(m.path.len(), 1);
+        assert_eq!(m.path[0].key, "k");
+        assert_eq!(
+            m.value,
+            ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::Exact("1".into()),
+                ignore_case: false,
+            })
+        );
+        assert_eq!(mf.match_if_key_not_found, Some(false));
+
+        // MEASURED R-0.2 LOAD-PARITY TRAP: upstream ACCEPTS a matcher-less
+        // `metadata_filter: {}` (`configuration OK`), so both fields default.
+        let empty: MetadataFilter = serde_yaml::from_str("{}").expect("empty metadata_filter");
+        assert_eq!(empty, MetadataFilter::default());
+        assert!(empty.matcher.is_none());
+        // Absent is DISTINCT from explicit `false` on the wire (BoolValue
+        // wrapper) — `None` means "default", resolved to `true` at compile
+        // (MEASURED R-0.4). Modelling this as a bare `bool` would lose it.
+        assert_eq!(empty.match_if_key_not_found, None);
+
+        // The message is CLOSED upstream (R-0.2); `deny_unknown_fields` mirrors it.
+        assert!(serde_yaml::from_str::<MetadataFilter>("bogus_field: true").is_err());
+
+        // CF-74-1: `matcher.invert` is ACCEPTED-but-INERT upstream (MEASURED
+        // R-0.5) and has no in-tree field — it stays BOOT-FATAL here. Adding it
+        // would CREATE a divergence.
+        assert!(
+            serde_yaml::from_str::<MetadataFilter>(
+                "matcher: { filter: f, path: [{key: k}], value: { present_match: true }, invert: true }"
+            )
+            .is_err(),
+            "matcher.invert must stay boot-fatal (CF-74-1)"
+        );
+    }
+
+    #[test]
+    fn six_arm_cardinality_counts_every_arm() {
+        // PV-3: the destructure is compiler-forced (no `..`), but the `set_arms`
+        // ARRAY is not length-checked — an arm present in the struct yet missing
+        // from the array would count as ZERO, turning a valid single-arm filter
+        // into `AmbiguousAccessLogFilter{"no filter variant is set"}`. Assert
+        // each of the SIX arms ALONE validates, and that all six together are
+        // "more than one".
+        let single_arms: Vec<AccessLogFilter> = vec![
+            AccessLogFilter {
+                status_code_filter: Some(StatusCodeFilter {
+                    comparison: ComparisonFilter {
+                        op: ComparisonOp::Ge,
+                        value: RuntimeUInt32 {
+                            default_value: 500,
+                            runtime_key: "rk".into(),
+                        },
+                    },
+                }),
+                ..AccessLogFilter::default()
+            },
+            AccessLogFilter {
+                response_flag_filter: Some(ResponseFlagFilter {
+                    flags: vec!["NR".into()],
+                }),
+                ..AccessLogFilter::default()
+            },
+            exact_header("x-a", "1"),
+            AccessLogFilter {
+                and_filter: Some(AndFilter {
+                    filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
+                }),
+                ..AccessLogFilter::default()
+            },
+            AccessLogFilter {
+                or_filter: Some(OrFilter {
+                    filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
+                }),
+                ..AccessLogFilter::default()
+            },
+            AccessLogFilter {
+                metadata_filter: Some(MetadataFilter::default()),
+                ..AccessLogFilter::default()
+            },
+        ];
+        assert_eq!(single_arms.len(), 6, "six arms must be covered");
+        for (idx, f) in single_arms.into_iter().enumerate() {
+            validate_access_logs(&mut file_log_with_filter(f))
+                .unwrap_or_else(|e| panic!("arm {idx} alone must validate, got {e:?}"));
+        }
+
+        let all_six = AccessLogFilter {
+            status_code_filter: Some(StatusCodeFilter {
+                comparison: ComparisonFilter {
+                    op: ComparisonOp::Ge,
+                    value: RuntimeUInt32 {
+                        default_value: 500,
+                        runtime_key: "rk".into(),
+                    },
+                },
+            }),
+            response_flag_filter: Some(ResponseFlagFilter {
+                flags: vec!["NR".into()],
+            }),
+            header_filter: Some(HeaderFilter {
+                header: HeaderMatcher {
+                    name: "x-a".into(),
+                    mode: HeaderMatcherMode::ExactMatch("1".into()),
+                    invert_match: false,
+                },
+            }),
+            and_filter: Some(AndFilter {
+                filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
+            }),
+            or_filter: Some(OrFilter {
+                filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
+            }),
+            metadata_filter: Some(MetadataFilter::default()),
+        };
+        let err = validate_access_logs(&mut file_log_with_filter(all_six)).expect_err("ambiguous");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
         ));
     }
 

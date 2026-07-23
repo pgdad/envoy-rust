@@ -4546,6 +4546,7 @@ static_resources:
                     header_filter: None,
                     and_filter: None,
                     or_filter: None,
+                    metadata_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4686,6 +4687,7 @@ static_resources:
                     header_filter: None,
                     and_filter: None,
                     or_filter: None,
+                    metadata_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4765,6 +4767,7 @@ static_resources:
             }),
             and_filter: None,
             or_filter: None,
+            metadata_filter: None,
         };
         let compiled = compile_access_log_filter(&filter);
         assert!(matches!(
@@ -4794,6 +4797,7 @@ static_resources:
             }),
             and_filter: None,
             or_filter: None,
+            metadata_filter: None,
         };
 
         // and_filter { [x-a=1, x-b=1] } → LogFilter::And([Header, Header]).
@@ -4805,6 +4809,7 @@ static_resources:
                 filters: vec![hdr("x-a", "1"), hdr("x-b", "1")],
             }),
             or_filter: None,
+            metadata_filter: None,
         };
         let compiled = compile_access_log_filter(&and);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::And(ref v) if v.len() == 2));
@@ -4832,10 +4837,12 @@ static_resources:
                             filters: vec![hdr("x-a", "1"), hdr("x-b", "1")],
                         }),
                         or_filter: None,
+                        metadata_filter: None,
                     },
                     hdr("x-c", "1"),
                 ],
             }),
+            metadata_filter: None,
         };
         let compiled = compile_access_log_filter(&or);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
@@ -4867,6 +4874,7 @@ static_resources:
                 }),
                 and_filter: None,
                 or_filter: None,
+                metadata_filter: None,
             })
         };
         let yes = [("x-log".to_string(), "yes".to_string())];
@@ -5008,6 +5016,7 @@ static_resources:
                         }),
                         and_filter: None,
                         or_filter: None,
+                        metadata_filter: None,
                     },
                 ),
                 // Sink B — status_code_filter { EQ 200 }.
@@ -5027,6 +5036,7 @@ static_resources:
                         header_filter: None,
                         and_filter: None,
                         or_filter: None,
+                        metadata_filter: None,
                     },
                 ),
             ],
