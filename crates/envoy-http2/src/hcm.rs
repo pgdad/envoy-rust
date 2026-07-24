@@ -1135,6 +1135,9 @@ async fn finalize_h2_stream(
             // Phase 72: thread the downstream request headers for the
             // `header_filter` arm (same `envoy_req.headers` snapshot feeding
             // forwarded_for/authority above); other arms ignore it.
+            // Phase 74: thread the record's dynamic-metadata store for the
+            // `metadata_filter` arm (already built above — the record literal
+            // completes BEFORE this loop). The other arms ignore it.
             if !sink.should_log(
                 record.response_code,
                 &record.response_flags,

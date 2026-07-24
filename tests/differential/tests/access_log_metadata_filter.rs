@@ -12,13 +12,29 @@
 //! and ONE `direct_response` route (`/x` → 200 `hi`). Unlike 0079/0080 the LINE
 //! itself echoes the gating value — `%DYNAMIC_METADATA(...)%` is a distinct
 //! command operator and is NOT gated by `REQ_ALLOW_LIST` (`%REQ(X-A)%` would be
-//! boot-fatal). Two probes, kept-LAST (ADR-0147): (1) `GET /x` with `x-a: 2`
-//! (metadata `k="2"` → value mismatch) → SUPPRESSED (`expect_logged: false`);
-//! (2) `GET /x` with `x-a: 1` (metadata `k="1"` → value matches) → KEPT. Each
-//! side's file holds EXACTLY ONE byte-identical line
-//! `STATUS=200 PATH=/x M=1`. `clusters: []`; no backend spawns. PURE
-//! cross-proxy equality: both proxies must agree on the KEPT half AND the
-//! DROPPED half.
+//! boot-fatal).
+//!
+//! `match_if_key_not_found` is deliberately ABSENT from this fixture's filter, so
+//! an unresolved key takes its MEASURED default `true` (SPEC §0 R-0.4) — the
+//! proto3 `google.protobuf.BoolValue` default that `--mode validate` provably
+//! cannot reach. The `header_to_metadata` rule carries `on_header_present` ONLY,
+//! deliberately OMITTING `on_header_missing`, so a request without `x-a` writes
+//! nothing and the key is genuinely absent (ADR-0155 PV-6 — adding the block
+//! would make the key RESOLVE and silently vacate the default-`true` witness
+//! while this test stayed green).
+//!
+//! THREE probes, kept-LAST (ADR-0147): (1) `GET /x` with `x-a: 2` (metadata
+//! `k="2"` → resolved, value mismatch) → SUPPRESSED (`expect_logged: false`);
+//! (2) `GET /x` with NO `x-a` (key unresolved → the `match_if_key_not_found`
+//! DEFAULT `true`) → KEPT; (3) `GET /x` with `x-a: 1` (metadata `k="1"` → value
+//! matches) → KEPT. Probe 2 is placed SECOND rather than appended, so the LAST
+//! probe is still KEPT and the driver pays the cheap 2 s `CF70_3_SETTLE`.
+//!
+//! Each side's file holds EXACTLY TWO byte-identical lines, in this order:
+//! `STATUS=200 PATH=/x M=-` then `STATUS=200 PATH=/x M=1`. They are byte-DISTINCT,
+//! so the fixture pins line ORDER as well as count. `clusters: []`; no backend
+//! spawns. PURE cross-proxy equality: both proxies must agree on both KEPT lines
+//! AND on the DROPPED one.
 
 use std::path::PathBuf;
 

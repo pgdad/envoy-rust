@@ -13500,8 +13500,10 @@ metadata_filter:
         // This pins the POSTURE, not a bug: the `Option<bool>` model is CORRECT
         // — it is what preserves the absent-vs-explicit-`false` distinction that
         // a bare `bool` would lose — and the house precedent for wrapper fields
-        // is bare-only (`UInt32Value`, ADR-0063, pinned by
-        // `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`). The pin
+        // is bare-only: established for `UInt32Value` at ADR-0063 (the buffer
+        // filter's `max_request_bytes`) and re-confirmed for
+        // `CidrRange.prefix_len` at ADR-0133, whose divergence is the one pinned
+        // by `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`. The pin
         // therefore FAILS if someone swaps `Option<bool>` for a
         // wrapper-accepting deserializer without first closing CF-74-6
         // deliberately, across ALL the wrapper fields, with fixtures.

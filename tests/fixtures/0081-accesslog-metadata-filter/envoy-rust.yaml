@@ -21,10 +21,24 @@ static_resources:
                     # Phase 74 (ADR-0154/0155): emit only when the request's
                     # dynamic metadata com.example:k equals "1". The metadata is
                     # produced by the header_to_metadata filter below from the
-                    # `x-a` request header. `match_if_key_not_found` is ABSENT
-                    # here — its MEASURED default is `true`, but every probe in
-                    # this fixture sets `x-a`, so the key always resolves and the
-                    # not-found path is never taken (fixture 0082 covers it).
+                    # `x-a` request header.
+                    #
+                    # `match_if_key_not_found` is deliberately ABSENT here, and
+                    # that ABSENCE is the witness: its MEASURED default is `true`,
+                    # and probe 2 sends NO `x-a`, so the key does NOT resolve and
+                    # the record is KEPT via the not-found DEFAULT. (Sibling
+                    # fixture 0082 sets the field explicitly to `false` and shows
+                    # the SAME no-`x-a` probe flipping to DROPPED.) Do NOT add
+                    # `match_if_key_not_found` here — it would vacate the default.
+                    #
+                    # LOAD-BEARING (ADR-0155 PV-6): the header_to_metadata rule
+                    # below has `on_header_present` ONLY — deliberately NO
+                    # `on_header_missing`. envoy-rust requires a `value` on that
+                    # block, so adding one would WRITE com.example:k on probe 2;
+                    # the key would RESOLVE, probe 2 would be decided by the VALUE
+                    # matcher instead of the not-found policy, and the default-
+                    # `true` witness would be silently vacated WHILE THIS FIXTURE
+                    # STAYED GREEN. Do not add it.
                     filter:
                       metadata_filter:
                         matcher:

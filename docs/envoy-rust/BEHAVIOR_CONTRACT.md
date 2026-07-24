@@ -2465,7 +2465,9 @@ DISTINCT on the wire — modelled as `Option<bool>`. **The two spellings are NOT
 at parity:** upstream accepts BOTH the bare `true`/`false` and the wrapped
 `{ value: <bool> }` form, while envoy-rust accepts ONLY the bare form and is
 BOOT-FATAL on the wrapped one — see **§D** and **CF-74-6**. Every fixture and
-example in this project therefore writes the bare form, which IS at parity. The
+example in this project therefore writes the bare form, which IS at parity, or
+omits the field entirely (fixture `0081` omits it — deliberately, to witness the
+default; see §H). The
 message is CLOSED (an unknown key is a hard error on both sides). The `filter:`
 namespace is an OPAQUE, unvalidated string: neither proxy checks that any filter
 ever writes it.
@@ -2530,8 +2532,10 @@ a YAML mapping.
 **The `Option<bool>` model is CORRECT and must not be "fixed" in isolation** — it
 is what preserves the absent-vs-explicit-`false` distinction the wrapper carries
 (§B: absent resolves to `true`), which a bare `bool` would lose. The house
-precedent for proto wrapper fields is likewise bare-only (`UInt32Value`, ADR-0063,
-pinned by `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`). Like every
+precedent for proto wrapper fields is likewise bare-only: established for
+`UInt32Value` at **ADR-0063** (the buffer filter's `max_request_bytes`) and
+re-confirmed for `CidrRange.prefix_len` at **ADR-0133**, whose divergence is the one
+pinned by `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`. Like every
 other §D entry this is **fail-loud in the REJECT direction** — envoy-rust refuses
 to BOOT, so runtime behavior is never silently different. Pinned by
 `metadata_filter_deserialize_round_trip_and_defaults`, which asserts BOTH wrapped
@@ -2567,28 +2571,62 @@ group 1, one H1 config pair, seven requests: `r1 x-a:1` · `r2 x-a:2` · `r3` no
 | S4 | `metadata_filter { matcher: { …, value: { present_match: true } }, match_if_key_not_found: false }` | r1 r2 r5 r6 | r1 r2 r5 r6 | **PARITY** |
 | S5 | `metadata_filter { matcher: { …, value: { present_match: false } }, match_if_key_not_found: true }` | r3 r4 r7 | r3 r4 r7 | **PARITY** |
 
+The requests above are labelled by HEADER while the sinks gate on METADATA, so the
+mapping is load-bearing: the probe config carries an
+`envoy.filters.http.header_to_metadata` rule with `on_header_present` ONLY, mapping
+request header `x-a` → metadata `com.example:k`. The key therefore RESOLVES for
+exactly the four requests carrying `x-a` — {r1, r2, r5, r6} — and is ABSENT for
+{r3, r4, r7}.
+
 S4 and S5 are **exact complements** over the seven requests, and both proxies agree
-on every cell. The derived rule is confirmed: with the key RESOLVED,
-`present_match: true` KEEPS and `present_match: false` DROPS; with the key ABSENT
-both defer to `match_if_key_not_found` (which is why S4, whose policy is `false`,
-drops exactly the requests S5, whose policy is `true`, keeps). All seven per-sink
-files were byte-identical across the two proxies (`md5sum` of the per-side
-concatenation `380b58e471f8c0c545d02a5e8b7b9df3` on both sides). Pinned in-process
-by `reuses_the_value_matcher_engine_verbatim`. **CF-74-5 is CLOSED.**
+on every cell. **What this table isolates is the RESOLVED branch:** with the key
+RESOLVED, `present_match: true` KEEPS and `present_match: false` DROPS — both
+polarities, both proxies. That is exactly the CF-74-5 claim, and it is confirmed.
+
+**The table does NOT isolate the ABSENT branch**, and must not be read as doing so:
+S4 and S5 flip TWO variables at once — the `present_match` polarity AND the
+`match_if_key_not_found` policy — so a competing rule in which the matcher returned
+`Some(present == want)` on BOTH branches, with the policy never consulted at all,
+predicts both observed rows exactly. The two hypotheses are observationally
+identical here. The ABSENT branch's deferral to `match_if_key_not_found` is true and
+MEASURED, but it is isolated ELSEWHERE: by **§B's R-0.4 polarity flip**, which holds
+the value matcher and the key's absence constant while flipping only the policy
+(absent → explicit `false` turned the identical key-absent probe from KEPT to
+DROPPED); and by **probe group 1's matcher-less S6/S7 pair**, which isolates the
+policy with no value matcher present at all (S6, `metadata_filter: {}`, kept all
+seven; S7, `metadata_filter: { match_if_key_not_found: false }`, kept none — both at
+parity).
+
+All seven per-sink files were byte-identical across the two proxies (`md5sum` of the
+per-side concatenation `380b58e471f8c0c545d02a5e8b7b9df3` on both sides). Pinned
+in-process by `reuses_the_value_matcher_engine_verbatim`. **CF-74-5 is CLOSED** — it
+was scoped to `present_match` on the RESOLVED branch, which this table does isolate
+in both polarities on both proxies.
 
 **§H Authoritative fixtures.** `0081`: `metadata_filter { matcher: { filter:
-com.example, path: [{key: k}], value: { string_match: { exact: "1" } } } }` over a
-`header_to_metadata` rule mapping `x-a` → `com.example:k` — `GET /x` with
-`x-a: 2` → DROPPED (value mismatch), with `x-a: 1` → KEPT (one line
-`STATUS=200 PATH=/x M=1`). `0082`: the same with `match_if_key_not_found: false`
-and NO `on_header_missing` — `GET /x` with no `x-a` → DROPPED (key not found),
-with `x-a: 1` → KEPT (one line). `0082`'s `on_header_missing` omission is
-load-bearing: envoy-rust requires a `value` on that block, and supplying one
-would WRITE the key on the no-header probe, so the key would RESOLVE and the
-probe would be dropped by the VALUE path — the fixture would pass while silently
-vacating the `match_if_key_not_found` witness. Both `direct_response` 200,
-`clusters: []`, no backend. Pure cross-proxy equality on the kept lines AND the
-dropped absences.
+com.example, path: [{key: k}], value: { string_match: { exact: "1" } } } }`, with
+`match_if_key_not_found` ABSENT, over a `header_to_metadata` rule mapping `x-a` →
+`com.example:k`. **THREE probes, TWO kept lines** — `GET /x` with `x-a: 2` →
+DROPPED (key resolves, value mismatch); `GET /x` with NO `x-a` → **KEPT via the
+`match_if_key_not_found` DEFAULT `true`** (line `STATUS=200 PATH=/x M=-`); `GET /x`
+with `x-a: 1` → KEPT (line `STATUS=200 PATH=/x M=1`). The kept probe with no `x-a`
+is placed SECOND, not last, so kept-LAST (ADR-0147) holds; the two kept lines are
+byte-DISTINCT, so the fixture pins line ORDER as well as count. `0082`: the same
+shape with `match_if_key_not_found: false` — TWO probes, ONE kept line: `GET /x`
+with no `x-a` → DROPPED (key not found, the §B polarity flip), with `x-a: 1` → KEPT
+(`STATUS=200 PATH=/x M=1`). Both `direct_response` 200, `clusters: []`, no backend.
+Pure cross-proxy equality on the kept lines AND the dropped absences.
+
+**Neither fixture may gain an `on_header_missing` block — the omission is
+load-bearing in BOTH** (ADR-0155 PV-6). envoy-rust requires a `value` on that block,
+so supplying one would WRITE the key on the no-`x-a` probe; the key would then
+RESOLVE and the probe would be decided by the VALUE matcher instead of the not-found
+policy. In `0082` that silently vacates the `match_if_key_not_found: false` witness;
+in `0081` it silently vacates the default-`true` witness its second probe exists to
+buy — **and in both cases the fixture would stay GREEN while testing the wrong
+thing.** The `on_header_missing` occurrences in these fixtures' configs are `#`
+COMMENTS documenting the deliberate omission; they are not config keys and must not
+be "cleaned up".
 
 ---
 
