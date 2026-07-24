@@ -17,7 +17,36 @@ driver:
         - ["x-a", "2"]
       expected_status: 200
       expect_logged: false
-    # Probe 2 — KEPT, and LAST. `x-a: 1` → com.example:k = "1" → the value
+    # Probe 2 — KEPT, and placed SECOND (phase 74 §5.2 state-3 re-entry,
+    # `REVIEW.md` I-3). NO `x-a` header at all, so the `header_to_metadata` rule
+    # — which carries `on_header_present` ONLY — writes nothing and
+    # `com.example:k` is genuinely ABSENT. The metadata path therefore does NOT
+    # resolve and the record takes `match_if_key_not_found`, which is ABSENT from
+    # this fixture's filter and whose MEASURED default is `true` → KEPT.
+    #
+    # This is the probe that makes the fixture read the wrapper DEFAULT. Before
+    # it, `0081` omitted the field but BOTH its probes sent `x-a` (the key always
+    # resolved, so `unwrap_or` was never consulted) and `0082` pins the field to
+    # explicit `false` — so mutating `unwrap_or(true)` → `unwrap_or(false)` REDdened
+    # an in-process test but NO differential fixture. The `None → true` KEEP
+    # branch — the observable `--mode validate` provably cannot reach, because it
+    # is a proto3 `google.protobuf.BoolValue` default — was pinned only by
+    # envoy-rust asserting against itself. It is now witnessed CROSS-PROXY.
+    #
+    # It must stay SECOND, not last: kept-LAST (ADR-0147) is what lets the
+    # driver's ordering-aware `suppression_settle` pay the cheap 2 s
+    # CF70_3_SETTLE instead of the 12 s CF71_1_SETTLE.
+    #
+    # Expected line (byte-identical on both sides): STATUS=200 PATH=/x M=-
+    # `%DYNAMIC_METADATA(com.example:k)%` renders `-` for an absent key, so this
+    # line is byte-DISTINCT from probe 3's — which pins line ORDER too, not just
+    # the count.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: true
+    # Probe 3 — KEPT, and LAST. `x-a: 1` → com.example:k = "1" → the value
     # matcher matches → the record IS emitted. Expected line (byte-identical on
     # both sides): STATUS=200 PATH=/x M=1
     - method: get
@@ -27,9 +56,14 @@ driver:
         - ["x-a", "1"]
       expected_status: 200
       expect_logged: true
-  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line ==). Each side's file
-  # holds EXACTLY ONE line (MEASURED, SPEC §0 R-0.3, graceful-stop flush):
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line ==). Each side's file holds
+  # EXACTLY TWO lines, in this order (MEASURED, SPEC §0 R-0.3/R-0.4 and the
+  # state-3 live re-measurement quoted at PROGRESS.md "§ T8", graceful-stop
+  # flush):
+  #   STATUS=200 PATH=/x M=-
   #   STATUS=200 PATH=/x M=1
-  # Both proxies must agree on the kept `x-a: 1` line AND on the absence of any
-  # line for the value-mismatching `x-a: 2` probe. The only route is a
-  # direct_response → clusters: [], no backend spawns.
+  # Both proxies must agree on the two kept lines — the key-ABSENT one taken via
+  # the `match_if_key_not_found` DEFAULT and the value-MATCHING one taken via the
+  # value matcher — AND on the absence of any line for the value-mismatching
+  # `x-a: 2` probe. The only route is a direct_response → clusters: [], no
+  # backend spawns.

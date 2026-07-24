@@ -575,7 +575,20 @@ mod metadata_match_tests {
 
     #[test]
     fn reuses_the_value_matcher_engine_verbatim() {
-        // Every modelled StringMatcher mode routes through ValueMatcher::matches.
+        // All FIVE modelled `StringMatcherMode` variants — Exact, Prefix,
+        // Suffix, Contains and SafeRegex — route through
+        // `ValueMatcher::matches` on the metadata path, plus `present_match`.
+        //
+        // Phase 74 §5.2 state-3 re-entry (`REVIEW.md` I-4): SafeRegex was the
+        // one mode this test SKIPPED, while the comment here claimed full
+        // coverage. That mattered more than the other four, because
+        // `StringMatcher::matches` reaches SafeRegex through
+        // `.expect("validator ensured StringMatcher SafeRegex compiled")` — a
+        // REQUEST-TIME panic path, not a wrong-verdict path. Nothing anywhere
+        // in the workspace evaluated a SafeRegex metadata value, so clearing
+        // `compiled` failed no test. (The state-5 code-review live-probed it
+        // clean cross-proxy, including at DEPTH 2 inside a composition, so this
+        // pins CORRECT behavior — see the `safe_regex` block below.)
         let md = store(&[("com.example", "k", "prod-1")]);
         let case = |mode: StringMatcherMode, ignore_case: bool| {
             matcher(ValueMatcher::StringMatch(StringMatcher {
@@ -609,10 +622,54 @@ mod metadata_match_tests {
             Some(false)
         );
 
+        // SafeRegex — the fifth mode, and the only one whose evaluation can
+        // PANIC rather than merely return the wrong verdict. `compiled` is
+        // filled IN PLACE by the access-log validator
+        // (`validate_access_log_metadata_matcher` → `compile_safe_regexes`), so
+        // this helper compiles exactly as the validator does before matching.
+        let safe_regex = |pattern: &str| {
+            let mut v = ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::SafeRegex(crate::bootstrap::SafeRegex {
+                    regex: pattern.to_string(),
+                    compiled: None,
+                }),
+                ignore_case: false,
+            });
+            v.compile_safe_regexes().expect("pattern compiles");
+            matcher(v).matches(&md)
+        };
+        assert_eq!(safe_regex("^prod-[0-9]+$"), Some(true));
+        // A non-matching pattern must return Some(false) — NOT None. Only an
+        // unresolved PATH yields None; a resolved value that the regex rejects
+        // is a definite "no", so it must NOT fall back to
+        // `match_if_key_not_found` (the same tri-state distinction
+        // `resolution_contract_is_option_bool` pins for Exact).
+        assert_eq!(safe_regex("^stage-[0-9]+$"), Some(false));
+        // NB the anchoring/full-match semantics of `SafeRegex` itself are
+        // phase-35/36 `StringMatcher` surface, NOT the metadata route, and are
+        // deliberately not asserted here — this test's job is that SafeRegex
+        // ROUTES through the engine, yields the tri-state correctly, and does
+        // not panic on the metadata path.
+        //
+        // An ABSENT key short-circuits before the value matcher runs, so the
+        // `.expect()` is never reached with a missing key.
+        let mut unresolved = ValueMatcher::StringMatch(StringMatcher {
+            mode: StringMatcherMode::SafeRegex(crate::bootstrap::SafeRegex {
+                regex: "^prod-[0-9]+$".to_string(),
+                compiled: None,
+            }),
+            ignore_case: false,
+        });
+        unresolved.compile_safe_regexes().expect("pattern compiles");
+        assert_eq!(matcher(unresolved).matches(&store(&[])), None);
+
         // present_match (phase-36 §A1 semantics `match = present && want`): the
         // path RESOLVED here, so it reduces to `want`. An ABSENT key returns
-        // None and takes `match_if_key_not_found` instead (CF-74-5: the
-        // present_match composition is pinned in-process, not live-probed).
+        // None and takes `match_if_key_not_found` instead. **MEASURED
+        // cross-proxy** at the phase-74 state-5 code-review (probe group 1,
+        // sinks S4/S5 — exact complements, both proxies agreeing on every
+        // cell), which CLOSED CF-74-5; `BEHAVIOR_CONTRACT.md` §G carries the
+        // table.
         assert_eq!(
             matcher(ValueMatcher::PresentMatch(true)).matches(&md),
             Some(true)

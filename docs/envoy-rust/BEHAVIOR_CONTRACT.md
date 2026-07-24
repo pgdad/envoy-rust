@@ -2460,11 +2460,15 @@ PARITY. Inside `matcher`, upstream PGV requires `filter` (`min_len 1`), `path`
 (`message.required`); envoy-rust enforces the same three fail-loud via
 `ConfigError::AccessLogMetadataMatcherInvalid` (plus `ConfigError::Yaml` for a
 missing `value`, which is a non-`Option` field). `match_if_key_not_found` is a
-`google.protobuf.BoolValue` **WRAPPER** (`{ value: true }` is accepted alongside
-a bare `true`), so absent and explicit-`false` are DISTINCT on the wire —
-modelled as `Option<bool>`. The message is CLOSED (an unknown key is a hard
-error on both sides). The `filter:` namespace is an OPAQUE, unvalidated string:
-neither proxy checks that any filter ever writes it.
+`google.protobuf.BoolValue` **WRAPPER**, so absent and explicit-`false` are
+DISTINCT on the wire — modelled as `Option<bool>`. **The two spellings are NOT
+at parity:** upstream accepts BOTH the bare `true`/`false` and the wrapped
+`{ value: <bool> }` form, while envoy-rust accepts ONLY the bare form and is
+BOOT-FATAL on the wrapped one — see **§D** and **CF-74-6**. Every fixture and
+example in this project therefore writes the bare form, which IS at parity. The
+message is CLOSED (an unknown key is a hard error on both sides). The `filter:`
+namespace is an OPAQUE, unvalidated string: neither proxy checks that any filter
+ever writes it.
 
 **§B Decision.** `resolved = dynamic_metadata[matcher.filter][matcher.path[0].key]`;
 `None` (unresolved, or no `matcher` at all) → `match_if_key_not_found`;
@@ -2500,9 +2504,41 @@ load, never a silent runtime difference): no `invert` field (§C); single-segmen
 FLAT `namespace → key → string`, in which a nested path is unrepresentable —
 CF-74-2); `ValueMatcher` limited to `string_match`/`present_match` (upstream also
 accepts `bool_match`, `double_match`, `list_match`, `null_match`, `or_match` —
-CF-74-3, blocked on the same string-only store). NB the RBAC-scoped
-`validate_metadata_matcher` does NOT check the empty path-segment `key` that this
-access-log validator does — an asymmetry recorded as CF-74-4, not fixed here.
+CF-74-3, blocked on the same string-only store); and **the wrapped
+`google.protobuf.BoolValue` spelling of `match_if_key_not_found` — CF-74-6**
+(below). NB the RBAC-scoped `validate_metadata_matcher` does NOT check the empty
+path-segment `key` that this access-log validator does — an asymmetry recorded as
+CF-74-4, not fixed here.
+
+**CF-74-6 — the wrapped `BoolValue` spelling** (MEASURED at the phase-74 §5 state-5
+code-review, with a control). `match_if_key_not_found` is a
+`google.protobuf.BoolValue`, so upstream accepts the wrapped map form as well as
+the bare scalar:
+
+| probe | real Envoy v1.33.0 | envoy-rust |
+|---|---|---|
+| `match_if_key_not_found: false` (bare) | `configuration OK` | accepted (fixture `0082`) |
+| `match_if_key_not_found: { value: false }` (wrapped) | `configuration OK`; boots; **HONORED** at runtime — the key-absent record was DROPPED, so it was parsed as `false`, not defaulted to `true` | **BOOT-FATAL**, exit 1: `invalid type: map, expected a boolean` |
+| **CONTROL** `match_if_key_not_found: { bogus: false }` | **REJECTED**, naming `message google.protobuf.BoolValue … no such field: 'bogus'` | — |
+
+The `{ bogus: false }` control is what makes this decisive: it proves upstream's
+parser genuinely interprets the map **as a `BoolValue` message** rather than
+ignoring it, and the runtime probe proves the value is **honored**, not merely
+accepted. envoy-rust models the field as `Option<bool>`, which cannot deserialize
+a YAML mapping.
+
+**The `Option<bool>` model is CORRECT and must not be "fixed" in isolation** — it
+is what preserves the absent-vs-explicit-`false` distinction the wrapper carries
+(§B: absent resolves to `true`), which a bare `bool` would lose. The house
+precedent for proto wrapper fields is likewise bare-only (`UInt32Value`, ADR-0063,
+pinned by `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`). Like every
+other §D entry this is **fail-loud in the REJECT direction** — envoy-rust refuses
+to BOOT, so runtime behavior is never silently different. Pinned by
+`metadata_filter_deserialize_round_trip_and_defaults`, which asserts BOTH wrapped
+polarities are errors AND that the error names the wrapper shape. Owner =
+a future wrapper-spelling-parity phase, which should ALSO survey the other
+`Option<bool>` / `Option<u32>` wrapper-typed fields for the same gap rather than
+closing this one field alone.
 
 **§E Mutual exclusion.** `metadata_filter` joins the SIX-arm `AccessLogFilter`
 oneof (`status_code_filter`, `response_flag_filter`, `header_filter`,
@@ -2518,11 +2554,27 @@ that operator has its own parser and is NOT constrained by `REQ_ALLOW_LIST`
 value when present and `-` when either the namespace or the key is absent, on
 both proxies.
 
-**§G Derived, not separately measured.** R-0.3/R-0.4 measured the decision rule
-with a `string_match` value. Because the value matcher is consulted ONLY when the
-path resolves, `present_match: true` → KEEP and `present_match: false` → DROP for
-a RESOLVED key, while an ABSENT key takes `match_if_key_not_found` in both cases.
-That composition is pinned in-process only — carry-forward CF-74-5.
+**§G `present_match` on the RESOLVED branch — MEASURED cross-proxy (CF-74-5 CLOSED).**
+R-0.3/R-0.4 measured the decision rule with a `string_match` value, leaving
+`present_match` on the resolved branch DERIVED from the structural rule (the value
+matcher is consulted only when the path resolves). The phase-74 §5 state-5
+code-review **measured it directly** against `envoyproxy/envoy:v1.33.0` (probe
+group 1, one H1 config pair, seven requests: `r1 x-a:1` · `r2 x-a:2` · `r3` none ·
+`r4 x-b:1` · `r5 x-a:1,x-b:1` · `r6 x-a:2,x-b:1` · `r7 x-c:1`):
+
+| sink | filter | kept — real Envoy | kept — envoy-rust | verdict |
+|---|---|---|---|---|
+| S4 | `metadata_filter { matcher: { …, value: { present_match: true } }, match_if_key_not_found: false }` | r1 r2 r5 r6 | r1 r2 r5 r6 | **PARITY** |
+| S5 | `metadata_filter { matcher: { …, value: { present_match: false } }, match_if_key_not_found: true }` | r3 r4 r7 | r3 r4 r7 | **PARITY** |
+
+S4 and S5 are **exact complements** over the seven requests, and both proxies agree
+on every cell. The derived rule is confirmed: with the key RESOLVED,
+`present_match: true` KEEPS and `present_match: false` DROPS; with the key ABSENT
+both defer to `match_if_key_not_found` (which is why S4, whose policy is `false`,
+drops exactly the requests S5, whose policy is `true`, keeps). All seven per-sink
+files were byte-identical across the two proxies (`md5sum` of the per-side
+concatenation `380b58e471f8c0c545d02a5e8b7b9df3` on both sides). Pinned in-process
+by `reuses_the_value_matcher_engine_verbatim`. **CF-74-5 is CLOSED.**
 
 **§H Authoritative fixtures.** `0081`: `metadata_filter { matcher: { filter:
 com.example, path: [{key: k}], value: { string_match: { exact: "1" } } } }` over a

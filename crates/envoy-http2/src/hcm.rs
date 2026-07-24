@@ -3454,7 +3454,8 @@ static_resources:
     /// 404 (`response_flags == "NR"` → 1 line) and SUPPRESS a clean
     /// direct-response 503 (`response_flags == "-"` → 0 lines). Exercises the
     /// widened `should_log(record.response_code, &record.response_flags,
-    /// &envoy_req.headers, &Default::default())` gate (phase 72 added the header slice) end-to-end;
+    /// &envoy_req.headers, &record.dynamic_metadata)` gate (phase 72 added the
+    /// header slice, phase 74 the metadata store) end-to-end;
     /// `access_logs_total` counts emitted only.
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_response_flag_filter_suppresses_no_flag() {
@@ -3556,7 +3557,8 @@ static_resources:
     /// Phase 72 §5.2 state-3 (REVIEW.md F-2): the H2 sibling of the H1
     /// `header_filter` emit gate. The H2 emit loop threads the post-decode
     /// `&envoy_req.headers` snapshot into the widened
-    /// `should_log(status, flags, headers, &Default::default())` gate (hcm.rs ~1138); this test
+    /// `should_log(status, flags, headers, dynamic_metadata)` gate
+    /// (hcm.rs ~1138); this test
     /// exercises that threaded slice end-to-end. A sink carrying
     /// `LogFilter::Header { exact "yes" on x-log }` must KEEP `GET /x` with
     /// `x-log: yes` and DROP both the present-MISMATCH (`x-log: no`) and the
@@ -3661,6 +3663,168 @@ static_resources:
             stats.value(),
             1,
             "the single kept record ticks access_logs_total"
+        );
+    }
+
+    /// Phase 74 §5.2 state-3 re-entry (`REVIEW.md` I-2): the H2 sibling of the
+    /// H1 `metadata_filter` emit gate. The H2 emit loop threads
+    /// `&record.dynamic_metadata` into the widened `should_log(status, flags,
+    /// headers, dynamic_metadata)` gate (hcm.rs ~1138); BEFORE this test that
+    /// one argument was undefended — mutating it to `&Default::default()` failed
+    /// no test in the workspace, because no H2 fixture carries an access-log
+    /// filter (`0076`–`0082` are all H1) and every other H2 in-process filter
+    /// test builds a `StatusCode`/`ResponseFlag`/`Header` arm, none of which
+    /// reads the 4th argument. The gate itself was MEASURED at full cross-proxy
+    /// parity over HTTP/2 at the state-5 code-review, so this pins CORRECT
+    /// behavior rather than fixing a bug.
+    ///
+    /// TWO sinks share one server run so BOTH `match_if_key_not_found` polarities
+    /// are pinned against the SAME threaded store — which is what makes the pin
+    /// discriminating in both directions: feeding an empty store would make the
+    /// `false` sink drop everything (0 lines, not 1) AND the default-`true` sink
+    /// keep everything (3 lines, not 2).
+    ///
+    /// The chain is `[header_to_metadata, router]` mapping request header `x-a`
+    /// → `com.example:k`, exactly as differential fixtures `0081`/`0082` do on
+    /// H1. The standalone H2 *differential* stays deferred (M71-6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_metadata_filter_gate_reads_the_threaded_dynamic_metadata() {
+        use envoy_config::{
+            HeaderToMetadataConfig, HeaderToMetadataKeyValue, HeaderToMetadataRule,
+            HeaderToMetadataType, MetadataMatcher, MetadataPathSegment, StringMatcher,
+            StringMatcherMode, ValueMatcher,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let drop_path = tmp.path().join("mifknf-false.log");
+        let keep_path = tmp.path().join("mifknf-default.log");
+
+        // Box the config `MetadataMatcher` into the ADR-0150 `MetadataMatch`
+        // seam, exactly as `compile_access_log_filter` does at runtime.
+        let matcher = || {
+            std::sync::Arc::new(MetadataMatcher {
+                filter: "com.example".to_string(),
+                path: vec![MetadataPathSegment {
+                    key: "k".to_string(),
+                }],
+                value: ValueMatcher::StringMatch(StringMatcher {
+                    mode: StringMatcherMode::Exact("1".to_string()),
+                    ignore_case: false,
+                }),
+            }) as std::sync::Arc<dyn envoy_accesslog::MetadataMatch>
+        };
+        let sink_for = |path: &std::path::Path, match_if_key_not_found: bool| {
+            let path = path.to_path_buf();
+            async move {
+                let fmt = envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE%\n")
+                    .expect("format parses");
+                std::sync::Arc::new(
+                    envoy_accesslog::FileSink::new(
+                        path,
+                        fmt,
+                        Some(envoy_accesslog::LogFilter::Metadata {
+                            matcher: Some(matcher()),
+                            match_if_key_not_found,
+                        }),
+                    )
+                    .await
+                    .expect("open FileSink"),
+                )
+            }
+        };
+        let drop_sink = sink_for(&drop_path, false).await;
+        let keep_sink = sink_for(&keep_path, true).await;
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "x".to_string(),
+                        r#match: RouteMatch {
+                            prefix: None,
+                            path: Some("/x".to_string()),
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("hi\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![
+                HttpFilter {
+                    name: "envoy.filters.http.header_to_metadata".to_string(),
+                    typed_config: HttpFilterTypedConfig::HeaderToMetadata(HeaderToMetadataConfig {
+                        request_rules: vec![HeaderToMetadataRule {
+                            header: "x-a".to_string(),
+                            on_header_present: Some(HeaderToMetadataKeyValue {
+                                metadata_namespace: "com.example".to_string(),
+                                key: "k".to_string(),
+                                value: None,
+                                r#type: HeaderToMetadataType::String,
+                            }),
+                            // Deliberately absent, exactly as fixture 0082
+                            // requires: an `on_header_missing` block would
+                            // WRITE the key on the no-`x-a` probe, so the
+                            // path would RESOLVE and the key-not-found
+                            // branch below would never be taken.
+                            on_header_missing: None,
+                        }],
+                    }),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![drop_sink, keep_sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        // 1. `x-a: 2` → com.example:k = "2" → the path RESOLVES and the value
+        //    matcher (`exact "1"`) says no → DROPPED by BOTH sinks. The
+        //    not-found policy is NOT consulted on a resolved path.
+        h2_header_filter_roundtrip(addr, "/x", &[("x-a", "2")], 200).await;
+        // 2. no `x-a` → the key is genuinely ABSENT → the two sinks diverge
+        //    purely on `match_if_key_not_found`.
+        h2_header_filter_roundtrip(addr, "/x", &[], 200).await;
+        // 3. `x-a: 1` → resolves and matches → KEPT by BOTH sinks.
+        h2_header_filter_roundtrip(addr, "/x", &[("x-a", "1")], 200).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let dropped = tokio::fs::read_to_string(&drop_path).await.unwrap();
+        assert_eq!(
+            dropped, "200\n",
+            "match_if_key_not_found=false must keep ONLY the value-matching \
+             `x-a: 1` request — the mismatch and the key-absent request both \
+             drop: {dropped:?}"
+        );
+        let kept = tokio::fs::read_to_string(&keep_path).await.unwrap();
+        assert_eq!(
+            kept, "200\n200\n",
+            "match_if_key_not_found=true must keep the key-absent request TOO, \
+             for two lines — while still dropping the value MISMATCH: {kept:?}"
         );
     }
 

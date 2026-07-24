@@ -23,19 +23,36 @@ metadata_filter:
       string_match: { exact: "1" }
 ```
 
-and ONE `direct_response` route (`/x` → 200 `hi`). Two probes:
+and ONE `direct_response` route (`/x` → 200 `hi`). Three probes:
 
-| # | request | `com.example:k` | `exact: "1"` matches? | emitted? |
+| # | request | `com.example:k` | branch taken | emitted? |
 |---|---|---|---|---|
-| 1 | `GET /x` `x-a: 2` | `"2"` | no | **DROPPED** |
-| 2 | `GET /x` `x-a: 1` | `"1"` | yes | **KEPT** |
+| 1 | `GET /x` `x-a: 2` | `"2"` | resolved → `exact: "1"` says **no** | **DROPPED** |
+| 2 | `GET /x` (no `x-a`) | *absent* | unresolved → `match_if_key_not_found` **default `true`** | **KEPT** |
+| 3 | `GET /x` `x-a: 1` | `"1"` | resolved → `exact: "1"` says **yes** | **KEPT** |
 
-The access-log file on EACH proxy holds EXACTLY ONE byte-identical line
-(MEASURED, SPEC §0 R-0.3, graceful-stop flush):
+The access-log file on EACH proxy holds EXACTLY TWO byte-identical lines, in this
+order (MEASURED, SPEC §0 R-0.3/R-0.4, graceful-stop flush):
 
 ```
+STATUS=200 PATH=/x M=-
 STATUS=200 PATH=/x M=1
 ```
+
+The two kept lines are byte-DISTINCT, so the fixture pins line ORDER as well as
+the count — a "logged the right number of records but the wrong ones" bug cannot
+survive it.
+
+**Probe 2 exists to make this fixture read the `match_if_key_not_found` wrapper
+DEFAULT** (phase 74 §5.2 state-3 re-entry, `REVIEW.md` I-3). Originally `0081`
+omitted the field but BOTH its probes sent `x-a`, so the key always resolved and
+the default was never consulted, while sibling `0082` pins the field to explicit
+`false` — meaning **no committed fixture exercised the `None → true` KEEP branch**,
+the phase's headline observable. It was pinned only by envoy-rust asserting
+against itself in-process: mutating `unwrap_or(true)` → `unwrap_or(false)` REDdened
+a unit test but left every differential fixture green. It is now witnessed
+cross-proxy here. Note this branch is exactly what `--mode validate` provably
+CANNOT reach, because it is a proto3 `google.protobuf.BoolValue` default.
 
 ## The MEASURED decision rule (SPEC §0 R-0.3/R-0.4, ADR-0155)
 
@@ -45,13 +62,21 @@ resolved = dynamic_metadata[matcher.filter][matcher.path[0].key]
   Some(v)                                    => matcher.value.matches(v)
 ```
 
-Both probes here RESOLVE the key, so both take the `Some(v)` branch and the
-value matcher alone decides. `match_if_key_not_found` is deliberately **ABSENT**
-from this fixture — its MEASURED default is `true`, but since the key always
-resolves the not-found path is never taken. Fixture `0082` sets it explicitly to
-`false` and probes the absent-key path, which is the observable that
-`--mode validate` provably cannot reach (a proto3 `google.protobuf.BoolValue`
-wrapper default).
+Probes 1 and 3 RESOLVE the key, so they take the `Some(v)` branch and the value
+matcher alone decides. Probe 2 does NOT, so it takes the `None` branch.
+`match_if_key_not_found` is deliberately **ABSENT** from this fixture, which is
+precisely the point: absent means the MEASURED default `true`, so probe 2 is
+KEPT. Sibling fixture `0082` sets the field explicitly to `false` and shows the
+SAME no-`x-a` probe flipping to DROPPED — the two fixtures together witness both
+polarities of the wrapper default cross-proxy.
+
+> **`on_header_missing` must NOT be added to this fixture either.** The
+> `header_to_metadata` rule carries `on_header_present` ONLY. envoy-rust requires
+> a `value` on an `on_header_missing` block, and supplying one would WRITE
+> `com.example:k` on the no-`x-a` probe — the key would RESOLVE, probe 2 would be
+> decided by the VALUE matcher instead of the not-found policy, and the
+> default-`true` witness would be silently vacated. This is the same trap
+> documented in `0082`'s README (ADR-0155 PV-6).
 
 > **Why the line CAN echo the gating value here** (unlike `0079`/`0080`).
 > `%DYNAMIC_METADATA(namespace:key)%` is a SEPARATE command operator with its own
@@ -60,7 +85,9 @@ wrapper default).
 > (`ConfigError::InvalidAccessLogFormat` — `BEHAVIOR_CONTRACT.md` §F and the
 > phase-73 §D note), which is why the sibling composition fixtures render only
 > `STATUS`+`PATH`. The operator renders the raw unquoted value when present and
-> `-` when either the namespace or the key is absent, on both proxies.
+> `-` when either the namespace or the key is absent — **both renderings are
+> witnessed directly by this fixture on both proxies** (probe 3 → `M=1`, probe 2
+> → `M=-`).
 
 > **`matcher.invert` may NOT be used in any fixture.** It is MEASURED
 > accepted-but-INERT upstream on this path (reproduced twice; an `invertBOGUS`
@@ -75,11 +102,13 @@ wrapper default).
 ## Probes / driver
 
 `kind: http1_access_log_byte_exact`. Probe ordering follows the **kept-LAST**
-convention (ADR-0147): the DROPPED probe comes first and the KEPT probe last, so
-the driver's ordering-aware `suppression_settle` pays the cheap 2 s
-`CF70_3_SETTLE` rather than the 12 s `CF71_1_SETTLE`. The assertion is PURE
-cross-proxy equality — both proxies must agree on the KEPT line AND on the
-ABSENCE of any line for the value-mismatching probe.
+convention (ADR-0147): the single DROPPED probe comes first and both KEPT probes
+follow, so the driver's ordering-aware `suppression_settle` pays the cheap 2 s
+`CF70_3_SETTLE` rather than the 12 s `CF71_1_SETTLE`. That is why probe 2 is
+placed SECOND rather than appended last. `expected_logged_count` is therefore
+**2**. The assertion is PURE cross-proxy equality — both proxies must agree on
+the two KEPT lines, in order, AND on the ABSENCE of any line for the
+value-mismatching probe.
 
 `clusters: []` — the only route is a `direct_response`, so no backend spawns.
 

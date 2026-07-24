@@ -648,6 +648,38 @@ held in reserve as a formality.
   `list_match`, `null_match`, `or_match`; R-0.2/R-0.8), blocked on the same
   string-only store. Owner = the same future phase as CF-74-2.
 
+**OPENED LATER IN THE PHASE** (recorded here so this §10 stays the phase's single
+carry-forward ledger — see `PLAN.md`'s carry-forward section and `REVIEW.md`):
+
+- **CF-74-4** *(opened at the state-2 PLAN-write)* — the RBAC-scoped
+  `validate_metadata_matcher` does NOT check that a path segment's `key` is
+  non-empty, though upstream PGV enforces `min_len 1`. The access-log validator
+  added by this phase DOES. Fixing the RBAC side means touching
+  `RbacMetadataMatcherInvalid`'s six coupled tests — out of scope. Owner = the
+  next RBAC-matcher phase.
+- **CF-74-5** *(opened at the state-2 PLAN-write)* — **CLOSED at the §5.2 state-3
+  re-entry.** `present_match` on the RESOLVED branch was DERIVED from the measured
+  rule rather than separately live-probed. The §5 state-5 code-review MEASURED it
+  cross-proxy in BOTH polarities (probe group 1 sinks S4/S5 — exact complements
+  over seven requests, both proxies agreeing on every cell, per-side `md5sum`
+  `380b58e471f8c0c545d02a5e8b7b9df3`). `BEHAVIOR_CONTRACT.md` §G was upgraded from
+  "derived, not separately measured" to MEASURED and carries the table.
+- **CF-74-6** *(opened by the state-5 code-review, `REVIEW.md` I-1)* — the wrapped
+  `google.protobuf.BoolValue` spelling `match_if_key_not_found: { value: <bool> }`
+  is ACCEPTED and HONORED upstream (MEASURED, with a `{ bogus: false }` control
+  that upstream rejects naming `google.protobuf.BoolValue`, proving the field is
+  genuinely wrapper-typed) but is BOOT-FATAL in envoy-rust
+  (`invalid type: map, expected a boolean`). A load-parity gap in the REJECT
+  direction — fail-loud, never a silent runtime difference. **The `Option<bool>`
+  model is CORRECT and must not be "fixed" in isolation**: it is what preserves
+  the absent-vs-explicit-`false` distinction the wrapper carries, and the house
+  precedent for wrapper fields is bare-only (`UInt32Value`, ADR-0063). Recorded in
+  `BEHAVIOR_CONTRACT.md` §D and pinned by
+  `metadata_filter_deserialize_round_trip_and_defaults`. Owner = a future
+  wrapper-spelling-parity phase, which should ALSO survey the other
+  `Option<bool>` / `Option<u32>` wrapper-typed fields rather than closing this one
+  field alone.
+
 **NOT consumed** (owner = whatever future phase touches their surface):
 
 - **CF-72-1** (the shared-engine value-matcher `absent+invert` divergence —

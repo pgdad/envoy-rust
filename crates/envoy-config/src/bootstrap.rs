@@ -724,21 +724,21 @@ pub struct AccessLog {
 pub struct AccessLogFilter {
     pub status_code_filter: Option<StatusCodeFilter>,
     /// Phase 71: the SECOND `AccessLogFilter` arm — gates emission on the
-    /// record's response-flag token. Mutually exclusive with
-    /// `status_code_filter` (cardinality enforced by `validate_access_logs`).
+    /// record's response-flag token. Mutually exclusive with the other arms
+    /// (cardinality enforced by `validate_access_logs`).
     pub response_flag_filter: Option<ResponseFlagFilter>,
     /// Phase 72: the THIRD `AccessLogFilter` arm — gates emission on whether a
     /// named request header matches `header`. Mutually exclusive with the other
-    /// two arms (cardinality enforced by `validate_access_logs`).
+    /// arms (cardinality enforced by `validate_access_logs`).
     pub header_filter: Option<HeaderFilter>,
     /// Phase 73: the FOURTH `AccessLogFilter` arm — the recursive AND
     /// composition. Emit iff ALL nested child predicates match. `filters` is
     /// PGV `min_items = 2` (enforced by `validate_access_logs`). Mutually
-    /// exclusive with the other four arms.
+    /// exclusive with the other arms.
     pub and_filter: Option<AndFilter>,
     /// Phase 73: the FIFTH `AccessLogFilter` arm — the recursive OR composition.
     /// Emit iff ANY nested child predicate matches. `min_items = 2`. Mutually
-    /// exclusive with the other four arms.
+    /// exclusive with the other arms.
     pub or_filter: Option<OrFilter>,
     /// Phase 74: the SIXTH `AccessLogFilter` arm — gates emission on the
     /// request's DYNAMIC METADATA. Mutually exclusive with the other arms.
@@ -771,11 +771,18 @@ pub struct OrFilter {
 /// BOTH fields are `Option` for MEASURED reasons:
 ///   - `matcher` — upstream ACCEPTS a matcher-less `metadata_filter: {}`
 ///     (`configuration OK`, R-0.2); rejecting it would break LOAD PARITY. A
-///     matcher-less filter keeps every record.
+///     matcher-less filter takes the not-found policy for EVERY record — so it
+///     keeps every record when `match_if_key_not_found` is absent or `true`, and
+///     DROPS every record when it is explicitly `false` (both polarities
+///     MEASURED cross-proxy at the state-5 code-review, probe group 1 S6/S7).
 ///   - `match_if_key_not_found` — it is a `google.protobuf.BoolValue` WRAPPER
-///     (R-0.2: `{ value: true }` is accepted alongside a bare `true`), so absent
-///     and explicit-`false` are DISTINCT on the wire. `None` means "default",
-///     resolved to `true` at compile (R-0.4). A bare `bool` would lose that.
+///     (R-0.2: upstream accepts the wrapped `{ value: true }` alongside a bare
+///     `true`), so absent and explicit-`false` are DISTINCT on the wire. `None`
+///     means "default", resolved to `true` at compile (R-0.4). A bare `bool`
+///     would lose that. NB only the BARE spelling parses here — the wrapped one
+///     is boot-fatal, a documented load-parity gap in the REJECT direction
+///     (CF-74-6, `BEHAVIOR_CONTRACT.md` §D), pinned by
+///     `metadata_filter_deserialize_round_trip_and_defaults`.
 ///
 /// `MetadataMatcher` is REUSED VERBATIM from the phase-35/36 RBAC `metadata`
 /// condition — upstream's `metadata_filter.matcher` is the same
@@ -795,8 +802,7 @@ pub struct MetadataFilter {
 /// PGV-required — an empty `header_filter: {}` is rejected fail-loud at
 /// deserialize (missing field → `ConfigError::Yaml`), matching upstream's
 /// `HeaderFilterValidationError.Header: value is required`. Mutually exclusive
-/// with `status_code_filter` / `response_flag_filter` (cardinality enforced by
-/// `validate_access_logs`).
+/// with the other arms (cardinality enforced by `validate_access_logs`).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderFilter {
@@ -13269,7 +13275,7 @@ or_filter: null
     #[test]
     fn and_filter_alongside_header_filter_is_ambiguous() {
         // A composition arm set alongside a leaf arm violates the oneof cardinality
-        // (exactly one across all FIVE arms).
+        // (exactly one across all the arms).
         let mut logs = vec![AccessLog {
             name: "envoy.access_loggers.file".into(),
             typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
@@ -13476,6 +13482,41 @@ metadata_filter:
             .is_err(),
             "matcher.invert must stay boot-fatal (CF-74-1)"
         );
+
+        // CF-74-6 (phase 74 §5.2 state-3 re-entry, `REVIEW.md` I-1): the WRAPPED
+        // `google.protobuf.BoolValue` spelling `match_if_key_not_found: { value:
+        // <bool> }` is a DELIBERATE, DOCUMENTED load-parity gap in the REJECT
+        // direction, and this pin fixes the posture in place.
+        //
+        // MEASURED at the state-5 code-review against `envoyproxy/envoy:v1.33.0`:
+        // upstream ACCEPTS the wrapped form (`configuration OK`), boots, and
+        // HONORS it (with `{ value: false }` the key-absent record was DROPPED,
+        // so it was parsed as `false`, not defaulted to `true`); a `{ bogus:
+        // false }` CONTROL is REJECTED naming `message
+        // google.protobuf.BoolValue … no such field: 'bogus'`, proving the field
+        // is genuinely wrapper-typed rather than ignored. envoy-rust is
+        // BOOT-FATAL here (`invalid type: map, expected a boolean`, exit 1).
+        //
+        // This pins the POSTURE, not a bug: the `Option<bool>` model is CORRECT
+        // — it is what preserves the absent-vs-explicit-`false` distinction that
+        // a bare `bool` would lose — and the house precedent for wrapper fields
+        // is bare-only (`UInt32Value`, ADR-0063, pinned by
+        // `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`). The pin
+        // therefore FAILS if someone swaps `Option<bool>` for a
+        // wrapper-accepting deserializer without first closing CF-74-6
+        // deliberately, across ALL the wrapper fields, with fixtures.
+        // `BEHAVIOR_CONTRACT.md` §D records the divergence.
+        for wrapped in [
+            "match_if_key_not_found: { value: true }",
+            "match_if_key_not_found: { value: false }",
+        ] {
+            let err = serde_yaml::from_str::<MetadataFilter>(wrapped)
+                .expect_err("the wrapped BoolValue spelling stays boot-fatal (CF-74-6)");
+            assert!(
+                err.to_string().contains("expected a boolean"),
+                "CF-74-6 must fail-loud on the WRAPPER SHAPE, not incidentally: {err}"
+            );
+        }
     }
 
     #[test]

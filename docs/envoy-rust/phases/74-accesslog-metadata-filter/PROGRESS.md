@@ -142,9 +142,23 @@ sites matched the plan exactly (10 in `envoy-http1/src/hcm.rs`, 3 in
 - **Call-site fan-out:** driven by the compiler. Rather than hand-editing ~98
   sites, a balanced-paren script appended `&Default::default()` to exactly those
   `should_log(` calls with THREE top-level arguments (skipping the definition
-  sites and the two already-widened production gates): **80 call sites patched** —
-  `filter.rs` 36, `file_sink.rs` 4, `envoy-http1/hcm.rs` 38, `envoy-http2/hcm.rs` 2.
+  sites and the two already-widened production gates): **80 lines patched, of
+  which 78 are genuine CALL SITES and 2 are DOC COMMENTS** —
+  `filter.rs` 36, `file_sink.rs` 4, `envoy-http1/hcm.rs` 38 (all call sites), and
+  `envoy-http2/hcm.rs` 2 (**both `///` prose, NOT calls**).
   `cargo build --workspace --all-targets` → **0 errors**.
+  > **CORRECTED at the §5.2 state-3 re-entry** (`REVIEW.md` I-2b — the phase's
+  > only undocumented deviation). This bullet originally read "**80 call sites
+  > patched**", counting two doc-comment lines as code. The script's
+  > balanced-paren rule had no `///` guard, so it rewrote prose describing the
+  > production gate into `&Default::default()` — i.e. into the claim that the
+  > gate feeds an EMPTY metadata store, precisely backwards. `cargo fmt` does not
+  > reflow doc comments, so the fmt pass did not surface it. Both comments were
+  > restored (and re-wrapped) at the re-entry. Re-derived on disk with
+  > `git show 796450d --numstat -- crates/envoy-http2/src/hcm.rs` → `3 2`, whose
+  > three `+` lines are ONE production argument (`&record.dynamic_metadata,`) and
+  > TWO `///` lines; and `grep "should_log(" crates/envoy-http2/src/hcm.rs |
+  > grep -v "///"` → exactly **1**, the real gate.
 - **DEVIATION from the plan (resolved per D-3.5, recorded here):** the plan's
   T3 Step 5 expects `cargo clippy … -D warnings` clean, but it REDs with
   `error: … only_used_in_recursion` on `dynamic_metadata` — a genuine and
@@ -563,12 +577,16 @@ unchanged by this phase. **No dep patch-bump was needed.**
 invocations finished in ~0.1 s because the state-3 session had already built this
 exact tree, so cargo's fingerprints were fresh. Rather than accept a cached
 green, the phase's ten changed `.rs` files were `touch`ed and workspace clippy
-re-run — it then genuinely re-analysed **all 15 workspace crates**
+re-run — it then genuinely re-analysed **15 workspace crates**
 (`Checking envoy-accesslog`, `Checking envoy-config`, `Checking envoy-http1`,
 `Checking envoy-http2`, `Checking differential`, …; `cargo clippy` emits
 `Checking`, not `Compiling`) and still reported **zero warnings, zero errors,
-exit 0**. Independently, `cargo test --workspace` built and ran **159 test
-binaries** on this tree, which is itself full-target compilation evidence.
+exit 0**. (Corrected at the §5.2 state-3 re-entry per `REVIEW.md` M74-15(b):
+15 is the number RE-CHECKED after touching four crates, not the workspace size —
+`[workspace] members` lists **22**.) Independently, `cargo test --workspace` emitted **159 `test result:` lines** on
+this tree, which is itself full-target compilation evidence. (Corrected at the
+§5.2 state-3 re-entry per `REVIEW.md` M74-15(a): 159 counts `test result:` LINES,
+which include doc-test lines, so it over-counts test BINARIES.)
 
 ### Invariant spot-checks (cheap, non-negotiable)
 
@@ -577,8 +595,12 @@ binaries** on this tree, which is itself full-target compilation evidence.
   the metadata matcher is an injected `Arc<dyn MetadataMatch>` trait object.
 - **`LogFilter` still derives ONLY `#[derive(Debug, Clone)]`** — no `Eq`, no
   `PartialEq` was added.
-- **D-3.8 holds** — `#![forbid(unsafe_code)]` present in **14 of 14** workspace
-  crate roots.
+- **D-3.8 holds** — `#![forbid(unsafe_code)]` present in **14 of 14** crate roots
+  under `crates/`, and in fact in **22 of 22** workspace MEMBER roots (the
+  workspace also has `tests/differential`, `tests/conformance/h2spec` and the six
+  `tests/helpers/*` crates). Re-measured at the §5.2 state-3 re-entry per
+  `REVIEW.md` M74-15(c), which noted the original figure UNDERSTATES coverage
+  rather than overclaiming.
 - **ROADMAP row `74` untouched** (`in-progress`); **`DECISIONS.md` ledger head is
   ADR-0155** and there is **no `## ADR-0156` section** — the §6.1 split
   reservation stays UNFIRED, as PV-8 determined.
@@ -598,3 +620,418 @@ fixtures additionally passed under full parallel differential load, which the
 state-3 isolated runs could not show.
 
 Next: the §5 state-5 code-review (a SEPARATE session) — write `REVIEW.md`.
+
+---
+
+## §5.2 state-3 RE-ENTRY (fixing `REVIEW.md`'s four Important findings)
+
+> **§5.2 state-3 re-entry** (`superpowers:executing-plans` +
+> `superpowers:test-driven-development`, per `BOOTSTRAP_PROMPT.md` §5.2 — a
+> `REVIEW.md` with issues re-enters at **step 3, NOT step 4**). A SEPARATE
+> session from the state-5 code-review that produced the findings (§5.1 /
+> ADR-0127). It does NOT re-run the §7.5 gate (that is the SEPARATE state-4
+> RE-VERIFICATION), does NOT write a new `REVIEW.md`, does NOT flip ROADMAP row
+> `74`, and fires NO ADR (ledger head stays **ADR-0155**; **ADR-0156** remains
+> reserved for the §6.1 split and UNFIRED — no split occurred).
+
+### STEP 0 confirmation (disk-authoritative)
+
+- `git status --porcelain` clean; branch `main`; `HEAD` = the phase-74 §5 state-5
+  code-review commit `93ec7393c2648751ac8323e1e02cc6d09b15f2e8`.
+- `git fetch origin --prune` → `origin/main` at the SAME SHA. No sibling
+  workstream had advanced; `REVIEW.md` present with verdict **APPROVED WITH
+  MUST-FIX**, so the `SKILL_ROUTING.md` state machine resolves to the §5.2
+  state-3 re-entry unambiguously.
+- CI on `93ec7393…` was already confirmed `completed`/`success` (run
+  `30055024452`, both jobs green with full step counts 15 and 13).
+
+### The governing fact, and how TDD's RED was honored
+
+**All four Important findings pin ALREADY-CORRECT code.** The state-5 review
+LIVE-PROBED every one of them cross-proxy against `envoyproxy/envoy:v1.33.0` and
+measured PARITY — they are pins the suite was MISSING, not bugs it was hiding
+(the one exception, I-1, is a documentation-accuracy defect about a REJECT-side
+load-parity gap). Every new pin therefore passes on its first run, which would
+make a naive "watch it fail" impossible.
+
+Per memory `state3-reentry-fixes-are-characterization-pins-red-via-mutation`,
+TDD's RED was honored with a **MUTATION check** on each: break the engine in
+exactly the way the finding warns about, watch the NEW pin go RED, revert.
+
+Mutations ran in a **scratch `git worktree`** (`git worktree add --detach`, per
+memory `mutation-checks-collide-with-parallel-subagents`), `git checkout --`-restored
+between runs and removed at the end; **the MAIN tree never carried a mutation** —
+verified after every check by grepping the mutated expression in the main tree
+(`unwrap_or(true)` intact at `envoy-http1/src/hcm.rs:1806`;
+`&record.dynamic_metadata` intact at `envoy-http2/src/hcm.rs:1142`). Every
+mutation run shows `Compiling <crate>` in its output, so none is a stale-binary
+false pass (memory `mutation-check-needs-forced-rebuild`; note `cargo clippy`
+prints `Checking`, not `Compiling` — memory `clippy-prints-checking-not-compiling`).
+No tree-mutating subagent was dispatched this session.
+
+### I-1 — the wrapped `BoolValue` load-parity divergence (DOC + PIN; NOT a code change)
+
+**What was wrong:** `BEHAVIOR_CONTRACT.md` §A presented the `BoolValue` wrapper
+acceptance as a **shared** property (`"{ value: true } is accepted alongside a
+bare true"`), and §D's "where envoy-rust is STRICTER" list omitted it — so a
+reader would conclude the wrapped spelling works here. MEASURED at state-5:
+upstream ACCEPTS `match_if_key_not_found: { value: false }`, boots, and HONORS it
+(the key-absent record was DROPPED); envoy-rust is BOOT-FATAL (`invalid type:
+map, expected a boolean`, exit 1). A `{ bogus: false }` CONTROL is rejected
+upstream naming `message google.protobuf.BoolValue`, proving the field is
+genuinely wrapper-typed rather than ignored. Project invariant §4.5 / D-3.3
+requires the contract be corrected, never left silently wrong.
+
+**Fixed:**
+- `BEHAVIOR_CONTRACT.md` **§A** corrected — it now states plainly that the two
+  spellings are **NOT at parity**, that upstream takes both while envoy-rust
+  takes only the bare one, and points at §D/CF-74-6.
+- `BEHAVIOR_CONTRACT.md` **§D** gained the divergence with its full measured
+  table (bare / wrapped / `{ bogus: false }` control), the reason the
+  `Option<bool>` model is CORRECT and must not be "fixed" in isolation, and the
+  ADR-0063 `UInt32Value` bare-only house precedent.
+- **CF-74-6 OPENED** in `BEHAVIOR_CONTRACT.md` §D and `SPEC.md` §10. Owner = a
+  future wrapper-spelling-parity phase, which should ALSO survey the other
+  `Option<bool>`/`Option<u32>` wrapper fields rather than close this one field
+  alone.
+- **Serde pin added** to `metadata_filter_deserialize_round_trip_and_defaults`
+  (`bootstrap.rs`): BOTH wrapped polarities (`{ value: true }` / `{ value: false }`)
+  must be errors, AND the error must name the wrapper shape
+  (`contains("expected a boolean")`) so the pin cannot pass for an unrelated
+  reason.
+- `MetadataFilter`'s own doc comment corrected — its `{ value: true }` example
+  read as if the wrapped spelling parsed HERE; it now says upstream accepts it
+  and that only the bare form parses here, naming CF-74-6.
+
+**`Option<bool>` was NOT replaced** with a wrapper-accepting deserializer, exactly
+as `REVIEW.md` directs: the model correctly preserves absent-vs-explicit-`false`,
+which is what makes `unwrap_or(true)` meaningful.
+
+**RED (mutation):** the pin guards a DELIBERATE POSTURE, so the faithful mutation
+is the change it exists to catch — swapping `Option<bool>` for a
+wrapper-accepting `deserialize_with` (an untagged `Bare(bool) | Wrapped { value }`
+enum) in the worktree:
+
+```
+---- bootstrap::tests::metadata_filter_deserialize_round_trip_and_defaults stdout ----
+panicked at crates/envoy-config/src/bootstrap.rs:13528:18:
+the wrapped BoolValue spelling stays boot-fatal (CF-74-6):
+    MetadataFilter { matcher: None, match_if_key_not_found: Some(true) }
+test result: FAILED. 0 passed; 1 failed
+```
+
+**GREEN:** `cargo test -p envoy-config --lib metadata_filter_deserialize` →
+`1 passed; 0 failed`.
+
+### I-2 — the H2 emit gate's metadata threading had ZERO coverage
+
+**What was wrong:** `crates/envoy-http2/src/hcm.rs:1142` passes
+`&record.dynamic_metadata`, and mutating that ONE argument to
+`&Default::default()` failed **no test in the workspace**: no H2 fixture carries
+an access-log filter (`0076`–`0082` are all H1), and the H2 in-process filter
+tests build only `StatusCode`/`ResponseFlag`/`Header` arms, none of which reads
+the 4th argument. The state-5 review measured the gate at full cross-proxy parity
+over HTTP/2, so this was an **undefended line, not a broken one** — but a future
+regression would be silent and severe (every H2 `metadata_filter` would see an
+empty store, logging everything or nothing).
+
+**Fixed:** added `h2_metadata_filter_gate_reads_the_threaded_dynamic_metadata` to
+`crates/envoy-http2/src/hcm.rs`, modelled on the phase-72 precedent
+`h2_header_filter_keeps_match_drops_mismatch_and_absent` in the same file (phases
+70/71/72 each added exactly such a test). The chain is
+`[header_to_metadata (x-a → com.example:k), router]`, mirroring fixtures
+`0081`/`0082` on H1, with `on_header_missing` deliberately absent so the
+no-`x-a` probe leaves the key genuinely unresolved.
+
+**TWO sinks share one server run**, pinning BOTH `match_if_key_not_found`
+polarities against the SAME threaded store — which is what makes the pin
+discriminating in both directions:
+
+| probe | `com.example:k` | sink `mifknf=false` | sink `mifknf=true` (default) |
+|---|---|---|---|
+| `x-a: 2` | `"2"` — resolved, value mismatch | DROP | DROP |
+| *(no `x-a`)* | absent — unresolved | DROP | **KEEP** |
+| `x-a: 1` | `"1"` — resolved, value match | **KEEP** | **KEEP** |
+
+→ asserts the `false` sink's file is exactly `"200\n"` and the default-`true`
+sink's is exactly `"200\n200\n"`.
+
+**RED (mutation):** `&record.dynamic_metadata` → `&Default::default()` at the H2
+gate (`hcm.rs:1142`), the exact prescription in `REVIEW.md`:
+
+```
+---- hcm::tests::h2_metadata_filter_gate_reads_the_threaded_dynamic_metadata stdout ----
+panicked at crates/envoy-http2/src/hcm.rs:3817:9:
+assertion `left == right` failed: match_if_key_not_found=false must keep ONLY the
+value-matching `x-a: 1` request — the mismatch and the key-absent request both drop: ""
+  left: ""
+ right: "200\n"
+test result: FAILED. 0 passed; 1 failed
+```
+
+With an empty store every request looks key-absent, so the `false` sink drops
+everything (0 lines, not 1) — and the `true` sink would keep everything (3 lines,
+not 2). Both halves are load-bearing.
+
+**GREEN:** `cargo test -p envoy-http2 --lib h2_metadata_filter_gate` →
+`1 passed; 0 failed`. Full crate: `109 passed; 0 failed; 1 ignored`.
+
+### I-2b — the phase's ONLY undocumented deviation: two doc comments describing the gate BACKWARDS
+
+**What was wrong:** T3's balanced-paren fan-out script had no `///` guard, so it
+appended the 4th argument to **prose it should have skipped**. The two lines it
+touched in `crates/envoy-http2/src/hcm.rs` were both `///` doc comments, which
+then asserted that the production emit gate feeds an **EMPTY** metadata store —
+precisely backwards, and precisely the misreading that would motivate a wrong
+"fix" to the gate (D-3.4). `cargo fmt` does not reflow doc comments, so the fmt
+pass never surfaced it, and `:3559` additionally overran the file's wrap width.
+
+**Re-derived on disk at this re-entry** (not taken on the review's word):
+
+```
+$ git show 796450d --numstat -- crates/envoy-http2/src/hcm.rs
+3	2	crates/envoy-http2/src/hcm.rs
+$ git show 796450d -- crates/envoy-http2/src/hcm.rs | grep -E "^\+" | grep -v "^+++"
++                &record.dynamic_metadata,
++    /// &envoy_req.headers, &Default::default())` gate (phase 72 added the header slice) end-to-end;
++    /// `should_log(status, flags, headers, &Default::default())` gate (hcm.rs ~1138); this test
+```
+
+— ONE production argument and TWO `///` lines. And, per-file, the number of ADDED
+lines containing `&Default::default()` in that commit is `filter.rs` **36**,
+`file_sink.rs` **4**, `envoy-http1/hcm.rs` **38**, `envoy-http2/hcm.rs` **2** — of
+which the envoy-http2 pair is **2 of 2 doc comments**. So the true split is
+**78 call sites + 2 doc-comment edits**, not "80 call sites".
+
+**Fixed:** both doc comments restored to `&record.dynamic_metadata` /
+`dynamic_metadata` and re-wrapped; the T3 bullet at `PROGRESS.md`'s
+"Call-site fan-out" corrected in place with a quoted `> CORRECTED …` note
+carrying the re-derivation above. Verified afterwards:
+`grep -n "///.*should_log.*Default::default" crates/envoy-http2/src/hcm.rs` → **0
+hits**, and `grep "should_log(" … | grep -v "///"` → exactly **1** (the real
+gate). Re-verified AFTER the `cargo fmt` pass, since fmt is precisely what does
+NOT police doc comments.
+
+This is an instance of memory `mechanical-fanout-scripts-corrupt-doc-comments`
+reaching a landed commit.
+
+### I-3 — no committed fixture read the `match_if_key_not_found` default-`true` branch
+
+**What was wrong:** the phase's headline observable — the `None → true` KEEP
+branch, which `--mode validate` provably cannot reach because it is a proto3
+`google.protobuf.BoolValue` default — was pinned **only by envoy-rust asserting
+against itself in-process**. `0081` omitted the field but BOTH its probes sent
+`x-a` (the key always resolved, so `unwrap_or` was never consulted; its only
+textual `match_if_key_not_found` occurrence is a COMMENT), and `0082` pins the
+field to explicit `false`.
+
+**Fixed:** a **THIRD probe** in
+`tests/fixtures/0081-accesslog-metadata-filter/expectations.yaml` — `GET /x` with
+**no** `x-a`, `expected_status: 200`, `expect_logged: true` — placed **SECOND**,
+so the kept-LAST convention (ADR-0147) holds and the fixture keeps paying the
+cheap 2 s `CF70_3_SETTLE` rather than the 12 s `CF71_1_SETTLE`.
+`expected_logged_count` becomes **2**, and the two kept lines are byte-DISTINCT
+(`…M=-` then `…M=1`), so the fixture now pins line ORDER as well as count. No new
+fixture, no driver change, no config change. `0081/README.md` updated: the
+three-probe table with the branch each takes, the two-line expected output, why
+probe 2 exists, and an explicit warning that `on_header_missing` must NOT be
+added to `0081` either (it would make the key RESOLVE and silently vacate the
+witness — the same ADR-0155 PV-6 trap `0082` documents). The README's claim that
+the `-` rendering is witnessed "on both proxies" (M74-8) is now TRUE.
+
+**RED (mutation) — a TWO-PART demonstration**, because the finding is not just
+"a mutation REDs" but "the fixture was BLIND to it". Mutation:
+`unwrap_or(true)` → `unwrap_or(false)` at `envoy-http1/src/hcm.rs:1806`, in the
+worktree, with `cargo build -p envoy-bin` there first (memory
+`differential-harness-uses-debug-envoy-bin`; the harness resolves
+`target/debug/envoy-bin` from the differential crate's own manifest dir, so the
+worktree run used the worktree's mutated binary).
+
+**Part 1 — mutated engine + the PRE-FIX 2-probe `expectations.yaml`:**
+
+```
+test access_log_metadata_filter ... ok
+test result: ok. 1 passed; 0 failed; ... finished in 3.21s
+```
+
+**GREEN — the fixture did not notice the wrapper default had been inverted.**
+That is finding I-3 reproduced directly, not merely argued.
+
+**Part 2 — the same mutated engine + the NEW 3-probe `expectations.yaml`:**
+
+```
+---- access_log_metadata_filter stdout ----
+panicked at tests/differential/tests/access_log_metadata_filter.rs:33:10:
+fixture green: envoy-rust emitted 1 access-log lines but 2 were expected to be
+logged; lines: ["STATUS=200 PATH=/x M=1"]
+test result: FAILED. 0 passed; 1 failed
+```
+
+**RED** — and for exactly the right reason: the missing line is `STATUS=200
+PATH=/x M=-`, the wrapper-default witness. Real Envoy is unaffected by the
+mutation and still emits both lines, so the assertion is genuinely cross-proxy.
+
+**GREEN (unmutated main tree, after `cargo build -p envoy-bin`):**
+`cargo test -p differential --test access_log_metadata_filter` →
+`1 passed; 0 failed` in 12.76 s. Sibling `0082` re-run unchanged and green:
+`1 passed; 0 failed` in 3.32 s.
+
+### I-4 — a `SafeRegex` metadata value was compiled but never EVALUATED
+
+**What was wrong:** `crates/envoy-config/src/matcher.rs:142` carries
+`.expect("validator ensured StringMatcher SafeRegex compiled")` — a **request-time
+panic** path, not a wrong-verdict path. Nothing anywhere in the workspace ever ran
+`MetadataMatcher::matches` with a `SafeRegex` value, so that `.expect()` was
+unexercised on the metadata route. Compounding it,
+`reuses_the_value_matcher_engine_verbatim` claimed in its own comment that "Every
+modelled StringMatcher mode routes through ValueMatcher::matches" while SKIPPING
+SafeRegex — false as written.
+
+**Fixed:** added a `SafeRegex` block to `reuses_the_value_matcher_engine_verbatim`
+that compiles the pattern exactly as the validator does
+(`ValueMatcher::compile_safe_regexes`, the same call
+`validate_access_log_metadata_matcher` makes in place) and then matches, asserting
+a match → `Some(true)`, a non-match → `Some(false)` (**not** `None` — only an
+unresolved PATH yields `None`, so a regex rejection must not fall back to
+`match_if_key_not_found`), and an absent key → `None`. The false comment is
+replaced with an accurate one naming all five modes and explaining why SafeRegex
+is the one that matters most.
+
+> **One assertion was written and then deliberately REMOVED before commit.** A
+> draft asserted the behavior of an UNANCHORED pattern and captioned it with a
+> claim about upstream's full-match `SafeRegex` semantics. That claim was **not
+> measured** by this project, and the assertion actually documented search
+> semantics — i.e. the comment and the assertion contradicted each other. Writing
+> it would have put a fresh unmeasured claim into the tree: exactly the I-1
+> defect class this same session is fixing (D-3.3 — the contract is the contract;
+> never assert equivalence that has not been measured). Anchoring semantics are
+> pre-existing phase-35/36 `StringMatcher` surface, not the metadata route, and
+> the test now says so explicitly instead.
+
+**RED (mutation):** `REVIEW.md` prescribes "clear the `compiled` field" — done by
+dropping the `compile_safe_regexes()` call so the validator's in-place compile is
+simulated away:
+
+```
+---- matcher::metadata_match_tests::reuses_the_value_matcher_engine_verbatim stdout ----
+panicked at crates/envoy-config/src/matcher.rs:142:18:
+validator ensured StringMatcher SafeRegex compiled
+test result: FAILED. 0 passed; 1 failed
+```
+
+The panic is at `matcher.rs:142` — the exact `.expect()` I-4 names, reached from
+the metadata route for the first time in an automated test.
+
+**GREEN:** `cargo test -p envoy-config --lib metadata_match_tests` →
+`3 passed; 0 failed`.
+
+### CF-74-5 → CLOSED; `BEHAVIOR_CONTRACT.md` §G upgraded to MEASURED
+
+§G previously read "**Derived, not separately measured**" — `present_match` on the
+RESOLVED branch was inferred from the structural rule (the value matcher is
+consulted only when the path resolves) and pinned in-process only. The state-5
+code-review MEASURED it cross-proxy in BOTH polarities. §G now carries the S4/S5
+table verbatim:
+
+| sink | filter | kept — real Envoy | kept — envoy-rust | verdict |
+|---|---|---|---|---|
+| S4 | `present_match: true`, `match_if_key_not_found: false` | r1 r2 r5 r6 | r1 r2 r5 r6 | **PARITY** |
+| S5 | `present_match: false`, `match_if_key_not_found: true` | r3 r4 r7 | r3 r4 r7 | **PARITY** |
+
+S4 and S5 are **exact complements** over the seven requests and both proxies agree
+on every cell (per-side concatenation `md5sum` `380b58e471f8c0c545d02a5e8b7b9df3`
+on both sides). **CF-74-5 is CLOSED** in §G, in `SPEC.md` §10 and in `STATE.md`.
+The in-process pin's comment in `matcher.rs` was updated from "pinned in-process,
+not live-probed" to record the measurement.
+
+### Minors folded (files this re-entry already touched)
+
+- **M74-1** — stale arm-count doc comments in `bootstrap.rs` rewritten to the
+  future-proof "the other arms" phrasing T1 already adopted, so arm #7 need not
+  touch them: the `response_flag_filter` field doc (was "Mutually exclusive with
+  `status_code_filter`"), `header_filter` ("the other **two** arms"), `and_filter`
+  and `or_filter` ("the other **four** arms"), the `HeaderFilter` type doc, and
+  the test comment "all **FIVE** arms". Verified: `grep "the other two arms\|the
+  other four arms\|all FIVE arms"` → **0 hits**.
+- **M74-2** — `bootstrap.rs`'s "A matcher-less filter keeps every record"
+  overclaimed: true only when `match_if_key_not_found` is absent or `true`. Now
+  mirrors the correct adjacent `hcm.rs` wording (it takes the not-found policy for
+  every record — keeping all under absent/`true`, DROPPING all under explicit
+  `false`), citing the state-5 probe-group-1 S6/S7 measurement of both polarities.
+- **M74-15** — the three counting imprecisions, each **re-measured on disk** here
+  rather than transcribed: (a) "159 test binaries" → "159 `test result:` lines"
+  (that count includes doc-test lines, so it over-counted binaries); (b) "all 15
+  workspace crates" → "15 workspace crates", with a note that 15 is the number
+  re-checked after touching four and `[workspace] members` lists **22**; (c) "14
+  of 14 workspace crate roots" kept but qualified — it is right for `crates/`, and
+  the attribute is in fact present at **22 of 22 member roots** (measured by
+  walking `[workspace] members` and reading each `src/lib.rs`/`src/main.rs`), so
+  the original figure UNDERSTATED coverage rather than overclaiming.
+
+M74-3..M74-14 and M74-16 were optional and are **NOT** folded; they carry forward.
+
+### Verification run at this re-entry (NOT the §7.5 gate)
+
+The §7.5 gate is deliberately NOT re-run here — that is the SEPARATE state-4
+RE-VERIFICATION. What WAS run, on the final tree:
+
+```
+cargo fmt --all -- --check                                          → clean (exit 0)
+    (drift from the new H2 test was applied with `cargo fmt --all`
+     first; the two restored doc comments were re-verified AFTER the
+     fmt pass, since fmt does not reflow doc comments)
+cargo clippy --workspace --all-targets --all-features -- -D warnings → clean (exit 0)
+cargo test -p envoy-config    --lib                                  → 648 passed; 0 failed
+cargo test -p envoy-accesslog --lib                                  → 112 passed; 0 failed
+cargo test -p envoy-http1     --lib                                  → 184 passed; 0 failed
+cargo test -p envoy-http2     --lib                                  → 109 passed; 0 failed; 1 ignored
+cargo build -p envoy-bin                                             → clean
+cargo test -p differential --test access_log_metadata_filter                → 1 passed; 0 failed (12.76s)
+cargo test -p differential --test access_log_metadata_filter_key_not_found  → 1 passed; 0 failed (3.32s)
+```
+
+### Invariant spot-checks
+
+- **ADR-0150 seam HOLDS** — `crates/envoy-accesslog/Cargo.toml` `[dependencies]`
+  unchanged (`tokio`, `bytes`, `tracing`, `thiserror`; ZERO workspace crates). The
+  new H2 test constructs the matcher on the `envoy-config` side and boxes it
+  through `Arc<dyn envoy_accesslog::MetadataMatch>`, exactly as
+  `compile_access_log_filter` does — it does not introduce a reverse edge.
+- **`LogFilter` still derives ONLY `Debug, Clone`** — no `Eq`, no `PartialEq`.
+- **The `unreachable!` lockstep guard is untouched** — no production match arm was
+  added, removed or reordered this session.
+- **NO production behavior changed.** The diff is: two new/extended tests, one new
+  test, two restored doc comments, doc-comment wording, one fixture's
+  `expectations.yaml` + `README.md`, and four docs files. `envoy-http1/src/hcm.rs`
+  and every other engine file are **byte-unchanged** — confirmed by
+  `git status --porcelain` listing neither.
+- **`known-failures.txt` / `tests/conformance/` untouched**; **`DECISIONS.md`
+  untouched** (ledger head **ADR-0155**, no `## ADR-0156`); **ROADMAP row `74`
+  untouched** (`in-progress`, 6 cells) — no flip until the state-6 close-out.
+- **The scratch worktree was removed** and the main tree verified unmutated.
+
+### Carry-forward disposition after this re-entry
+
+- **CLOSED:** **CF-74-5** (measured cross-proxy; §G upgraded).
+- **OPENED / now recorded in the contract:** **CF-74-6** (the wrapped `BoolValue`
+  spelling — `BEHAVIOR_CONTRACT.md` §D + `SPEC.md` §10 + a serde pin).
+- **CONSUMED earlier in the phase:** N73-R1.
+- **FOLDED here:** M74-1, M74-2, M74-15.
+- **STILL OPEN:** CF-74-1, CF-74-2, CF-74-3, CF-74-4; M74-3..M74-14, M74-16;
+  M73-R2 (probe groups 1/4 advanced it, but it asks for a committed FIXTURE, so it
+  stays open), M71-3, M71-6 (this re-entry adds an in-process H2 metadata test —
+  the standalone H2 *differential* stays deferred), M71-7/8, M70-R4/R9,
+  CF-72-1/CF-72-2 (still the strongest NEXT candidate), CF-73-1, N73-R2, M73-R1,
+  M69-A..I, CF-69-1/2/3/5, M68-1, M-1, CF-67-3/5/6/7, the older Minors and the
+  HTTP-filters-family (1)–(4).
+
+### Verdict
+
+**All four Important findings are FIXED, each with recorded mutation-RED
+evidence; CF-74-5 is CLOSED and CF-74-6 is OPENED and contract-documented; three
+Minors folded.** No production behavior changed — every fix is a pin, a document
+correction, or a fixture probe.
+
+Next: the §5 state-4 **RE-VERIFICATION** (a SEPARATE session) — re-run and
+re-adjudicate the full §7.5 gate (a)–(e) on this tree. Then a state-5 RE-REVIEW,
+then the state-6 close-out. ROADMAP row `74` stays `in-progress` throughout.
