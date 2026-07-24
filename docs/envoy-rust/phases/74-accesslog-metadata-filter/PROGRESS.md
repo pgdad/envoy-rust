@@ -1737,3 +1737,395 @@ the full §7.5 gate (a)–(e)** because I-6(a) edited two fixture CONFIG files �
 `cargo build -p envoy-bin` FIRST (memory `differential-harness-uses-debug-envoy-bin`).
 Then a state-5 re-review, then the state-6 close-out. ROADMAP row `74` stays
 `in-progress` throughout.
+
+---
+
+## §7.5 gate (state-4 RE-VERIFICATION, 2nd)
+
+> **Second state-4 RE-VERIFICATION** (`superpowers:verification-before-completion`,
+> per `BOOTSTRAP_PROMPT.md` §5 state-4 + §5.2 + D-3.6). A SEPARATE session from the
+> SECOND §5.2 state-3 re-entry above (§5.1 / ADR-0127). Per §5.2 a `REVIEW.md` with
+> issues re-enters at step 3; step 3 is now COMPLETE, so the cycle resumes at step 4.
+> This session **RE-RUNS and RE-ADJUDICATES the full §7.5 gate (a)–(e) FROM SCRATCH**
+> on the post-2nd-re-entry tree. It writes no new `REVIEW.md` (that is the SEPARATE
+> state-5 RE-REVIEW), implements no new behavior, fires no ADR, does NOT flip ROADMAP
+> row `74`, and relocates no close-out Notes.
+>
+> **The previous state-4 verdict was NOT consumed.** The state-5 re-review already
+> consumed it, and the 2nd re-entry then edited **two fixture CONFIG files**
+> (`0081`'s `envoy.yaml` + `envoy-rust.yaml`). Those edits are comment-only and so
+> semantically inert — but per D-3.3 that must be **SHOWN cross-proxy, not assumed**,
+> which is why the gate genuinely had to be re-run. The re-entry's own de-risk runs
+> are PRIOR EVIDENCE ONLY and discharge nothing. **Every item below was actually RUN
+> in this session.**
+
+### STEP 0 confirmation (disk-authoritative)
+
+- `git status --porcelain` clean (0 lines); branch `main`; `HEAD` = the phase-74
+  SECOND §5.2 state-3 re-entry commit `1f93811272cf090ab0f6f1b26b1e3b5096af3cd5`.
+- `git fetch origin --prune` → `origin/main` at the **SAME** SHA, re-checked again
+  immediately before the commit (memory `concurrent-loop-sessions-race-on-phase-pick`).
+- `SPEC.md` + `PLAN.md` + `PROGRESS.md` + `REVIEW.md` all present; `STATE.md`
+  `## Next expected skill` names the state-4 RE-VERIFICATION → `SKILL_ROUTING.md`
+  resolves to step 4 unambiguously.
+- Toolchain: `cargo 1.95.0 (f2d3ce0bd 2026-03-21)` / `rustc 1.95.0 (59807616e 2026-04-14)`.
+
+### A CONCURRENT SESSION WAS LIVE-PROBING THROUGHOUT THIS GATE — recorded, not hidden
+
+`docker ps` at sweep start showed **8** running containers that are **not mine**:
+seven hand-named probe containers (`p74a-var`, `p74b-r1`, `p74b-r2`, `p74b-va`,
+`p74b-vb`, `p74b-vc`, `p74c-a2`) on image `envoyproxy/envoy:contrib-v1.37.2` — **not
+this project's pin** — being created seconds apart, plus one auto-named
+`envoyproxy/envoy:v1.33.0` container. A sibling workstream is running live recon
+probes concurrently. They were **left alone** (memory
+`concurrent-loop-sessions-race-on-phase-pick`: remove only your own artifacts).
+
+This matters for adjudication and is the honest explanation for the one RED that is
+NOT in the documented set: CPU/port contention raises the probability of the
+port-reuse startup-race family. It does **not** weaken the gate — every RED was
+re-run in isolation and adjudicated on its failure TEXT — but a reader comparing
+this gate's 6 REDs against the prior gate's 5 deserves the cause rather than a
+silent discrepancy. No sibling had **committed**: `origin/main == HEAD` at start and
+at commit time.
+
+### The GOVERNING FACT, re-derived on disk rather than taken from the handoff
+
+The 2nd re-entry changed **ZERO executable lines**:
+
+```
+$ git diff cd695dd..HEAD --stat
+ crates/envoy-config/src/bootstrap.rs               |   6 +-
+ crates/envoy-http2/src/hcm.rs                      |   3 +
+ docs/envoy-rust/BEHAVIOR_CONTRACT.md               |  82 +++--
+ docs/envoy-rust/STATE.md                           |  50 ++-
+ docs/envoy-rust/STATE_HISTORY.md                   |  28 ++
+ .../74-accesslog-metadata-filter/PROGRESS.md       | 361 ++++++++++++++++++++-
+ .../tests/access_log_metadata_filter.rs            |  30 +-
+ .../0081-accesslog-metadata-filter/envoy-rust.yaml |  22 +-
+ .../0081-accesslog-metadata-filter/envoy.yaml      |  22 +-
+ 9 files changed, 537 insertions(+), 67 deletions(-)
+
+$ git diff cd695dd..HEAD -U0 -- crates/ | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+    | grep -vE '^[+-]\s*(//|///)' | wc -l
+0
+```
+
+Both `crates/` edits are COMMENTS (M74-19, M74-23). So the behavior adjudicated at
+the prior state-4 and both state-5 reviews is exactly the behavior that ships. What
+is genuinely NEW to show is that the two edited fixture CONFIGS are semantically
+inert **cross-proxy** — confirmed in (a).
+
+### The CI baseline used for the numeric cross-check
+
+CI run `30121024060` on the FULL 40-char SHA `1f93811272cf090ab0f6f1b26b1e3b5096af3cd5`
+is `completed`/`success`. Both jobs green with **full step counts** — job
+`89573441309` `build + test + lint` **15 steps**, job `89573441401` `fuzz (…5 targets…)`
+**13 steps** — i.e. NOT the `cancelled` + `steps:0` runner-starvation signature
+(memory `ci-run-cancelled-with-no-runner-is-starvation`). The job log yields:
+
+```
+CI passed=2095 failed=0 lines=159
+```
+
+(The GitHub credential works this session, so the log-derived numeric identity —
+ADR-0143's "standard protocol whenever a valid credential exists" — was obtainable
+and is used directly rather than via a substitute.)
+
+### (a) The two phase-74 fixtures — **GREEN**
+
+`cargo build --workspace --all-targets` preceded the sweep so the debug `envoy-bin`
+the harness executes was current (memory `differential-harness-uses-debug-envoy-bin`).
+**The rebuild is PROVEN, not assumed — and the first attempt was rejected:**
+
+```
+run 1: Finished `dev` profile … in 0.08s      ← 0 `Compiling` lines = CACHED, refused as evidence
+run 2 (after `touch` of the two changed .rs files):
+   Compiling envoy-config / envoy-listener / envoy-cluster / envoy-filter / envoy-tls
+   Compiling envoy-http1 / envoy-tcp / envoy-http2 / envoy-admin / envoy-health
+   Compiling http1-echo-server / http2-echo-server / envoy-bin
+    Finished `dev` profile … in 3.25s          ← 13 `Compiling` lines, incl. envoy-bin
+BUILD_EXIT=0    target/debug/envoy-bin mtime = 2026-07-24 16:43:13 (= now)
+```
+
+Both fixtures ran inside the full `cargo test --workspace --no-fail-fast` sweep, i.e.
+under FULL parallel differential load (and, this time, alongside a sibling session's
+live containers):
+
+```
+     Running tests/access_log_metadata_filter.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.66s
+
+     Running tests/access_log_metadata_filter_key_not_found.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.09s
+```
+
+`0081`'s 12.66 s (vs `0082`'s 3.09 s) is the three-probe shape plus the 2 s
+`CF70_3_SETTLE`, matching the prior gate's 12.66 s exactly. **The comment-only YAML
+edits are therefore SHOWN inert cross-proxy**, which is the specific thing this
+re-verification existed to establish.
+
+`0081`'s per-side `diff` re-derived — still EXACTLY the four documented divergences
+(admin block; bind address `0.0.0.0` vs `127.0.0.1`; `generate_request_id: false`;
+the log mount path), and the new comment block is **byte-identical across sides**:
+
+```
+$ for f in envoy.yaml envoy-rust.yaml; do grep -E '^\s*#' $f | md5sum; done
+14dd98c681472cc74dd732e78bcaa545  -
+14dd98c681472cc74dd732e78bcaa545  -
+```
+
+**The ADR-0155 PV-6 trap holds on BOTH fixtures** — asserted non-vacuously (4 files
+actually scanned, each reported individually):
+
+```
+0081/envoy.yaml:      config-keys=0  textual(incl comments)=1
+0081/envoy-rust.yaml: config-keys=0  textual(incl comments)=1
+0082/envoy.yaml:      config-keys=0  textual(incl comments)=1
+0082/envoy-rust.yaml: config-keys=0  textual(incl comments)=1
+```
+
+Zero `on_header_missing` CONFIG KEYS anywhere; the single textual hit per file is the
+`#` comment documenting the deliberate omission — now INLINE on `0081` too, which is
+exactly what re-entry finding I-6(a) added. **They must not be "cleaned up."**
+
+### (b) All pre-existing fixtures — **GREEN except 6 adjudicated non-regressions**
+
+```
+cargo test --workspace --no-fail-fast     (FULL output redirected to a file — NEVER
+                                           piped through tail, memory
+                                           never-pipe-verification-runs-through-tail)
+→ 159 `test result:` lines
+→ LOCAL passed=2089 failed=6 sum=2095
+→ TEST_EXIT=101
+```
+
+**The decisive numeric cross-check PASSES exactly:**
+`local 2089 passed + 6 failed = 2095` **==** `CI 2095 passed`, with **159**
+`test result:` lines on BOTH sides. **No test silently failed to RUN** — the failure
+mode worse than a RED. The total is unchanged from the prior gate's 2095 (a **+0**,
+as predicted: the 2nd re-entry added no test), and the 159-line count is unchanged
+because no test target was added.
+
+Each RED was re-run in ISOLATION **naming its `--test <binary>`**, adjudicated on the
+`N passed` COUNT and never the exit code (memory
+`cargo-test-p-name-false-green-filtered-out`: `0 passed; N filtered out` would mean
+it never ran):
+
+| # | test | isolation re-run (`cargo test -p differential --test <binary>`) | adjudication |
+|---|---|---|---|
+| 1 | `access_log_h2_rcd_upstream_reset` | `0 passed; 1 failed` (2.69 s) | env. family `tcpclosebackend-ipv6-unreachable-host-flake` |
+| 2 | `access_log_h2_uc_upstream_reset` | `0 passed; 1 failed` (2.69 s) | same family |
+| 3 | `access_log_rcd_upstream_reset` | `0 passed; 1 failed` (2.73 s) | same family |
+| 4 | `access_log_rf_upstream_reset` | `0 passed; 1 failed` (2.83 s, 2nd attempt — see below) | same family |
+| 5 | `admin_config_dump_server_info` | `0 passed; 1 failed` (2.70 s) | env. family `differential-host-bridge-ip-192-168-65-2` |
+| 6 | `network_filter_direct_response_fixture` | **`1 passed; 0 failed` (0.99 s)** | **parallel-load startup race — PASSES in isolation** |
+
+**#1–#5 fail deterministically in isolation** — the ENVIRONMENTAL signature, not the
+parallel-load class. The diagnosis is MEASURED from the failure TEXT, not assumed:
+
+- **#1–#4** — real Envoy cannot reach the host-spawned close backend and reports an
+  upstream **connect failure** (`UF`) where the fixture intends a reset; envoy-rust
+  produces the CORRECT `UC`. The IPv6 address in the reference-side text is the
+  documented root cause:
+
+  ```
+  envoy="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{remote_connection_failure|
+         immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:45097}\",
+         \"rf\":\"UF\"}"
+  envoy="{\"method\":\"GET\",\"proto\":\"HTTP/2\",\"rc\":503,\"rf\":\"UF\"}"
+  envoy-rust="{\"method\":\"GET\",\"proto\":\"HTTP/2\",\"rc\":503,\"rf\":\"UC\"}"
+  ```
+
+- **#5** — the host routes the backend via `192.168.65.2` (confirmed present in the
+  failure text), which is not in the fixture's allow-list, so all 18 `/clusters` host
+  lines land `envoy-only` with `envoy-rust-only: []`.
+
+**#6 is the one RED not in the documented set, and it is NOT a regression.** Its
+failure text is the startup-race signature, not a semantic assertion —
+`127.0.0.1:55116 not accept-ready within 10s: Connection refused (os error 111)` —
+and it **PASSES in isolation with `1 passed`**. It also passed on CI at this exact
+SHA (CI shows 0 failed). Its most likely aggravator is the sibling session's
+concurrent live containers noted above.
+
+**An honest correction, recorded rather than smoothed over.** `access_log_rf_upstream_reset`'s
+FIRST isolation attempt did **not** reproduce the environmental signature — it hit the
+*startup race* instead (`not accept-ready within 10s`, 12.84 s). Reading the failure
+TEXT rather than the exit code (memory `mutation-red-needs-unmutated-control`, same
+discipline) showed that attempt adjudicated nothing, so it was re-run: attempt 2 gave
+`0 passed; 1 failed` in 2.83 s with the real semantic text
+`envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"` and **0**
+occurrences of `not accept-ready`. Only that second run is used as evidence.
+
+**None of the six touches this phase's surface** — verified NON-VACUOUSLY (the YAML
+count is reported per fixture, so an unresolved glob cannot masquerade as a clean 0):
+
+```
+0070-accesslog-h2-rcd-upstream-reset: yaml files=3  AccessLogFilter-arm hits=0
+0069-accesslog-h2-uc-upstream-reset:  yaml files=3  AccessLogFilter-arm hits=0
+0062-accesslog-rcd-upstream-reset:    yaml files=3  AccessLogFilter-arm hits=0
+0061-accesslog-rf-upstream-reset:     yaml files=3  AccessLogFilter-arm hits=0
+0014-admin-config-dump-server-info:   yaml files=3  AccessLogFilter-arm hits=0
+0071-network-filter-direct-response:  yaml files=3  AccessLogFilter-arm hits=0
+```
+
+None sets an `AccessLogFilter` of any arm. `grep -c 'client error (Connect)'` over the
+sweep → **0**, so the Docker daemon was healthy throughout (memory
+`docker-desktop-down-after-reboot-kvm-acl` did not apply); daemon 28.1.1 and the
+pinned image confirmed on disk with the digest matching `ENVOY_TARGET.md` exactly
+(`sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`).
+
+### (c) Conformance — **no new suite required; the existing gate is GREEN**
+
+Access-log emission gating is not codec-conformance-gated, so the phase declares no
+new suite. CONFIRMED on disk rather than asserted:
+
+- `git diff cd695dd..HEAD --stat -- tests/conformance/` is **EMPTY** (0 lines).
+- `known-failures.txt` is **21 lines** and was **NOT trimmed** (memory
+  `h2spec-3-5-2-preface-host-sensitive`: this host scores invalid-preface 3.5/2 as
+  PASS, so trimming on local evidence would break CI).
+- The existing gate RAN inside the sweep and passed: `test h2spec_pass_rate_gate ... ok`.
+
+### (d) Fuzz — **CLEAN**
+
+No new fuzz target was added by this phase or either re-entry, so §7.5(d) is satisfied
+by the existing ones. Run from the CRATE dir (memory
+`cargo-fuzz-runs-from-crate-dir-not-repo-root`) at the same short budget the CI step
+uses:
+
+```
+$ cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30
+INFO: 12412 files found in /home/esa/git/envoy-rust/crates/envoy-config/fuzz/corpus/parse_bootstrap
+#12413  INITED cov: 16957 ft: 35802 corp: 3489/2373Kb exec/s: 6206 rss: 383Mb
+Done 18730 runs in 92 second(s)
+FUZZ_EXIT=0
+```
+
+No crash, no leak, no timeout (`grep -ciE 'crash|leak|ERROR:'` → **0**). The tree
+stayed clean afterwards (`git status --porcelain` → 0 lines; new libFuzzer corpus
+entries are `*`-ignored, which is why the on-disk corpus reads 12412 files against
+the prior gate's 11780 while the TRACKED seed count is unchanged).
+
+Seed tracking re-verified (memory `fuzz-corpus-seed-gitignored-by-default`):
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/metadata_filter.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/metadata_filter.yaml
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/ | wc -l
+63
+```
+
+**The I-7 census re-measured on disk** (this is the finding the 2nd re-entry closed;
+it is re-derived here rather than transcribed): `crates/envoy-config/fuzz/fuzz_targets/`
+holds exactly **ONE** target (`parse_bootstrap.rs`), while the **WORKSPACE holds FIVE**
+across five crates (`envoy-config`, `envoy-jwt`, `envoy-http2`, `envoy-accesslog`,
+`envoy-filter`): `parse_bootstrap`, `jwt_parse`, `cdn_loop_parse`,
+`accesslog_format_parse`, `grpc_health_decode` — all five wired into
+`.github/workflows/ci.yml` at lines **107/113/120/127/134**, confirmed by reading those
+lines. No `ci.yml` edit was needed or made (memory `new-fuzz-target-needs-a-ci-yml-step`
+does not apply). *(The `find` also surfaces five `.claude/worktrees/agent-*` copies —
+a concurrent session's worktrees, excluded from the census and not touched.)*
+
+### (e) build / clippy / fmt / test / deny — **ALL CLEAN**
+
+```
+cargo build --workspace --all-targets      BUILD_EXIT=0   (13 `Compiling`, 0 warnings/errors)
+cargo fmt --all -- --check                 FMT_EXIT=0     (no output)
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+                                           CLIPPY_EXIT=0  (13 `Checking`, 0 warnings, 2.03s)
+cargo deny check                           DENY_EXIT=0    (advisories ok, bans ok,
+                                                           licenses ok, sources ok)
+cargo test --workspace --no-fail-fast      TEST_EXIT=101  (2089 passed; 6 failed —
+                                                           adjudicated in (b))
+```
+
+**The build was NOT a cached false pass** — see (a): the 0.08 s / 0-`Compiling` first
+run was REFUSED and the forced re-run emitted 13 `Compiling` lines including
+`envoy-bin`.
+
+**Clippy was a GENUINE re-analysis this time, and was checked for the cached
+signature before being believed.** It reported **13** `Checking` lines in 2.03 s with
+**0** warnings and exit 0 — not the `Finished … in 0.09s` / 0-`Checking` pattern that
+the prior two state-4 sessions each had to reject. Note `cargo clippy` prints
+**`Checking`**, not `Compiling`; grepping for `Compiling` here yields a FALSE NEGATIVE
+(memory `clippy-prints-checking-not-compiling`).
+
+**`cargo deny check` was the item flagged most likely to red FRESH** (it is not in the
+CI job set; memory `cargo-deny-reds-on-unrelated-advisory` warns that a newly published
+RustSec advisory against an existing dep can red it independently of the phase). It
+came back **clean**. Its only output is the same five pre-existing
+`license-not-encountered` WARNINGS naming allow-list entries in `deny.toml` (`0BSD`,
+`BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib`) that no dependency uses — a
+policy-hygiene note, not a check failure. **No dep patch-bump was needed.**
+
+### (f) — NOT THIS SESSION
+
+Gate (f) (`REVIEW.md` approved) is the SEPARATE §5 state-5 **RE-REVIEW** and is
+deliberately NOT attempted here (ADR-0127: the context that wrote an artifact must not
+grade it).
+
+### Invariant spot-checks (cheap, non-negotiable)
+
+- **ADR-0150 seam HOLDS** — `crates/envoy-accesslog/Cargo.toml` `[dependencies]` is
+  `tokio`, `bytes`, `tracing`, `thiserror` and **ZERO** workspace path deps
+  (`grep -c 'path = "../'` → 0). No reverse edge to `envoy-config`.
+- **`LogFilter` derives ONLY `#[derive(Debug, Clone)]`** (`filter.rs:67`) — no `Eq`,
+  no `PartialEq`.
+- **The `unreachable!` lockstep guard is UNCHANGED.** `grep -c` over
+  `crates/envoy-http1/src/hcm.rs` → **2**, correctly reconciled by LINE: `:1750` is a
+  DOC COMMENT mentioning the guard, `:1808` is the guard itself. Phase-wide
+  `git diff 53893b67..HEAD … | grep -cE '^[+-].*unreachable!'` → **0** added/removed.
+  One real guard, as reviewed. **No defect.**
+- **D-3.8 holds — `#![forbid(unsafe_code)]` at 22 of 22 workspace member roots**,
+  enumerated programmatically from `[workspace] members` with each root resolved to
+  `src/lib.rs` or `src/main.rs`; **0 missing**.
+- **ROADMAP row `74`** — **6 cells**, status `in-progress`, correctly NOT flipped (the
+  flip is the state-6 close-out).
+- **`DECISIONS.md` ledger head is ADR-0155**; `grep -c '^## ADR-0156'` → **0**. The
+  §6.1 split reservation stays UNFIRED.
+- **82** fixture directories; **63** tracked corpus seeds; exactly **one** conformance
+  suite.
+- **The "36 access-log fixtures" figure was re-derived and RECONCILED rather than
+  transcribed.** A first, looser measurement (substring `access_log` over every
+  `*.yaml`) returned **37**. The extra is `0011-admin-stats-prometheus`, which matches
+  only inside a **stat name**, not an `access_log:` config stanza. Under the documented
+  rule — fixtures whose CONFIG (`envoy.yaml`/`envoy-rust.yaml`) carries an
+  `access_log:` key — the count is **36**; by DIRECTORY NAME it is **34**. All three
+  figures are right under their own stated rule. **No defect.**
+- **The re-entry's "wrap-checked at ≤100 cols" claim was CHECKED, not trusted, and
+  holds.** Lines >100 cols ADDED by `cd695dd..HEAD` across the three touched `.rs`
+  files: **0**. The three over-wide comment lines that exist
+  (`access_log_metadata_filter.rs:11`, `bootstrap.rs:223`, `bootstrap.rs:8494`) are all
+  PRE-EXISTING, and `cargo fmt --check` is clean regardless because rustfmt does not
+  reflow comments (memory `mechanical-fanout-scripts-corrupt-doc-comments`).
+- **The three re-entry fixes verified on disk by their own proving greps:** `Two probes`
+  → **0** and `EXACTLY ONE` → **0** in `access_log_metadata_filter.rs` (I-6b);
+  `with the key ABSENT` → **0** in `BEHAVIOR_CONTRACT.md` (I-5); the fuzz census above
+  (I-7).
+
+### Verdict
+
+**The §7.5 gate is GREEN: (a) ✅ (b) ✅ (c) ✅ (d) ✅ (e) ✅.** Gate (f) is the SEPARATE
+state-5 RE-REVIEW.
+
+**No real defect was found, so no further §5.2 state-3 re-entry is owed.** Every gate
+item above was actually RUN in this session on the post-2nd-re-entry tree — none is
+inferred from the re-entry's own de-risk runs or from CI. The thing this
+re-verification specifically existed to establish is established: the two comment-only
+fixture CONFIG edits are **shown** semantically inert cross-proxy, with `0081` green at
+12.66 s under full parallel load, its per-side diff still exactly the four documented
+divergences, and its new comment block byte-identical across sides.
+
+Four places where a shortcut was available were refused: the cached 0.08 s build
+(re-run after a `touch` → 13 `Compiling`), the possibility of a cached clippy green
+(checked for the 0.09 s/0-`Checking` signature before being believed), the vacuous
+fixture-arm grep (YAML counts reported per fixture), and
+`access_log_rf_upstream_reset`'s first isolation attempt (a startup race that
+adjudicated nothing, re-run rather than recorded as the environmental RED). Two
+discrepancies against the handoff's expected figures were RECONCILED rather than
+waved through or silently "fixed": the 6-vs-5 RED count (one extra parallel-load
+startup race, passing in isolation, alongside a sibling session's live containers) and
+the 37-vs-36 access-log fixture count (a stat-name substring match).
+
+Next: the §5 state-5 **RE-REVIEW** (a SEPARATE session) — write the updated
+`REVIEW.md`, which IS gate (f). Then the state-6 close-out. ROADMAP row `74` stays
+`in-progress` throughout.
