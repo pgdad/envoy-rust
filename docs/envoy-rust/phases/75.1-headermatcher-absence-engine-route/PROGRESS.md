@@ -837,3 +837,57 @@ workstream's `quizzical_goldstine` (also `envoyproxy/envoy:v1.33.0`) was
 observed still running and **LEFT ALONE**.
 
 **Commit:** `phase 75.1 task 10: fixture 0083 configs — 8 HeaderMatchers over 16 direct_response routes, backend-free`
+
+---
+
+## Task 11 — fixture `0083`: `expectations.yaml`
+
+**File created:**
+`tests/fixtures/0083-headermatcher-absence-parity/expectations.yaml`
+(`kind: http1_probe_list`, `Driver::Http1ProbeList`, reused with ZERO harness
+change).
+
+### Step 2 — the probe census
+
+```bash
+grep -c '^    - name:' tests/fixtures/0083-headermatcher-absence-parity/expectations.yaml
+```
+
+**22**, and the per-group split is exactly the plan's: p01=3, p06=3, p07=2,
+p08=2, p09=3, p10=3, p11=3, p12=3.
+
+Every `expected_body` was cross-checked line-for-line against the Task-10 live
+cross-proxy sweep — the file is a transcription of a measurement taken from both
+proxies, not a derivation.
+
+### Step 3 — THE ONE WIRE-SHAPE UNKNOWN: **RESOLVED, nothing weakened**
+
+`SPEC.md` §2.3's empty-value column was measured with `curl -H "x-a;"`, which
+puts `x-a:` on the wire. The harness instead emits `x-a: ` (a SPACE before
+CRLF) because `drive_http1` formats `"{n}: {v}\r\n"`. Both are an empty value,
+but this was the only cell in the fixture whose exact wire bytes differ from
+what was originally measured — so `PLAN.md` required probing it directly and
+PRE-AUTHORISED dropping ONLY the two empty-value probes if the proxies
+disagreed.
+
+**Both byte shapes were driven at BOTH proxies:**
+
+| probe | shape | upstream | envoy-rust |
+|---|---|---|---|
+| `/p11` | `x-a: ` (harness shape, raw socket) | `p11=MATCH` | `p11=MATCH` |
+| `/p12` | `x-a: ` (harness shape, raw socket) | `p12=NOMATCH` | `p12=NOMATCH` |
+| `/p11` | `x-a:` (`curl -H "x-a;"`, the SPEC shape) | `p11=MATCH` | `p11=MATCH` |
+| `/p12` | `x-a:` (`curl -H "x-a;"`, the SPEC shape) | `p12=NOMATCH` | `p12=NOMATCH` |
+
+**The two proxies AGREE on BOTH byte shapes, and both shapes agree with each
+other.** HTTP header values are whitespace-trimmed, so `x-a: ` and `x-a:` are
+the same empty value to both implementations. **The pre-authorised fallback was
+therefore NOT taken: both `p11-empty-value-counts-as-present` and
+`p12-empty-value-counts-as-present` are KEPT at full strength, and no probe in
+this fixture was weakened.**
+
+This also independently corroborates the SPEC §2.3 empty-value column on a
+second wire encoding, and pairs with the in-process empty-value control that
+Task 1 (engine) and Task 9 (through the ADR-0150 seam) already pin.
+
+**Commit:** `phase 75.1 task 11: fixture 0083 expectations — 22 probes across 8 matchers, all read off the measured upstream column`

@@ -1,0 +1,214 @@
+# Phase 75.1 (ADR-0159): 22-probe sequential burst against a backend-free HCM
+# listener (`clusters: []`, direct_response only) carrying EIGHT HeaderMatchers.
+# This is the FIRST differential witness of `invert_match` AND of
+# `HeaderMatcher.present_match` in the whole fixture corpus.
+#
+# Per probe id pNN there is an ORDERED route PAIR on prefix /pNN: the first
+# carries the matcher under test and answers "pNN=MATCH", the second is an
+# unguarded catch-all answering "pNN=NOMATCH". So the response body IS the
+# matcher's verdict, byte-exact.
+#
+# THE MEASURED RULE (SPEC §2.1, measured cross-proxy on envoyproxy/envoy:v1.33.0):
+#   present_match(want) -> (present == want) XOR invert_match
+#   any other mode, header ABSENT -> false   (invert_match is NOT applied)
+#   any other mode, header PRESENT -> mode_matches(value) XOR invert_match
+#   an EMPTY header VALUE counts as PRESENT.
+#
+# What each group witnesses:
+#   p01/p06/p09 - D1 (= CF-72-1): a VALUE matcher + invert + ABSENT. Upstream
+#                 DROPS; envoy-rust KEPT before phase 75.1. Three different
+#                 value paths: literal compare, numeric parse, StringMatcher.
+#   p08/p12     - D2: upstream `present_match: false` means the header must be
+#                 ABSENT. p12 is NON-inverted - a plain, single-line matcher
+#                 that silently matched every request in-tree before 75.1.
+#   p07         - P1, THE GUARD. `present_match: true` + invert + ABSENT is
+#                 MEASURED PARITY (both proxies KEEP). A naive uniform
+#                 "absent => DROP" fix breaks this cell and mints a NEW
+#                 divergence, so p07-absent expecting MATCH is load-bearing.
+#   p10/p11     - parity controls. p11-empty-value and p12-empty-value pin
+#                 presence-not-emptiness: an empty value is PRESENT.
+#
+# Omitting the `extra_headers` key entirely makes `x-a` genuinely ABSENT on the
+# wire; `["x-a", ""]` sends it with an EMPTY value.
+driver:
+  kind: http1_probe_list
+  probes:
+    # ---- p01: exact_match "v" + invert_match ---------------------------- D1
+    - name: p01-absent-drops
+      method: get
+      path: "/p01"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p01=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p01-value-matches-so-invert-drops
+      method: get
+      path: "/p01"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p01=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p01-value-differs-so-invert-keeps
+      method: get
+      path: "/p01"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "zzz"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p01=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p06: range_match [1,10) + invert_match -------------------------- D1
+    - name: p06-absent-drops
+      method: get
+      path: "/p06"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p06=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p06-non-numeric-so-invert-keeps
+      method: get
+      path: "/p06"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p06=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p06-in-range-so-invert-drops
+      method: get
+      path: "/p06"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "5"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p06=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p07: present_match true + invert_match ---------------- P1 THE GUARD
+    - name: p07-absent-keeps-GUARD
+      method: get
+      path: "/p07"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p07=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p07-present-drops
+      method: get
+      path: "/p07"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p07=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p08: present_match false + invert_match ------------------------- D2
+    - name: p08-absent-drops
+      method: get
+      path: "/p08"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p08=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p08-present-keeps
+      method: get
+      path: "/p08"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p08=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p09: string_match {exact: v} + invert_match --------------------- D1
+    - name: p09-absent-drops
+      method: get
+      path: "/p09"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p09=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p09-value-matches-so-invert-drops
+      method: get
+      path: "/p09"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p09=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p09-value-differs-so-invert-keeps
+      method: get
+      path: "/p09"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "zzz"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p09=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p10: exact_match "v", no invert ------------------ parity control
+    - name: p10-absent-drops
+      method: get
+      path: "/p10"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p10=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p10-value-matches
+      method: get
+      path: "/p10"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p10=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p10-value-differs
+      method: get
+      path: "/p10"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "zzz"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p10=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p11: present_match true, no invert --------------- parity control
+    - name: p11-absent-drops
+      method: get
+      path: "/p11"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p11=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p11-present-keeps
+      method: get
+      path: "/p11"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p11=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p11-empty-value-counts-as-present
+      method: get
+      path: "/p11"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", ""]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p11=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p12: present_match false, NO invert ------------------- D2, the worst
+    - name: p12-absent-keeps
+      method: get
+      path: "/p12"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p12=MATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p12-present-drops
+      method: get
+      path: "/p12"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", "v"]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p12=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p12-empty-value-counts-as-present
+      method: get
+      path: "/p12"
+      host: "envoy-rust.test"
+      extra_headers: [["x-a", ""]]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "p12=NOMATCH" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }
