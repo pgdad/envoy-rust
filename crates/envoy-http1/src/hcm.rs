@@ -10048,4 +10048,78 @@ static_resources:
             "present_match:true+invert, PRESENT → route does not match"
         );
     }
+
+    /// Phase 75.1 (ADR-0159): the MODE-SCOPED absence rule propagates to the
+    /// access-log `header_filter` — call site 5 of 5, and the only one reached
+    /// through the ADR-0150 `Arc<dyn HeaderMatch>` trait object rather than the
+    /// inherent method. Compiled end-to-end via `compile_access_log_filter`, so
+    /// this exercises the real boxing the runtime performs, not a stub.
+    ///
+    /// The CROSS-PROXY witness for this call site is sub-phase 75.2 (fixtures
+    /// 0084 + 0085); this in-process pin is what makes 75.1 a complete slice.
+    #[test]
+    fn access_log_header_filter_absence_rule_is_mode_scoped_through_the_seam() {
+        use envoy_config::HeaderMatcherMode as M;
+
+        let compile = |mode: M, invert: bool| {
+            compile_access_log_filter(&envoy_config::AccessLogFilter {
+                status_code_filter: None,
+                response_flag_filter: None,
+                header_filter: Some(envoy_config::HeaderFilter {
+                    header: envoy_config::HeaderMatcher {
+                        name: "x-a".into(),
+                        mode,
+                        invert_match: invert,
+                    },
+                }),
+                and_filter: None,
+                or_filter: None,
+                metadata_filter: None,
+            })
+        };
+        let present = [("x-a".to_string(), "zzz".to_string())];
+        let absent: [(String, String); 0] = [];
+
+        // D1: value matcher + invert + ABSENT → the record is now DROPPED.
+        let f = compile(M::ExactMatch("v".into()), true);
+        assert!(
+            f.should_log(200, "-", &present, &Default::default()),
+            "value+invert, present non-matching → KEEP"
+        );
+        assert!(
+            !f.should_log(200, "-", &absent, &Default::default()),
+            "value+invert, ABSENT → DROP (D1 / CF-72-1 closed) — this is the \
+             divergence fixture 0078's README recorded as deferred"
+        );
+
+        // D2: plain `present_match: false` requires ABSENCE.
+        let f = compile(M::PresentMatch(false), false);
+        assert!(
+            !f.should_log(200, "-", &present, &Default::default()),
+            "present_match:false, PRESENT → DROP (D2)"
+        );
+        assert!(
+            f.should_log(200, "-", &absent, &Default::default()),
+            "present_match:false, ABSENT → KEEP"
+        );
+
+        // P1 THE GUARD — must stay KEEP through the seam.
+        let f = compile(M::PresentMatch(true), true);
+        assert!(
+            f.should_log(200, "-", &absent, &Default::default()),
+            "present_match:true+invert, ABSENT → STILL KEEP (P1 parity)"
+        );
+        assert!(
+            !f.should_log(200, "-", &present, &Default::default()),
+            "present_match:true+invert, PRESENT → DROP"
+        );
+
+        // An EMPTY VALUE counts as PRESENT through the seam too.
+        let empty = [("x-a".to_string(), String::new())];
+        assert!(
+            !compile(M::PresentMatch(false), false)
+                .should_log(200, "-", &empty, &Default::default()),
+            "an EMPTY header value is PRESENT, so present_match:false DROPs"
+        );
+    }
 }

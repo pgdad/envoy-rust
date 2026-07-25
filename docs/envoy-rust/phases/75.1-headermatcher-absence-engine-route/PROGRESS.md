@@ -645,3 +645,72 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; fi
 `jwt_authn.rs` production code is NOT edited.
 
 **Commit:** `phase 75.1 task 8: pin mode-scoped absence propagation through JWT-authn rule matching`
+
+---
+
+## Task 9 — consumer propagation: the access-log `header_filter` through the ADR-0150 trait object
+
+Call site **5 of 5**: `crates/envoy-accesslog/src/filter.rs`
+`LogFilter::should_log`, reached as `Arc<dyn HeaderMatch>`. This is the only
+call site that goes through the **trait object** rather than the inherent
+method, so it is the one that proves the ADR-0150 seam carries the new rule.
+
+**Why the test lives in `crates/envoy-http1/src/hcm.rs` and not in
+`envoy-accesslog`.** `envoy-accesslog` MUST NOT depend on `envoy-config`
+(ADR-0150 — the reverse edge already exists, so it would be a dependency cycle),
+so `envoy-accesslog`'s own tests can only use LOCAL STUB trait objects and could
+never exercise the real engine. `envoy-http1` depends on both crates and owns
+the private `compile_access_log_filter`, which is where a real `HeaderMatcher`
+is actually boxed into the seam at runtime. Compiling through that function is
+what makes this test exercise the real boxing rather than a stub.
+
+**The ADR-0150 seam was NOT moved.** `envoy-accesslog` keeps ZERO workspace
+dependencies; matchers still cross as injected trait objects; `LogFilter` still
+has NO `Eq`/`PartialEq`. Neither `envoy-accesslog` nor `compile_access_log_filter`
+was edited.
+
+### RED — pre-75.1 engine
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 185 filtered out
+thread 'hcm::tests::access_log_header_filter_absence_rule_is_mode_scoped_through_the_seam' panicked at crates/envoy-http1/src/hcm.rs:10089:9:
+value+invert, ABSENT → DROP (D1 / CF-72-1 closed) — this is the divergence fixture 0078's README recorded as deferred
+```
+
+### GREEN — fixed engine
+
+```bash
+cargo test -p envoy-http1 --lib access_log_header_filter_absence_rule_is_mode_scoped_through_the_seam
+```
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 185 filtered out; finished in 0.00s
+```
+
+Beyond D1/D2/P1 this test also carries the **empty-VALUE control through the
+seam**: an empty header value counts as PRESENT, so `present_match: false` DROPs
+it. That is the in-process pin which makes fixture `0083`'s two empty-value
+probes a confirmation rather than the sole evidence (see Task 11).
+
+### The RED worktree was torn down
+
+```bash
+git worktree remove --force /tmp/wt-75-1-consumers
+git worktree list
+```
+
+Only the four `.claude/worktrees/agent-*` of the PARALLEL WORKSTREAM remain —
+they were LEFT ALONE throughout, per memory
+`concurrent-loop-sessions-race-on-phase-pick` (remove only your OWN artifacts).
+
+### All five call sites are now pinned
+
+| # | call site | subsystem | task |
+|---|---|---|---|
+| 1 | `envoy-http1/src/hcm.rs` `route_matches` | route header matching (H1 **and** H2) | 5 |
+| 2 | `envoy-filter/src/rbac.rs` `eval` | HTTP RBAC | 6 |
+| 3 | `envoy-filter/src/fault.rs` `header_gate_matches` | fault header gate | 7 |
+| 4 | `envoy-filter/src/jwt_authn.rs` `route_match_matches` | JWT authn | 8 |
+| 5 | `envoy-accesslog/src/filter.rs` `should_log` (via `Arc<dyn HeaderMatch>`) | access-log `header_filter` | 9 |
+
+**Commit:** `phase 75.1 task 9: pin mode-scoped absence propagation through the ADR-0150 HeaderMatch trait object`
