@@ -521,6 +521,155 @@ mod tests {
         assert!(!sm.matches_resolved(Some("dev")));
         assert!(!sm.matches_resolved(None));
     }
+
+    /// Phase 75.1 (ADR-0159): the full ABSENCE-SEMANTICS matrix for the shared
+    /// engine — seven modes × {absent, present-matching, present-non-matching}
+    /// × {invert, no-invert}, plus the empty-header-VALUE control.
+    ///
+    /// Every expectation below is the MEASURED upstream
+    /// `envoyproxy/envoy:v1.33.0` verdict (`SPEC.md` §2.3, a 13-probe × 5-variant
+    /// backend-free route matrix driven live against BOTH proxies). The rule:
+    ///
+    /// * `present_match(want)` is the ONLY mode evaluated with the header
+    ///   ABSENT: `(present == want) ^ invert_match`.
+    /// * every VALUE mode returns `false` when the header is absent —
+    ///   `invert_match` is NOT applied to a missing header.
+    /// * an EMPTY header VALUE counts as PRESENT.
+    ///
+    /// This matrix is the coverage whose absence let the `present_match: false`
+    /// divergence (D2) survive from phase 04.2 to phase 75.1.
+    #[test]
+    fn absence_semantics_matrix_matches_measured_upstream() {
+        let string_exact = |lit: &str| {
+            HeaderMatcherMode::StringMatch(StringMatcher {
+                mode: StringMatcherMode::Exact(lit.into()),
+                ignore_case: false,
+            })
+        };
+
+        // (label, mode, a value that MATCHES the mode, a value that does NOT)
+        let value_modes: Vec<(&str, HeaderMatcherMode, &str, &str)> = vec![
+            (
+                "exact_match",
+                HeaderMatcherMode::ExactMatch("v".into()),
+                "v",
+                "zzz",
+            ),
+            (
+                "prefix_match",
+                HeaderMatcherMode::PrefixMatch("v".into()),
+                "v1",
+                "zzz",
+            ),
+            (
+                "suffix_match",
+                HeaderMatcherMode::SuffixMatch("v".into()),
+                "1v",
+                "zzz",
+            ),
+            (
+                "safe_regex_match",
+                HeaderMatcherMode::SafeRegexMatch(compile("^v$")),
+                "v",
+                "zzz",
+            ),
+            (
+                "range_match",
+                HeaderMatcherMode::RangeMatch(Int64Range { start: 1, end: 10 }),
+                "5",
+                "zzz",
+            ),
+            ("string_match", string_exact("v"), "v", "zzz"),
+        ];
+
+        for (label, mode, hit, miss) in value_modes {
+            // --- no invert ---
+            let m = hm("x-a", mode.clone());
+            assert!(m.matches(&[h("x-a", hit)]), "{label}: present+matching");
+            assert!(
+                !m.matches(&[h("x-a", miss)]),
+                "{label}: present+non-matching"
+            );
+            assert!(!m.matches(&[]), "{label}: absent");
+
+            // --- invert ---
+            let mi = hm_inverted("x-a", mode.clone());
+            assert!(
+                !mi.matches(&[h("x-a", hit)]),
+                "{label}+invert: present+matching"
+            );
+            assert!(
+                mi.matches(&[h("x-a", miss)]),
+                "{label}+invert: present+non-matching"
+            );
+            // THE D1 CELL. Upstream DROPS: a missing header is an unconditional
+            // value no-match that `invert_match` does NOT resurrect.
+            assert!(
+                !mi.matches(&[]),
+                "{label}+invert: ABSENT must be false — invert_match is NOT \
+                 applied to a missing header (D1 / CF-72-1)"
+            );
+
+            // --- empty VALUE counts as PRESENT, so it takes the value path ---
+            assert!(
+                !m.matches(&[h("x-a", "")]),
+                "{label}: empty value is PRESENT and fails the value match"
+            );
+            assert!(
+                mi.matches(&[h("x-a", "")]),
+                "{label}+invert: empty value is PRESENT, so invert DOES apply"
+            );
+        }
+
+        // --- present_match: the ONLY mode evaluated on an absent header ---
+        let pm_true = hm("x-a", HeaderMatcherMode::PresentMatch(true));
+        assert!(pm_true.matches(&[h("x-a", "v")]), "present(true): present");
+        assert!(
+            pm_true.matches(&[h("x-a", "")]),
+            "present(true): EMPTY VALUE counts as PRESENT"
+        );
+        assert!(!pm_true.matches(&[]), "present(true): absent");
+
+        let pm_true_inv = hm_inverted("x-a", HeaderMatcherMode::PresentMatch(true));
+        assert!(
+            !pm_true_inv.matches(&[h("x-a", "v")]),
+            "present(true)+invert: present"
+        );
+        // THE P1 GUARD CELL — MEASURED PARITY on both proxies. A uniform
+        // "absent => DROP" fix breaks this and mints a NEW divergence.
+        assert!(
+            pm_true_inv.matches(&[]),
+            "present(true)+invert: ABSENT must stay KEEP (P1 — MEASURED PARITY)"
+        );
+
+        // D2: upstream `present_match: false` means the header must be ABSENT.
+        let pm_false = hm("x-a", HeaderMatcherMode::PresentMatch(false));
+        assert!(
+            !pm_false.matches(&[h("x-a", "v")]),
+            "present(false): a PRESENT header must NOT match (D2)"
+        );
+        assert!(
+            !pm_false.matches(&[h("x-a", "")]),
+            "present(false): an EMPTY VALUE is PRESENT, so it must NOT match (D2)"
+        );
+        assert!(pm_false.matches(&[]), "present(false): absent matches");
+
+        let pm_false_inv = hm_inverted("x-a", HeaderMatcherMode::PresentMatch(false));
+        assert!(
+            pm_false_inv.matches(&[h("x-a", "v")]),
+            "present(false)+invert: present matches (D2, inverted)"
+        );
+        assert!(
+            !pm_false_inv.matches(&[]),
+            "present(false)+invert: absent does not match"
+        );
+
+        // The name match stays case-insensitive under the restructure.
+        assert!(
+            hm("X-A", HeaderMatcherMode::PresentMatch(true)).matches(&[h("x-a", "v")]),
+            "header NAME matching stays case-insensitive"
+        );
+    }
 }
 
 #[cfg(test)]
