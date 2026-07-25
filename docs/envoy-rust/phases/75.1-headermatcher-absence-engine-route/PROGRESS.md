@@ -891,3 +891,91 @@ second wire encoding, and pairs with the in-process empty-value control that
 Task 1 (engine) and Task 9 (through the ADR-0150 seam) already pin.
 
 **Commit:** `phase 75.1 task 11: fixture 0083 expectations — 22 probes across 8 matchers, all read off the measured upstream column`
+
+---
+
+## Task 12 — fixture `0083`: README and the test entrypoint
+
+**Files created:**
+- `tests/fixtures/0083-headermatcher-absence-parity/README.md` (the 8-section
+  house shape: what it witnesses + the rule quoted in full, the config shape, the
+  8-matcher table, the full 22-probe table, the "why p07 is load-bearing"
+  subsection, the per-side divergence table, cross-references, and the
+  "Deferred — NOT in this differential" section).
+- `tests/differential/tests/headermatcher_absence_parity.rs` — the entrypoint.
+
+**Registration cost was ONE file, as projected.** `tests/differential/Cargo.toml`
+has no `[[test]]` stanza (cargo autodiscovers `tests/*.rs`), the workspace root
+already lists `tests/differential`, CI is `cargo test --workspace`, and there is
+no fixture registry — `run_fixture` takes a directory path. **No `ci.yml` edit,
+no workspace edit, no `[[test]]` stanza.**
+
+### Step 3 — the fixture runs GREEN cross-proxy
+
+```bash
+cargo build -p envoy-bin       # NOT optional: the harness runs target/debug/envoy-bin
+cargo test -p differential --test headermatcher_absence_parity
+```
+
+```
+running 1 test
+INFO node registered node.id=x node.cluster=y
+INFO listener bound with SO_REUSEPORT (one accept queue per worker) addr=127.0.0.1:37197 sockets=32
+INFO envoy-rust listening (http_connection_manager) addr=127.0.0.1:37197 stat_prefix=ingress_http codec_type=HTTP1
+test headermatcher_absence_parity_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+```
+
+### TWO ANTI-VACUITY CHECKS — because a 1.09 s "green" deserves suspicion
+
+A differential that boots an Envoy container and finishes in ~1 s is fast enough
+to warrant proving it did the work. Both checks were run.
+
+**(a) The upstream container really is spawned.** `docker ps -a` after the run
+shows nothing (testcontainers removes on drop), so the run was repeated while
+polling `docker ps`:
+
+```
+SPOTTED upstream container during run:
+interesting_cohen	envoyproxy/envoy:v1.33.0
+```
+
+A real upstream container on the `ENVOY_TARGET.md`-pinned image is started and
+torn down per run. Envoy simply boots fast from a warm image. (The parallel
+workstream's long-running `quizzical_goldstine` was filtered out of the poll and
+LEFT ALONE.)
+
+**(b) The 22 probes are genuinely ASSERTED against upstream, not merely driven.**
+A negative control flipped the load-bearing `p07-absent-keeps-GUARD` expectation
+from `p07=MATCH` to `p07=NOMATCH` and re-ran:
+
+```
+test result: FAILED. 0 passed; 1 failed
+thread 'headermatcher_absence_parity_fixture' panicked at ...:37:10:
+fixture passes: probe p07-absent-keeps-GUARD: upstream body != expected
+  upstream: [112, 48, 55, 61, 77, 65, 84, 67, 72]
+  expected: [112, 48, 55, 61, 78, 79, 77, 65, 84, 67, 72]
+```
+
+The failure names the probe and compares against **UPSTREAM's actual response
+bytes** (`[112,48,55,61,77,65,84,67,72]` = `p07=MATCH`), which is direct proof
+that the upstream side is driven and asserted. The expectation was then reverted
+with `git checkout --` and the file confirmed clean.
+
+> **A FIRST attempt at this control was DISCARDED as inconclusive.** Run in a
+> scratch worktree, it went RED with
+> `envoy-bin not found at /tmp/wt-0083-neg/target/debug/envoy-bin` — a STARTUP
+> failure that never reached an assertion, which is exactly the trap memory
+> `mutation-red-needs-unmutated-control` describes. Reading the failure TEXT
+> rather than the exit code caught it; the control was redone in the main tree
+> (which has the built binary) and only then produced the semantic RED above.
+
+### Step 4 — the census moved by exactly one
+
+```
+fixture dirs: 83   (was 82)
+tracked files in tests/fixtures/0083-headermatcher-absence-parity/: 4
+```
+
+**Commit:** `phase 75.1 task 12: fixture 0083 README + differential entrypoint — the route-path absence-parity witness is green`
