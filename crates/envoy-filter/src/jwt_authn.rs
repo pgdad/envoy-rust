@@ -665,51 +665,56 @@ mod tests {
         let (_kp, jwks) = keypair();
 
         // Returns true iff the RULE MATCHED (a tokenless request got denied).
-        let rule_matched = |mode: HeaderMatcherMode, invert: bool, headers: Vec<(String, String)>| {
-            let reg = registry();
-            let mut providers = std::collections::BTreeMap::new();
-            providers.insert(
-                "prov".to_string(),
-                envoy_config::JwtProvider {
-                    issuer: ISS.to_string(),
-                    audiences: vec![],
-                    local_jwks: envoy_config::DataSource {
-                        filename: None,
-                        inline_string: Some(jwks.clone()),
+        let rule_matched =
+            |mode: HeaderMatcherMode, invert: bool, headers: Vec<(String, String)>| {
+                let reg = registry();
+                let mut providers = std::collections::BTreeMap::new();
+                providers.insert(
+                    "prov".to_string(),
+                    envoy_config::JwtProvider {
+                        issuer: ISS.to_string(),
+                        audiences: vec![],
+                        local_jwks: envoy_config::DataSource {
+                            filename: None,
+                            inline_string: Some(jwks.clone()),
+                        },
+                        forward: false,
                     },
-                    forward: false,
-                },
-            );
-            let cfg = envoy_config::JwtAuthnConfig {
-                providers,
-                rules: vec![envoy_config::RequirementRule {
-                    r#match: envoy_config::RouteMatch {
-                        prefix: Some("/".to_string()),
-                        path: None,
-                        headers: vec![HeaderMatcher {
-                            name: "x-a".to_string(),
-                            mode,
-                            invert_match: invert,
-                        }],
-                    },
-                    requires: envoy_config::JwtRequirement {
-                        provider_name: "prov".to_string(),
-                    },
-                }],
+                );
+                let cfg = envoy_config::JwtAuthnConfig {
+                    providers,
+                    rules: vec![envoy_config::RequirementRule {
+                        r#match: envoy_config::RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![HeaderMatcher {
+                                name: "x-a".to_string(),
+                                mode,
+                                invert_match: invert,
+                            }],
+                        },
+                        requires: envoy_config::JwtRequirement {
+                            provider_name: "prov".to_string(),
+                        },
+                    }],
+                };
+                let mut f = JwtAuthnFilter::build_from_config(&cfg, &reg, "ingress_http").unwrap();
+                let mut hs = vec![host()];
+                hs.extend(headers);
+                let mut r = req(hs, "/api");
+                let _ = f.decode_headers(&mut r);
+                denied_value(&reg) == 1
             };
-            let mut f = JwtAuthnFilter::build_from_config(&cfg, &reg, "ingress_http").unwrap();
-            let mut hs = vec![host()];
-            hs.extend(headers);
-            let mut r = req(hs, "/api");
-            let _ = f.decode_headers(&mut r);
-            denied_value(&reg) == 1
-        };
 
         let present = vec![("x-a".to_string(), "zzz".to_string())];
 
         // D1: value matcher + invert + ABSENT → the rule no longer matches.
         assert!(
-            rule_matched(HeaderMatcherMode::ExactMatch("v".into()), true, present.clone()),
+            rule_matched(
+                HeaderMatcherMode::ExactMatch("v".into()),
+                true,
+                present.clone()
+            ),
             "value+invert, present non-matching → rule matches → tokenless denied"
         );
         assert!(
@@ -719,7 +724,11 @@ mod tests {
 
         // D2: plain `present_match: false` requires ABSENCE.
         assert!(
-            !rule_matched(HeaderMatcherMode::PresentMatch(false), false, present.clone()),
+            !rule_matched(
+                HeaderMatcherMode::PresentMatch(false),
+                false,
+                present.clone()
+            ),
             "present_match:false, PRESENT → rule must NOT match (D2)"
         );
         assert!(

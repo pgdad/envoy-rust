@@ -10117,8 +10117,12 @@ static_resources:
         // An EMPTY VALUE counts as PRESENT through the seam too.
         let empty = [("x-a".to_string(), String::new())];
         assert!(
-            !compile(M::PresentMatch(false), false)
-                .should_log(200, "-", &empty, &Default::default()),
+            !compile(M::PresentMatch(false), false).should_log(
+                200,
+                "-",
+                &empty,
+                &Default::default()
+            ),
             "an EMPTY header value is PRESENT, so present_match:false DROPs"
         );
     }

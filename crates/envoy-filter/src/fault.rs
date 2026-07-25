@@ -218,7 +218,10 @@ mod tests {
             !aborts(g.clone(), present.clone()),
             "present_match:false, PRESENT → gate must NOT fire (D2)"
         );
-        assert!(aborts(g, vec![]), "present_match:false, ABSENT → gate fires");
+        assert!(
+            aborts(g, vec![]),
+            "present_match:false, ABSENT → gate fires"
+        );
 
         // P1 THE GUARD.
         let g = gate(HeaderMatcherMode::PresentMatch(true), true);

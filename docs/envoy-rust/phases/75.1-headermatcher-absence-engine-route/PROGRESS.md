@@ -1121,3 +1121,60 @@ nothing else:
 Fixture `0083` re-confirmed green after the doc edits: `1 passed; 0 failed`.
 
 **Commit:** `phase 75.1 task 13: BEHAVIOR_CONTRACT §C rewritten to the measured parity rule (CF-72-1 CLOSED); C2 correction; 0078 README`
+
+---
+
+## Post-task-13 — `cargo fmt` normalisation of the PLAN's literal Rust
+
+**A real finding, not bookkeeping.** After all 13 tasks were committed,
+`cargo fmt --all -- --check` **FAILED** in FIVE places — every one of them in
+code copied VERBATIM from `PLAN.md`:
+
+| file | what rustfmt changed |
+|---|---|
+| `crates/envoy-filter/src/fault.rs` | a one-line `assert!(aborts(g, vec![]), "…")` split across lines |
+| `crates/envoy-filter/src/jwt_authn.rs` | the `rule_matched` closure re-indented (its param list exceeded the width) |
+| `crates/envoy-filter/src/jwt_authn.rs` ×2 | two `rule_matched(...)` call sites split one-arg-per-line |
+| `crates/envoy-http1/src/hcm.rs` | the final `compile(..).should_log(..)` chain split one-arg-per-line |
+
+This is memory `plan-md-example-code-trips-clippy` recurring in its `fmt` form:
+**the plan's own literal Rust does not satisfy the plan's own gates.** The
+PLAN-write pre-flight lints the ENGINE restructure (Task 2) but not the test
+bodies of Tasks 5-9, so this was not caught there. It is also exactly the
+"CI is often red-at-fmt mid-phase" pattern of memory
+`envoy-rust-state4-ci-first-execution`.
+
+Resolved by running `cargo fmt --all` — a pure whitespace/wrapping
+normalisation, no semantic change:
+
+```
+cargo fmt --all && cargo fmt --all -- --check   → exit 0
+ M crates/envoy-filter/src/fault.rs
+ M crates/envoy-filter/src/jwt_authn.rs
+ M crates/envoy-http1/src/hcm.rs
+```
+
+**Doc-comment safety check.** `cargo fmt` does NOT reflow `///` / `//!` / `//`
+lines, so a reformatting pass could in principle leave a comment stranded
+mid-sentence. `git diff -U0 | grep -cE '^[+-].*///'` = **0** — the normalisation
+touched ZERO doc-comment lines, so the hazard of memory
+`mechanical-fanout-scripts-corrupt-doc-comments` did not bite.
+
+All four affected tests re-run GREEN after the reformat:
+
+```
+fault_header_gate_absence_rule_is_mode_scoped:      1 passed; 0 failed
+jwt_rule_header_matcher_absence_rule_is_mode_scoped: 1 passed; 0 failed
+access_log_..._through_the_seam:                     1 passed; 0 failed
+route_header_matcher_absence_rule_is_mode_scoped:    1 passed; 0 failed
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit `0`,
+and `#![forbid(unsafe_code)]` still holds at every crate root (the
+"crate roots missing it" grep returned nothing).
+
+> **NOTE FOR THE STATE-4 SESSION.** This is a state-3 convenience run of two
+> cheap gates to avoid pushing trivially-red CI. It is **NOT** the §7.5
+> verification gate, which is state-4's job and a SEPARATE session (§5.1,
+> ADR-0127). `cargo test --workspace`, `cargo deny check`, the full differential
+> suite and the conformance suites have **NOT** been run by this session.
