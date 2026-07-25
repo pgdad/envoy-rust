@@ -532,7 +532,7 @@ re-review. ROADMAP row `74` stays `in-progress` until the state-6 close-out.
 
 ---
 
-# §5 state-5 RE-REVIEW (the SECOND review — this is the phase's CURRENT verdict)
+# §5 state-5 RE-REVIEW (the SECOND review — SUPERSEDED; the CURRENT verdict is the 2nd RE-REVIEW at the END of this file)
 
 > `superpowers:requesting-code-review`, run in its OWN fresh session per §5.1 /
 > ADR-0127 (the context that wrote an artifact must not grade it). This section
@@ -566,6 +566,13 @@ re-review. ROADMAP row `74` stays `in-progress` until the state-6 close-out.
 ---
 
 ## Verdict: **APPROVED WITH MUST-FIX — 3 Important, 0 Critical. Next = §5.2 state-3 RE-ENTRY (step 3, NOT step 4).**
+
+> **THIS VERDICT IS SUPERSEDED (reasoning preserved verbatim per D-3.5 — do NOT
+> re-litigate it).** All three Important findings below (I-5, I-6 a/b/c, I-7) were
+> consumed by the SECOND §5.2 state-3 re-entry (commit `1f938112`) and CONFIRMED
+> CLOSED by the **`# §5 state-5 RE-REVIEW (2nd)` section appended at the end of
+> this file**, which is the phase's CURRENT verdict (**APPROVED** — 0 Critical, 0
+> Important). Read that section for the live disposition.
 
 **All four original Important findings (I-1, I-2 + I-2b, I-3, I-4) are genuinely
 and correctly CLOSED.** No behavioral defect. No Critical. The re-entry changed
@@ -1045,3 +1052,381 @@ assumed.
 Then: state-4 re-verification → state-5 re-review → the state-6 close-out.
 ROADMAP row `74` stays `in-progress` throughout. Do **not** flip it, and do **not**
 create a `stop` file — the `MISSION.md` §9 feature families remain largely unbuilt.
+
+---
+
+# §5 state-5 RE-REVIEW (2nd — this is the phase's CURRENT verdict)
+
+> `superpowers:requesting-code-review`, run in its OWN fresh session per §5.1 /
+> ADR-0127 (the context that wrote an artifact must not grade it). This section
+> supersedes BOTH verdicts above; their reasoning is preserved verbatim per D-3.5
+> and must not be re-litigated.
+>
+> **What is graded here:** the SECOND §5.2 state-3 re-entry's diff
+> `git diff cd695dd4bc9d2ed7a2b524dae3ca42eae76f84c8..1f93811272cf090ab0f6f1b26b1e3b5096af3cd5`
+> (9 files, +537/−67) against the three Important findings it claims to close
+> (I-5, I-6 a/b/c, I-7), PLUS the SECOND state-4 RE-VERIFICATION commit
+> `c6197f69193d5f09f784a6fd98255c53d6f02db0` (docs-only, 3 files) whose §7.5 gate
+> verdict this review CONSUMES. Session HEAD = `c6197f69…`; `git status
+> --porcelain` clean; `git fetch origin --prune` showed `origin/main` at the SAME
+> SHA at session start and again immediately before the commit. CI on
+> `c6197f69…` was already `completed`/`success` (run `30126128604`, both jobs
+> green with full step counts 15 and 13).
+>
+> **The §7.5 gate (a)–(e) was NOT re-run** — it was RE-RUN FROM SCRATCH and
+> adjudicated GREEN at the second state-4 RE-VERIFICATION, and its evidence is
+> quoted in `PROGRESS.md` `## §7.5 gate (state-4 RE-VERIFICATION, 2nd)`. Gate
+> **(f) IS this review.**
+>
+> **Method** (memory `state5-must-probe-untested-compositions`): five FRESH
+> zero-context read-only reviewers fanned out across independent dimensions (the
+> contract §G edit; the two fixture YAMLs plus the two `crates/` comment edits;
+> the test-entrypoint module doc and contract §H; the fuzz census; and a
+> PROGRESS/STATE narrative audit against disk), each forbidden to write and
+> forbidden to run `cargo`. The MAIN session re-derived every load-bearing disk
+> fact itself, and — because one reviewer identified a genuinely UNMEASURED
+> composition rather than a wording problem — **ran a new live cross-proxy probe
+> itself** (probe group 5 below). **Every subagent finding was re-verified on disk
+> before being adopted; two were re-graded and one was converted from an argument
+> into a measurement.**
+
+---
+
+## Verdict: **APPROVED — 0 Critical, 0 Important. Next = the §5 state-6 CLOSE-OUT.**
+
+**All three Important findings (I-5, I-6 a/b/c, I-7) are genuinely and correctly
+CLOSED.** No behavioral defect. No Critical. Nothing MUST-FIX remains, so **no
+third §5.2 state-3 re-entry is owed** and the phase proceeds to close-out.
+
+The governing fact was re-derived on disk, not taken from the handoff:
+
+```
+$ git diff cd695dd..1f93811 -U0 -- crates/ | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+    | grep -vE '^[+-]\s*(//|///)' | wc -l
+0
+$ git diff cd695dd..1f93811 | grep -cE '^\+\s*#\[(tokio::)?test'
+0
+```
+
+**ZERO executable lines and ZERO new tests.** Both `crates/` hunks are comments
+(M74-19, M74-23) and were additionally read in full rather than trusted to the
+grep — neither touches a string literal, an attribute, or code. The state-4
+commit is genuinely docs-only (3 files). So the behavior adjudicated at the gate
+and at both prior reviews is exactly the behavior that ships, and **no behavioral
+re-adjudication is owed** for the diff.
+
+The ten Minors recorded below are all documentary or cosmetic. None makes the
+contract assert anything FALSE about measured behavior — which is the bar that
+made I-1, I-5 and I-6 MUST-FIX — and the one that came closest was resolved by
+MEASUREMENT rather than by argument (M74-33, probe group 5).
+
+ROADMAP row `74` stays `in-progress` — the flip is the state-6 close-out.
+
+---
+
+## The three findings — CONFIRMED CLOSED
+
+| finding | independent verification | verdict |
+|---|---|---|
+| **I-5** — §G over-read its own S4/S5 table | §G now (i) scopes the confirmation to the RESOLVED branch (`BEHAVIOR_CONTRACT.md:2582-2584`), (ii) states plainly that the table does **NOT** isolate the ABSENT branch **and why** — spelling out the competing `Some(present == want)` rule that predicts both rows exactly (`:2586-2591`) — and (iii) cites the isolating evidence elsewhere (`:2592-2598`). I re-derived the competing-hypothesis argument by hand and it is correct: on S4 (`want=true`) it predicts KEEP{r1,r2,r5,r6}/DROP, on S5 (`want=false`) DROP/KEEP{r3,r4,r7} — observationally identical to the true rule on that table. Both citations were checked AT SOURCE: §B's R-0.4 flip does hold the value matcher and the key's absence constant while flipping only the policy (`SPEC.md:131-140`), and S6/S7 are genuinely matcher-less with opposite policies (`REVIEW.md:99-100`). **CF-74-5 was NOT reopened** and remains correctly scoped to the resolved branch in both `BEHAVIOR_CONTRACT.md:2602-2604` and `SPEC.md:660-666`. | **CLOSED** |
+| **I-6(a)** — the `0081` config comments (the one that mattered) | The false clause is gone from BOTH YAMLs (`grep -rc "every probe in this fixture sets"` → **0** across all 4 files of the fixture, asserted non-vacuously after `ls` confirmed the files exist). The replacement text checks out probe-for-probe against `expectations.yaml`. An INLINE ADR-0155 PV-6 warning now exists on both sides and is **strictly stronger than the `0082` precedent it mirrors** — it names the "silently vacated WHILE THIS FIXTURE STAYED GREEN" failure mode, which `0082`'s inline text does not. `on_header_missing` remains **0 config keys** in all four `0081`/`0082` YAMLs with exactly 1 `#`-comment hit each (each file greped and reported individually). The per-side `diff` is still EXACTLY the four documented divergences, and the new comment block is byte-identical across sides (`md5sum` `14dd98c681472cc74dd732e78bcaa545` both). | **CLOSED** |
+| **I-6(b)** — the test entrypoint module doc | `grep -c "Two probes"` → **0**; `grep -c "EXACTLY ONE"` → **0**. The doc now enumerates all THREE probes with the branch each takes, matching `expectations.yaml` exactly (P1 `x-a:2` resolved-mismatch DROP, P2 no-header unresolved→default KEEP, P3 `x-a:1` resolved-match KEEP), gives both byte-DISTINCT lines in order, carries the `match_if_key_not_found` default-`true` branch and the PV-6 warning, and now mirrors the sibling's four-block structure. **0** lines >100 cols added; the one over-wide line in the file (`:11`, 118 cols) is pre-existing. | **CLOSED** |
+| **I-6(c)** — contract §H | §H now reads "**THREE probes, TWO kept lines**" with the no-`x-a` probe named as KEPT **via the `match_if_key_not_found` DEFAULT `true`**, both lines given in order; `0082`'s description re-checked against its own `expectations.yaml` and still accurate. The PV-6 note is lifted into its own paragraph scoped to **BOTH** fixtures, naming the distinct witness each would lose and that the fixture would stay GREEN either way. I swept §A–§G for any surviving two-probe/one-line description of `0081` and found **none** — the only "two probes" hits in the contract are fixtures `0076`/`0077`, which genuinely have two. | **CLOSED** |
+| **I-7** — the "exactly ONE fuzz target" claim | Ground truth re-measured on disk (worktree-safe — `.claude/worktrees/agent-*` exist and were excluded by construction): **FIVE** targets (`accesslog_format_parse`, `parse_bootstrap`, `cdn_loop_parse`, `grpc_health_decode`, `jwt_parse`), wired into `ci.yml` at **107/113/120/127/134** — a **bijection**, no orphan either way; **63** tracked seeds. The one prescribed site (`PROGRESS.md:1362`) is now directory-scoped and names all five with their `ci.yml` lines; every element matches disk. "This phase added none" verified: `git diff 53893b67..1f93811 --stat -- 'crates/*/fuzz/fuzz_targets/'` and `-- .github/` are both **EMPTY**. The gate-(d) bodies (`:538`, `:1275`) were correctly left alone and remain scoped and true, so **the gate verdict stands**. `STATE.md`'s two bad phrasings are gone (`grep -c 'exactly ONE fuzz target, so no'` → **0**). | **CLOSED** |
+
+---
+
+## Probe group 5 — a NEW live cross-proxy measurement (this review)
+
+A reviewer flagged §G's absent-branch citation as covering the wrong
+configuration: **§B's R-0.4 flip uses a `string_match` matcher and S6/S7 have no
+matcher at all, so neither isolates the ABSENT branch for a `present_match`
+matcher** — precisely the configuration §G's own competing hypothesis is stated
+over. That is not a wording problem; it is a genuinely UNPROBED composition with
+a concrete divergence hypothesis, and probe group 1 contains only
+(`present_match: true`, policy `false`) and (`present_match: false`, policy
+`true`) — the two DISCRIMINATING pairs were never run.
+
+Per memory `state5-must-probe-untested-compositions` I **measured it instead of
+arguing it.** Method per memories `state0-recon-docker-needs-port-mapping`
+(port-mapped `docker -p`, never `--network host`) and
+`differential-per-side-counts-mid-settle-are-flush-artifacts` (graceful
+`docker stop -t 15` to flush real Envoy's buffer). ONE H1 config pair, differing
+only in the permitted per-side divergences (`admin`, bind, mount path — confirmed
+by `diff`), with the two `metadata_filter` sink stanzas **byte-identical across
+sides** (`md5sum` `10c0a096aebb2faa2f9b6cc3ceb69e57` both). `cargo build -p
+envoy-bin` first (memory `differential-harness-uses-debug-envoy-bin`; the run
+emitted `Compiling envoy-bin`, so it is not a stale binary). Two sinks share one
+server run, so both see the SAME requests: a readiness probe (no `x-a`), then
+`x-a: 1` (key RESOLVES), then no `x-a` (key ABSENT).
+
+| sink | filter | predicted — TRUE rule | predicted — competing rule | real Envoy v1.33.0 | envoy-rust | verdict |
+|---|---|---|---|---|---|---|
+| SA | `metadata(present_match: **true**, mifknf **true**)` | 3 lines | 1 line | `P=/x M=-` · `P=/x M=1` · `P=/x M=-` (**3**) | identical (**3**) | **PARITY** |
+| SB | `metadata(present_match: **false**, mifknf **false**)` | 0 lines | 2 lines | *(0 lines)* | *(0 lines)* | **PARITY** |
+
+Both files byte-identical cross-proxy (`md5sum` `c127df6fc23db0dec1fd03cb396cfb83`
+for SA on both sides; SB empty, `d41d8cd98f00b204e9800998ecf8427e` on both).
+
+**What this settles:**
+
+1. **The competing ABSENT-branch hypothesis is REFUTED on real Envoy**, not merely
+   on envoy-rust: a matcher returning `Some(present == want)` on both branches
+   would have produced SA=1 / SB=2. Upstream defers the absent branch to
+   `match_if_key_not_found` **even with a `present_match` matcher**. §G's claim
+   that the deferral "is true and MEASURED" is therefore TRUE — and it is now
+   measured for the matcher type it was missing.
+2. **The MIRROR hypothesis on the RESOLVED branch is refuted too**, by the same
+   two rows: "the policy governs the resolved branch" predicts SA (policy `true`)
+   DROPS the resolved `x-a: 1` and SB (policy `false`) KEEPS it; observed is the
+   exact opposite on both proxies. That independently re-confirms **CF-74-5's
+   closure** from a second, non-complementary pair of sinks.
+3. **envoy-rust is at parity on both previously-unprobed discriminating
+   combinations.** Its `MetadataMatch` impl short-circuits on `?` *before*
+   consulting the value matcher (`crates/envoy-config/src/matcher.rs`), making its
+   absent branch matcher-type-independent by construction — and upstream now
+   measures the same way.
+
+No divergence. The finding therefore lands as a **Minor of record** (M74-33): the
+contract should bank this measurement, which is the same ask M74-26 already
+carries. My probe container was removed afterwards; the sibling session's
+`v1.33.0` container was left alone (memory
+`concurrent-loop-sessions-race-on-phase-pick`); the main tree was `git status
+--porcelain` clean throughout and never mutated.
+
+---
+
+## The §7.5 gate — CONSUMED, with its structural claims independently checked
+
+The verdict `(a) ✅ (b) ✅ (c) ✅ (d) ✅ (e) ✅` stands and is consumed; I did not
+re-run it. I did re-derive the parts a re-review can check without re-running
+anything, and **every one reproduces**: the `+0` test delta (0 new tests, 0 new
+test files, so no new binary and no change to the 159 `test result:` lines); the
+arithmetic `2089 + 6 = 2095 == CI 2095`; the docs-only 3-file state-4 commit;
+**82** fixture dirs; **36** access-log fixtures by config stanza; **63** tracked
+seeds; `known-failures.txt` **21** lines, last touched by `dac3f8b` (phase 05.2)
+and NOT trimmed; `#![forbid(unsafe_code)]` at **22 of 22** member roots (members
+enumerated from the root `Cargo.toml`, so the concurrent session's worktrees
+cannot inflate it); ROADMAP row `74` **6 cells** / `in-progress`; ledger head
+**ADR-0155** with **0** occurrences of `## ADR-0156`; `envoy-accesslog` with
+**ZERO** workspace path deps; `LogFilter` deriving only `Debug, Clone`; and the
+`unreachable!` three-part reconciliation (`grep -c` → **2**, `:1750` a doc
+comment and `:1808` the guard, **0** added or removed phase-wide).
+
+**The 37-vs-36 access-log reconciliation was confirmed rather than accepted:** the
+set difference between the loose-substring and config-key measurements is
+*exactly* `{0011-admin-stats-prometheus}`, and that fixture has **zero**
+`access_log:` config keys — its only hits are the stat names
+`envoy_http_ingress_http_access_logs_total/_failed`. All three figures (37 / 36 /
+34) are right under their own stated rule. **No defect**, exactly as recorded.
+
+**CI was re-confirmed on the FULL 40-char SHAs** (memory
+`gh-run-list-commit-needs-full-sha`): run `30121024060` on `1f93811…` and run
+`30126128604` on `c6197f6…`, both `success`, jobs `89573441309` (15 steps) and
+`89573441401` (13 steps) — job IDs and step counts matching the record verbatim,
+i.e. transcribed accurately rather than rounded to "green".
+
+**One check the gate does not make, added here.** I verified the ADR-0035
+relocation integrity of the state-4 commit: of the 23 lines removed from
+`STATE.md`, 10 are byte-present in `STATE_HISTORY.md` and 13 are the active-phase
+`### Phase-74 …` Notes subsection plus the doctrine-reminder bullet — i.e. the
+**rename-in-place** discipline that `STATE.md`'s own 27 archive breadcrumbs
+document for every prior phase, under which the active-phase subsection is
+superseded in place and relocated only at the state-6 close-out. **Consistent
+with ADR-0035, not a violation.**
+
+---
+
+## Findings
+
+### Critical
+
+**NONE.** Across five review dimensions, a full disk audit, a new cross-proxy
+live probe and the code-level verification of every behavioral claim the changed
+docs make, no input was found that produces a wrong verdict, a panic, or a broken
+load-bearing invariant.
+
+### Important
+
+**NONE.** The one candidate — §G's absent-branch citation not covering a
+`present_match` matcher — was converted from an unmeasured assertion into a
+MEASURED fact by probe group 5 above, at full cross-proxy parity, and is recorded
+as M74-33. Nothing else changes what a reader would believe about measured
+behavior.
+
+### Minor (record; fold at the close-out or opportunistically — NOT required before state-6)
+
+- **M74-30** — `tests/fixtures/0081-accesslog-metadata-filter/envoy.yaml:23-24`
+  and verbatim `envoy-rust.yaml:21-22` retain the lead sentence *"emit **only**
+  when the request's dynamic metadata com.example:k equals `\"1\"`"*. Since the
+  re-entry's third probe that is an over-statement: probe 2 is EMITTED with the
+  key ABSENT, via the not-found default. It is self-corrected three lines below
+  (and the PV-6 block below that blocks the harmful edit), which is why this is
+  not MUST-FIX — but the sibling `0082`, whose not-found branch merely DROPS,
+  already carries the precise wording *"— AND, when the key does NOT resolve, only
+  if `match_if_key_not_found`"*. Fix: copy the sibling's clause; it is one line
+  and already written.
+- **M74-31** — a false CAUSAL claim about probe placement, now at FIVE sites.
+  `tests/differential/tests/access_log_metadata_filter.rs:30-31` (*"placed SECOND
+  rather than appended, **so** the LAST probe is still KEPT and the driver pays
+  the cheap 2 s `CF70_3_SETTLE`"*) and `BEHAVIOR_CONTRACT.md:2612-2614` (*"placed
+  SECOND, not last, **so** kept-LAST (ADR-0147) holds"*) are **new in this diff**;
+  `0081/expectations.yaml:36-38` and `README.md:104-108` pre-existed. Verified
+  against the driver: `suppression_settle` (`tests/differential/src/lib.rs:1694-1699`)
+  inspects **only** `probes.last()`, and with the order `[drop, keep, keep]` the
+  last probe is KEPT whichever kept probe sits last — so appending probe 2 would
+  ALSO yield the cheap settle. Every OUTCOME asserted is true (kept-LAST holds;
+  the fixture does pay 2 s); only the "so" is a non-sequitur. What placement
+  SECOND actually buys is the pinned line ORDER (`M=-` before `M=1`), which the
+  same documents state correctly and separately. Note the FIRST re-review praised
+  this wording, so it has now been endorsed once and propagated twice — worth
+  fixing at all five sites together.
+- **M74-32** — `access_log_metadata_filter.rs:33-34` (and `0081/README.md:34`):
+  *"Each side's file holds EXACTLY TWO **byte-identical** lines … They are
+  byte-DISTINCT"*. At a count of one the phrase was unambiguous (identical ACROSS
+  sides); at two it reads as "identical to each other" and is denied one sentence
+  later. Fix: "EXACTLY TWO lines, byte-identical ACROSS THE TWO PROXIES".
+- **M74-33** — `BEHAVIOR_CONTRACT.md:2591-2598`: the absent-branch citation
+  (§B's R-0.4 flip + the matcher-less S6/S7) covers a `string_match` matcher and
+  the matcher-less case, but not a `present_match` matcher — the configuration the
+  paragraph is actually about. **Probe group 5 above now measures exactly that, at
+  parity**, so the claim is true and no re-probing is owed; the contract should
+  bank the measurement and cite it. This is the same ask **M74-26** already
+  carries (newly measured cross-proxy facts not entering the contract), and
+  M74-26 was itself graded Minor by the previous re-review — this extends it
+  rather than opening a new class.
+- **M74-34** — `PROGRESS.md:1629` presents
+  `$ grep -c 'exactly \*\*one\*\* fuzz target;$' <the bullet's own line>` inside a
+  `$`-prefixed transcript with output `0`, but `<the bullet's own line>` is a
+  PLACEHOLDER, not a file — it is not a command that was run. Separately, the two
+  *real* greps above it no longer reproduce their recorded single hits (now 2 and
+  3), because pasting their output into the file they grep made the transcript its
+  own extra match. Both are self-referential artifacts and the section's own
+  instruction ("adjudicate by LINE, not by count") pre-empts the second — its
+  per-line disposition is correct and I re-verified it. Fix: replace the
+  pseudo-command with a real one, or drop it.
+- **M74-35** — two cross-document count inconsistencies between `STATE.md` and
+  `PROGRESS.md` describing the SAME session: (a) `STATE.md:15/:44/:116` say
+  "**eight** live probe containers on `envoyproxy/envoy:contrib-v1.37.2`
+  (`p74a-*`/`p74b-*`/`p74c-*`)" while `PROGRESS.md:1775-1779` says **seven**
+  hand-named `p74*` on `contrib-v1.37.2` **plus one auto-named `v1.33.0`**;
+  (b) `PROGRESS.md:2118` says "**Four** places where a shortcut was available were
+  refused" while `STATE.md:44`/`:114` and the commit message say **three** (they
+  drop the vacuous-grep item). Unverifiable on disk now (the containers are gone),
+  but the two documents disagree.
+- **M74-36** — `BEHAVIOR_CONTRACT.md:2468-2471` leaves a 21-char orphan line
+  mid-paragraph (`default; see §H). The`) in a hand-wrapped file. Cosmetic.
+- **M74-37** — `BEHAVIOR_CONTRACT.md:2592` cites "**§B's R-0.4 polarity flip**",
+  but `R-0.4` is a `74/SPEC.md` §0 label that appears nowhere in the living
+  contract, so a stranger reading only `BEHAVIOR_CONTRACT.md` cannot resolve it
+  (D-3.4). Pre-existing style in §G's opening, amplified by the new sentence. Fix:
+  "§B's polarity flip (`74/SPEC.md` §0 R-0.4)".
+- **M74-38** — `BEHAVIOR_CONTRACT.md:2620-2621` attributes the both-fixtures
+  `on_header_missing` trap to "ADR-0155 PV-6", but PV-6 (`DECISIONS.md:2427`)
+  scopes it to `0082` alone; the extension to `0081` was created later, by the
+  first re-entry's third probe. The MECHANISM described is correct and the
+  instruction is right — only the attribution over-reaches. Fix: "(the ADR-0155
+  PV-6 trap, extended to `0081` by the state-3 re-entry's third probe)".
+- **M74-39** — `REVIEW.md:113-116` (this file) still asserts the retracted
+  over-read verbatim — *"with the key ABSENT both defer to
+  `match_if_key_not_found`"* — roughly 600 lines before I-5 retracts it, with
+  nothing at the earlier site pointing forward. Superseded reasoning is preserved
+  deliberately per D-3.5, so it must NOT be rewritten; a one-line forward pointer
+  ("— but see I-5") would prevent a reader stopping at the first occurrence.
+
+**Two things that look like defects and are NOT, recorded so a future session does
+not "fix" them:**
+
+- `STATE_HISTORY.md:51` and `:3223` still contain the stale unscoped "exactly ONE
+  fuzz target" phrasing. That archive is **append-only and byte-preserving** by
+  ADR-0035; correcting it would violate the very contract that makes it
+  trustworthy. The I-7 correction sits ABOVE them in a newest-first file. **Do not
+  touch.**
+- `PLAN.md:1844` writes `fuzz_targets/` without the `crates/envoy-config/` prefix.
+  `PLAN.md` is a FROZEN state-2 artifact and the finding explicitly scoped the fix
+  to `PROGRESS.md:1362`; the same document is correctly scoped at `:103`.
+
+---
+
+## Strengths
+
+- **The re-entry correctly refused to manufacture a RED.** Every fix was prose, so
+  there was no behavioral pin to break. Rather than invent a mutation to satisfy
+  ritual, it recorded *why* memory
+  `state3-reentry-fixes-are-characterization-pins-red-via-mutation` does not apply
+  ("the RED obligation attaches to BEHAVIORAL pins, and there are none here") and
+  substituted before/after text plus a proving grep per fix. That is the correct
+  reading of the memory, and the harder call — the easy path was a decorative
+  mutation.
+- **I-5's fix is genuinely subtle and genuinely right.** It does not merely soften
+  a sentence: it names the competing hypothesis explicitly, shows it predicts both
+  observed rows, and redirects to evidence that actually isolates the variable. I
+  re-derived the argument by hand and it holds. Writing down "my own table cannot
+  distinguish these two rules" is a rare and valuable thing for a record to say.
+- **I-6(a)'s fix is stronger than what was prescribed.** The inline PV-6 warning
+  it added to `0081` names the "silently vacated WHILE THIS FIXTURE STAYED GREEN"
+  failure mode, which the `0082` precedent it was told to mirror does not — so the
+  weaker sibling is now the one that lags.
+- **The scope line was held under pressure.** M74-17 was explicitly REFUSED as out
+  of scope because it requires a code change, in a session whose mandate was
+  documentary. Eight further Minors were left unfolded with a stated reason each.
+  Declining cheap wins to keep a state's blast radius honest is exactly what makes
+  the next state-4 cheap to adjudicate.
+- **The record is HONEST under audit.** An independent disk audit of every
+  load-bearing figure — the 0-line diff, the docs-only commit, 82/36/34/37/63/21,
+  22-of-22, the dual counting rules, the `unreachable!` three-part reconciliation,
+  the CI job IDs and step counts — found **no materially false claim**. The
+  reconciliations are real rather than decorative: the 37-vs-36 difference
+  resolves to exactly `{0011-admin-stats-prometheus}` on disk.
+- **The state-4 gate reported inconvenient things rather than smoothing them.** It
+  recorded a SIXTH RED against the handoff's expected five with its cause (a
+  concurrent session's eight containers) instead of quietly matching the expected
+  figure; it discarded an isolation run that would have been easier to keep, and
+  annotated the table so the discarded attempt cannot be mistaken for evidence;
+  and it refused a cached 0.08 s build and a possibly-cached clippy green.
+- **Non-vacuity discipline is real, not claimed.** The per-fixture YAML counts
+  (3/3/3/3/3/3) reproduce exactly, so the `0` arm-hit results genuinely scanned
+  files; the four-file `on_header_missing` census reports each file individually.
+- **The ADR-0150 seam and the phase's other load-bearing invariants held
+  throughout**, and the two `crates/` edits are genuinely inert — verified by
+  reading both hunks in full, not only by a comment-stripping grep.
+
+---
+
+## Carry-forward disposition (after this re-review)
+
+- **CONSUMED earlier in the phase:** N73-R1.
+- **CLOSED:** **CF-74-5** — remains correctly closed and correctly scoped;
+  independently re-confirmed by probe group 5's refutation of the mirror rule.
+- **OPEN, correctly recorded:** **CF-74-6** (the wrapped `BoolValue` spelling),
+  **CF-74-1** (`matcher.invert` accepted-but-INERT upstream, boot-fatal here — do
+  NOT "implement" it), **CF-74-2** (multi-segment `path`), **CF-74-3** (unmodelled
+  `ValueMatcher` arms), **CF-74-4** (the RBAC validator's missing
+  empty-segment-`key` check).
+- **FOLDED at the 2nd re-entry, verified:** M74-19, M74-23, M74-24, M74-25.
+- **OPENED by this re-review:** **M74-30 … M74-39** (all Minor). None blocks the
+  close-out.
+- **ADVANCED but not closed:** **M74-26** — probe group 5 adds a fifth
+  newly-measured cross-proxy fact owed to the contract (see M74-33).
+- **STILL OPEN, unchanged:** M74-3…M74-14, M74-16, M74-17, M74-18, M74-20,
+  M74-21, M74-22, M74-27, M74-28, M74-29; M73-R2 (still asks for a committed
+  FIXTURE), M71-3, M71-6, M71-7/8, M70-R4/R9, **CF-72-1/CF-72-2** (still the
+  strongest NEXT candidate), CF-73-1, N73-R2, M73-R1, M69-A..I, CF-69-1/2/3/5,
+  M68-1, M-1, CF-67-3/5/6/7, the older Minors and the HTTP-filters-family (1)–(4).
+
+---
+
+## Next state
+
+**§5 state-6 CLOSE-OUT — a SEPARATE session** (§5.1 / ADR-0127; memory
+`closeout-and-pick-are-separate-sessions`). Gate (f) is now satisfied, so all six
+§7.5 gates are met. The close-out flips ROADMAP row `74` to `done` (preserving 6
+cells and escaping `\|`), relocates the closed-phase Notes per ADR-0035 with a
+**DELTA-based** byte-preservation check (memory
+`state6-relocation-check-must-be-delta-based` — a "no duplicates" check
+false-fails), advances `STATE.md` to "awaiting next planning", and exits. It fires
+no ADR (**ADR-0156 stays reserved and UNFIRED**), re-runs no gate, and must NOT
+chain into the next phase's state-0/1 pick.
+
+**Do NOT create a `stop` file** — the `MISSION.md` §9 feature families remain
+largely unbuilt and the carry-forward set above is live.
