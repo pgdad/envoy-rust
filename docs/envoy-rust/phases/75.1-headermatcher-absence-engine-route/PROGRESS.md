@@ -714,3 +714,126 @@ they were LEFT ALONE throughout, per memory
 | 5 | `envoy-accesslog/src/filter.rs` `should_log` (via `Arc<dyn HeaderMatch>`) | access-log `header_filter` | 9 |
 
 **Commit:** `phase 75.1 task 9: pin mode-scoped absence propagation through the ADR-0150 HeaderMatch trait object`
+
+---
+
+## Task 10 — fixture `0083`: the two configs
+
+**Files created:**
+`tests/fixtures/0083-headermatcher-absence-parity/{envoy.yaml,envoy-rust.yaml}`
+(137 lines each).
+
+One HTTP/1.1 HCM listener, `clusters: []`, `direct_response` only — so **no
+backend container spawns**. Backend-free-ness is decided by a literal substring
+scan for the `{{BACKEND_PORT}}` marker; `grep -c BACKEND_PORT` = **0** on both
+files. EIGHT matchers over SIXTEEN routes as ordered PAIRS on prefix `/pNN`: the
+first carries the matcher under test and answers `pNN=MATCH`, the second is an
+unguarded catch-all answering `pNN=NOMATCH`. **The response body IS the
+matcher's verdict, byte-exact.**
+
+The probe ids are NON-CONTIGUOUS on purpose — they are the ids of the
+`SPEC.md` §2.3 measured matrix, so every expectation reads straight off that
+table's UPSTREAM column with nothing re-derived.
+
+**Both files were generated from ONE shared body**, so the route table is
+byte-identical between the sides by construction rather than by inspection. The
+complete diff is exactly the three house per-side deltas and nothing else:
+
+```
+0a1,3
+> node:
+>   id: x
+>   cluster: y
+5c8
+<         socket_address: { address: 0.0.0.0, port_value: {{PORT}} }
+---
+>         socket_address: { address: 127.0.0.1, port_value: {{PORT}} }
+135,137d137
+< admin:
+<   address:
+<     socket_address: { address: 0.0.0.0, port_value: 0 }
+```
+
+`codec_type: HTTP1` is on BOTH sides and is **NOT** a per-side divergence
+(ADR-0158 correction C3). The unquoted `node: { cluster: y }` YAML-1.1 boolean
+trap does NOT apply — the `node:` block exists only on the envoy-rust side,
+exactly as in the proven `0007`.
+
+### Step 3 — the SUBJECT side parses and routes
+
+```bash
+cargo build -p envoy-bin        # the harness runs target/debug/envoy-bin
+./target/debug/envoy-bin -c /tmp/0083-rust-r1.yaml
+```
+
+Booted clean (`listener bound … 127.0.0.1:18083 … codec_type=HTTP1`). All eight
+absent-header probes, plus the `x-a: v` variants:
+
+```
+p01 absent -> p01=NOMATCH    p06 absent -> p06=NOMATCH
+p07 absent -> p07=MATCH      p08 absent -> p08=NOMATCH
+p09 absent -> p09=NOMATCH    p10 absent -> p10=NOMATCH
+p11 absent -> p11=NOMATCH    p12 absent -> p12=MATCH
+```
+
+`p07`=MATCH is the **P1 GUARD** holding and `p12`=MATCH is **D2** fixed — the
+two cells that carry the whole phase.
+
+### Step 4 — the UPSTREAM side parses
+
+```bash
+docker run --rm -v $D:/cfg envoyproxy/envoy:v1.33.0 --mode validate -c /cfg/0083-envoy-r1.yaml
+```
+
+```
+configuration '/cfg/0083-envoy-r1.yaml' OK
+```
+
+Written to a FRESH FILENAME in a FRESH DIRECTORY (this host's Docker bind mounts
+are STALE-CACHED — an in-place edit silently validates the PREVIOUS contents).
+The run also emits `Deprecated field: … 'HeaderMatcher.exact_match'` warnings;
+these are informational, upstream still honors the field, and the pre-existing
+`0007` fixture uses the same spelling.
+
+### The 22-cell CROSS-PROXY sweep — run BEFORE writing the expectations
+
+Both proxies were run simultaneously (upstream in Docker with **`-p` PORT
+MAPPING**, never `--network host`; envoy-rust as the freshly-rebuilt DEBUG
+binary) and every one of the 22 probe cells was driven at BOTH:
+
+```
+PROBE                                  UPSTREAM       ENVOY-RUST     VERDICT
+p01-absent-drops                       p01=NOMATCH    p01=NOMATCH    OK
+p01-value-matches-so-invert-drops      p01=NOMATCH    p01=NOMATCH    OK
+p01-value-differs-so-invert-keeps      p01=MATCH      p01=MATCH      OK
+p06-absent-drops                       p06=NOMATCH    p06=NOMATCH    OK
+p06-non-numeric-so-invert-keeps        p06=MATCH      p06=MATCH      OK
+p06-in-range-so-invert-drops           p06=NOMATCH    p06=NOMATCH    OK
+p07-absent-keeps-GUARD                 p07=MATCH      p07=MATCH      OK
+p07-present-drops                      p07=NOMATCH    p07=NOMATCH    OK
+p08-absent-drops                       p08=NOMATCH    p08=NOMATCH    OK
+p08-present-keeps                      p08=MATCH      p08=MATCH      OK
+p09-absent-drops                       p09=NOMATCH    p09=NOMATCH    OK
+p09-value-matches-so-invert-drops      p09=NOMATCH    p09=NOMATCH    OK
+p09-value-differs-so-invert-keeps      p09=MATCH      p09=MATCH      OK
+p10-absent-drops                       p10=NOMATCH    p10=NOMATCH    OK
+p10-value-matches                      p10=MATCH      p10=MATCH      OK
+p10-value-differs                      p10=NOMATCH    p10=NOMATCH    OK
+p11-absent-drops                       p11=NOMATCH    p11=NOMATCH    OK
+p11-present-keeps                      p11=MATCH      p11=MATCH      OK
+p11-empty-value-counts-as-present      p11=MATCH      p11=MATCH      OK
+p12-absent-keeps                       p12=MATCH      p12=MATCH      OK
+p12-present-drops                      p12=NOMATCH    p12=NOMATCH    OK
+p12-empty-value-counts-as-present      p12=NOMATCH    p12=NOMATCH    OK
+
+OVERALL: ALL 22 CELLS AGREE CROSS-PROXY
+```
+
+Every value also equals the body `PLAN.md` Task 11 predicts for that probe, so
+the expectations file is transcribed from a MEASUREMENT, not from a hope.
+
+Only this session's own `er-0083-up` container was removed. The parallel
+workstream's `quizzical_goldstine` (also `envoyproxy/envoy:v1.33.0`) was
+observed still running and **LEFT ALONE**.
+
+**Commit:** `phase 75.1 task 10: fixture 0083 configs — 8 HeaderMatchers over 16 direct_response routes, backend-free`

@@ -1,0 +1,137 @@
+node:
+  id: x
+  cluster: y
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address:
+        socket_address: { address: 127.0.0.1, port_value: {{PORT}} }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        # p01 — D1: exact_match + invert_match.
+                        - match:
+                            prefix: "/p01"
+                            headers:
+                              - name: "x-a"
+                                exact_match: "v"
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p01=MATCH" }
+                        - match: { prefix: "/p01" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p01=NOMATCH" }
+                        # p06 — D1 on the numeric parse path.
+                        - match:
+                            prefix: "/p06"
+                            headers:
+                              - name: "x-a"
+                                range_match: { start: 1, end: 10 }
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p06=MATCH" }
+                        - match: { prefix: "/p06" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p06=NOMATCH" }
+                        # p07 — P1, THE GUARD. absent MUST stay MATCH.
+                        - match:
+                            prefix: "/p07"
+                            headers:
+                              - name: "x-a"
+                                present_match: true
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p07=MATCH" }
+                        - match: { prefix: "/p07" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p07=NOMATCH" }
+                        # p08 — D2, inverted.
+                        - match:
+                            prefix: "/p08"
+                            headers:
+                              - name: "x-a"
+                                present_match: false
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p08=MATCH" }
+                        - match: { prefix: "/p08" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p08=NOMATCH" }
+                        # p09 — D1 through the StringMatcher delegation.
+                        - match:
+                            prefix: "/p09"
+                            headers:
+                              - name: "x-a"
+                                string_match: { exact: "v" }
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p09=MATCH" }
+                        - match: { prefix: "/p09" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p09=NOMATCH" }
+                        # p10 — parity control, plain exact_match.
+                        - match:
+                            prefix: "/p10"
+                            headers:
+                              - name: "x-a"
+                                exact_match: "v"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p10=MATCH" }
+                        - match: { prefix: "/p10" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p10=NOMATCH" }
+                        # p11 — parity control + the empty-value presence cell.
+                        - match:
+                            prefix: "/p11"
+                            headers:
+                              - name: "x-a"
+                                present_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p11=MATCH" }
+                        - match: { prefix: "/p11" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p11=NOMATCH" }
+                        # p12 — D2, NON-inverted. The worst cell: a plain,
+                        # single-line matcher silently matched everything
+                        # in-tree before phase 75.1.
+                        - match:
+                            prefix: "/p12"
+                            headers:
+                              - name: "x-a"
+                                present_match: false
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p12=MATCH" }
+                        - match: { prefix: "/p12" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "p12=NOMATCH" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
