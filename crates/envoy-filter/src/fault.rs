@@ -176,4 +176,59 @@ mod tests {
         let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
+
+    /// Phase 75.1 (ADR-0159): the MODE-SCOPED absence rule propagates into the
+    /// fault filter's header gate — call site 3 of 5. The gate AND-combines its
+    /// matchers, and a 100% abort fires iff the gate matches, so the gate's
+    /// verdict is directly observable as StopAndSend vs Continue.
+    #[test]
+    fn fault_header_gate_absence_rule_is_mode_scoped() {
+        use envoy_config::HeaderMatcherMode;
+
+        let gate = |mode: HeaderMatcherMode, invert: bool| {
+            vec![HeaderMatcher {
+                name: "x-a".to_string(),
+                mode,
+                invert_match: invert,
+            }]
+        };
+        let registry = Arc::new(StatsRegistry::new());
+        let aborts = |g: Vec<HeaderMatcher>, headers: Vec<(String, String)>| {
+            let mut f = FaultFilter::build_from_config(&cfg(100, g), &registry, "ingress_http")
+                .expect("fault config builds");
+            let mut r = req(headers);
+            matches!(f.decode_headers(&mut r), Decision::StopAndSend(_))
+        };
+        let present = vec![("x-a".to_string(), "zzz".to_string())];
+
+        // D1: value matcher + invert + ABSENT → gate no longer fires.
+        let g = gate(HeaderMatcherMode::ExactMatch("v".into()), true);
+        assert!(
+            aborts(g.clone(), present.clone()),
+            "value+invert, present non-matching → gate fires"
+        );
+        assert!(
+            !aborts(g, vec![]),
+            "value+invert, ABSENT → gate must NOT fire (D1 / CF-72-1 closed)"
+        );
+
+        // D2: plain `present_match: false` requires ABSENCE.
+        let g = gate(HeaderMatcherMode::PresentMatch(false), false);
+        assert!(
+            !aborts(g.clone(), present.clone()),
+            "present_match:false, PRESENT → gate must NOT fire (D2)"
+        );
+        assert!(aborts(g, vec![]), "present_match:false, ABSENT → gate fires");
+
+        // P1 THE GUARD.
+        let g = gate(HeaderMatcherMode::PresentMatch(true), true);
+        assert!(
+            aborts(g.clone(), vec![]),
+            "present_match:true+invert, ABSENT → gate STILL fires (P1 parity)"
+        );
+        assert!(
+            !aborts(g, present),
+            "present_match:true+invert, PRESENT → gate does not fire"
+        );
+    }
 }

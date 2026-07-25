@@ -566,3 +566,39 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; fi
 `rbac.rs` production code is NOT edited — the behavior comes from Task 2.
 
 **Commit:** `phase 75.1 task 6: pin mode-scoped absence propagation through the HTTP RBAC matcher tree`
+
+---
+
+## Task 7 — consumer propagation: the fault filter header gate
+
+Call site **3 of 5**: `crates/envoy-filter/src/fault.rs`, inside
+`fn header_gate_matches` — which is PRIVATE, so the test lives in-crate and
+observes the gate INDIRECTLY but unambiguously: the gate AND-combines its
+matchers and a 100%-percentage abort fires iff the gate matches, so the verdict
+is observable as `Decision::StopAndSend(_)` vs `Decision::Continue`.
+
+### RED — pre-75.1 engine
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 212 filtered out
+thread 'fault::tests::fault_header_gate_absence_rule_is_mode_scoped' panicked at crates/envoy-filter/src/fault.rs:210:9:
+value+invert, ABSENT → gate must NOT fire (D1 / CF-72-1 closed)
+```
+
+This is the most operationally pointed of the five REDs: before the fix, a fault
+gate of `exact_match` + `invert_match` **injected a 503 abort into requests that
+did not carry the header at all**, where upstream Envoy leaves them alone.
+
+### GREEN — fixed engine
+
+```bash
+cargo test -p envoy-filter --lib fault_header_gate_absence_rule_is_mode_scoped
+```
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s
+```
+
+`fault.rs` production code is NOT edited.
+
+**Commit:** `phase 75.1 task 7: pin mode-scoped absence propagation through the fault filter header gate`
