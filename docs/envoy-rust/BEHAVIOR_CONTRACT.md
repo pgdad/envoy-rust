@@ -1875,9 +1875,16 @@ artifact, NOT the differential fixture itself.
 through `/config_dump`. Runtime semantics are **`match = present && want`** where
 `present` is whether the metadata `filter:key` resolves to a stored value:
 `present_match: true` matches IFF the key is present (any value); **`present_match:
-false` NEVER matches** (even when the key is present). This is a MATERIAL
-DIVERGENCE from the existing `HeaderMatcherMode::PresentMatch` (`want ? present :
-true`) — the RBAC `ValueMatcher::PresentMatch` does NOT use that precedent.
+false` NEVER matches** (even when the key is present). This rule is CORRECT and
+unchanged. It is DISTINCT from — and NOT derived from — the
+`HeaderMatcherMode::PresentMatch` of the route/header engine, whose own MEASURED
+rule is **`(present == want)`** since phase 75.1 (ADR-0159; the parenthetical
+`want ? present : true` recorded here before 75.1 described the pre-75.1 in-tree
+behavior, which was divergence D2 and has been fixed). The two now **AGREE when
+the key/header is PRESENT** and still **DIFFER when it is ABSENT** —
+`ValueMatcher` → `false`, `HeaderMatcher` → `true`. They remain different fields
+on different messages: do NOT unify them, and do not "fix" the `ValueMatcher`
+rule to match. See §C for the `HeaderMatcher` rule in full.
 A present-but-empty header → the `header_to_metadata` producer writes nothing
 (ADR-0084) → key UNSET → `present=false` → `present_match: true` DENIES. Verdicts
 are byte-exact: present → `200` + `ok\n` (3 bytes); absent → `403` + `RBAC:
@@ -2354,27 +2361,64 @@ reusing the engine verbatim. Validation delegates to the phase-04.2
 `validate_header_matcher` (empty name → `EmptyHeaderName`; bad regex →
 `InvalidRegex`; bad range → `InvalidInt64Range`; SafeRegex compiled in place).
 
-**§C Invert + ABSENT (PV-4, MEASURED — inherited SHARED boundary; MODE-DEPENDENT).**
-The `invert_match: true` + ABSENT-header interaction is **mode-dependent**
-(re-MEASURED at the phase-72 §5 state-5 LIVE-PROBE across BOTH proxies — envoy-rust
-DEBUG `envoy-bin` vs. `envoyproxy/envoy:v1.33.0`; **ADR-0151**, correcting the
-blanket "absent+invert = divergence" framing that ADR-0149 recorded):
-- A **VALUE-based matcher** (`exact`/`prefix`/`suffix`/`safe_regex`/`range`/
-  `string_match`) + invert + absent **DIVERGES** — envoy-rust KEEPS, upstream
-  DROPS. Upstream treats a missing header as an unconditional value no-match that
-  `invert_match` does NOT resurrect.
-- A **`present_match`** + invert + absent is **PARITY** — envoy-rust AND upstream
-  BOTH KEEP (upstream's present-check is `false`, which `invert_match` flips → KEEP).
+**§C Invert + ABSENT — the MODE-SCOPED absence rule (MEASURED; PARITY since phase 75.1).**
+The absence behavior of the shared `HeaderMatcher` engine is **mode-dependent**,
+and since phase **75.1** (ADR-0159) the in-tree engine implements the measured
+upstream rule in full. MEASURED cross-proxy against `envoyproxy/envoy:v1.33.0` —
+first at the phase-72 §5 state-5 LIVE-PROBE (**ADR-0151**, correcting the blanket
+"absent+invert = divergence" framing ADR-0149 recorded), then re-measured over a
+13-probe × 5-variant matrix at the phase-75 state-2 PLAN-write (**ADR-0156**,
+**ADR-0158**). The rule:
 
-The in-tree shared engine (`matcher.rs:51`) applies `mode_result ^ invert_match`
-UNCONDITIONALLY, so absent (`mode_result = false`) → `false ^ true` = KEEP in BOTH
-modes — matching upstream for `present_match` (parity) but diverging for value
-matchers. Phase 72 reuses the engine verbatim (the opener 0078 uses a NON-inverted
-matcher) and does NOT fix it; the shared-engine fix is carry-forward **CF-72-1**,
-scoped to the **value-matcher** case — a future fixer MUST preserve the
-`present_match` KEEP (a naive uniform DROP would break that parity and introduce a
-NEW divergence). Pinned by `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`
-+ `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` (`matcher.rs`).
+```
+present := the named header is present (name matched case-insensitively;
+           an EMPTY VALUE still counts as PRESENT)
+
+if mode is present_match(want):   result = (present == want) XOR invert_match
+else if not present:              result = false      # invert_match NOT applied
+else:                             result = mode_matches(value) XOR invert_match
+```
+
+- A **VALUE-based matcher** (`exact`/`prefix`/`suffix`/`safe_regex`/`range`/
+  `string_match`) + invert + absent **DROPS on both proxies**. Upstream treats a
+  missing header as an unconditional value no-match that `invert_match` does NOT
+  resurrect. *Before 75.1 envoy-rust KEPT it* — that was carry-forward
+  **CF-72-1**, now **CLOSED**.
+- **`present_match(want)` is the ONLY mode evaluated with the header ABSENT**, and
+  therefore the only one that carries an absent header into `invert_match`. Its
+  rule is `(present == want)`. In particular `present_match: false` means **the
+  header must be ABSENT**. *Before 75.1 envoy-rust modelled it as
+  unconditionally true*, which diverged on a plain, NON-inverted, single-line
+  matcher — the worst cell of the two, and unrecorded in this contract before
+  75.1.
+- **`present_match: true` + invert + absent is PARITY** — envoy-rust AND upstream
+  BOTH KEEP (upstream's present-check is `false`, which `invert_match` flips →
+  KEEP).
+
+**THE GUARD — this is mode-scoped and must stay that way.** A naive uniform
+"absent ⇒ DROP" simplification of the shared engine closes the value-matcher case
+while BREAKING the `present_match` parity above, minting a NEW divergence in its
+place. The phase-75.1 fixer PRESERVED that KEEP by ordering the engine's match
+arms so the absent short-circuit sits AFTER the `present_match` arm and BEFORE
+every value arm; **any future refactor MUST continue to.** This is not
+hypothetical — the exact mutation was applied in a scratch worktree at both the
+75.1 PLAN-write and its implementation, and turns three in-process guards RED
+while leaving every value-mode assertion green.
+
+The engine is `HeaderMatcher::matches` (the XOR is at `matcher.rs:52`), shared
+verbatim by five subsystems: route matching (H1 **and** H2), HTTP RBAC, the fault
+header gate, JWT-authn rule matching, and the access-log `header_filter` (the
+last via the ADR-0150 `Arc<dyn HeaderMatch>` trait object). Pinned in-process by
+`pv4_value_matcher_absent_plus_invert_dropped_is_parity_with_upstream`,
+`pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`,
+`invert_match_inverts_present_match_result` and
+`absence_semantics_matrix_matches_measured_upstream` (`matcher.rs`), plus one
+propagation test per call site. Pinned CROSS-PROXY by fixture
+**`0083-headermatcher-absence-parity`** (route path, 22 probes over 8 matchers —
+the first differential witness of `invert_match` and of
+`HeaderMatcher.present_match` in the corpus), whose `p07-absent-keeps-GUARD`
+probe is the load-bearing one. The ACCESS-LOG-path cross-proxy witness is
+sub-phase **75.2** (fixtures `0084` + `0085`).
 
 **§D Name-only + treat_missing_header_as_empty (PV-5, MEASURED — inherited
 boundary).** Upstream accepts `header: { name }` (presence match) and

@@ -979,3 +979,145 @@ tracked files in tests/fixtures/0083-headermatcher-absence-parity/: 4
 ```
 
 **Commit:** `phase 75.1 task 12: fixture 0083 README + differential entrypoint — the route-path absence-parity witness is green`
+
+---
+
+## Task 13 — `BEHAVIOR_CONTRACT.md` §C rewrite, correction C2, the citation fix, and the `0078` README
+
+**Files modified:** `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (§C and the C2 site)
+and `tests/fixtures/0078-accesslog-header-filter/README.md`.
+**`docs/envoy-rust/DECISIONS.md` is NOT modified** — see step 4.
+
+### Step 1 — §C rewritten
+
+§C previously recorded D1 as an ACCEPTED, CARRIED divergence ("Phase 72 reuses
+the engine verbatim … and does NOT fix it; the shared-engine fix is
+carry-forward **CF-72-1**"), and **omitted D2 entirely** — there was no mention
+anywhere in the contract of the non-inverted `present_match: false` divergence.
+
+The rewrite: retitles §C to the parity rule, states the §2.1 rule in a fenced
+block including the EMPTY-VALUE-counts-as-PRESENT clause, adds D2 inline,
+records **CF-72-1 CLOSED**, names fixture `0083` as the cross-proxy pin and the
+renamed in-process pins, lists all five sharing subsystems, fixes the stale
+`matcher.rs:51` → **`:52`** citation, and points forward to 75.2 for the
+access-log witness.
+
+**KEPT, as `PLAN.md` requires** — re-tensed, not removed: the mode-dependence
+warning and the "a fixer MUST preserve the `present_match` KEEP" instruction.
+Both remain true and remain the guard, now phrased as *the phase-75.1 fixer
+preserved it; any future refactor MUST continue to*, with the mutation evidence
+cited.
+
+### Step 2 — correction C2 at the `ValueMatcher` block
+
+The contract described the RBAC `ValueMatcher` rule as "a MATERIAL DIVERGENCE
+from the existing `HeaderMatcherMode::PresentMatch` (`want ? present : true`)".
+After this phase that parenthetical formula is simply wrong.
+
+**The `ValueMatcher` rule itself — "`present_match: false` NEVER matches" — is
+CORRECT and was NOT touched** (Trap A). Only the comparison was restated: the
+`HeaderMatcher` rule is `(present == want)` since 75.1; the two now AGREE when
+the key/header is PRESENT and still DIFFER when it is ABSENT (`ValueMatcher` →
+`false`, `HeaderMatcher` → `true`); they are different fields on different
+messages and must not be unified.
+
+### Step 3 — the `0078` README
+
+Its "Deferred" bullet documented the invert+absent divergence as live. Rewritten
+to record **CF-72-1 CLOSED**, describe the new short-circuit, note that
+`present_match` still carries an absent header into the inversion and MUST, and
+point at `0083` (route) and 75.2 (access log).
+
+**`0078`'s configs, `expectations.yaml` and probes were NOT touched** — only its
+README:
+
+```
+ M tests/fixtures/0078-accesslog-header-filter/README.md
+```
+
+and the fixture is still GREEN:
+
+```
+cargo test -p differential --test access_log_header_filter
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+```
+
+### Step 4 — ADR-0159 verified intact; `DECISIONS.md` UNTOUCHED
+
+ADR-0159 landed at the state-2 PLAN-write (house precedent ADR-0153/0155/0158:
+the §6.2 reconciliation ADR ships WITH the plan). State-3 must not re-create it
+and must not append an ADR-0160 for work the plan already covers.
+
+```
+grep -c '^## ADR-0159' docs/envoy-rust/DECISIONS.md   → 1
+grep -c '^## ADR-0160' docs/envoy-rust/DECISIONS.md   → 0
+git status --porcelain docs/envoy-rust/DECISIONS.md   → (empty)
+git log --oneline -1 -- docs/envoy-rust/DECISIONS.md
+  78c37a3 phase 75.1 state-2 PLAN-write: … [ADR-0159]
+```
+
+The last commit touching `DECISIONS.md` is the state-2 PLAN-write, not any
+commit from this session. Ledger head **ADR-0159**; next available **ADR-0160**.
+**No genuinely new decision arose during this implementation**, so no ADR was
+appended: every choice was already recorded (the engine shape and its two
+rejected alternatives, the pre-validated mutation, the amend-list of three, the
+size, the `is_ok_and` change, the empty-value wire-shape caveat, the §7.4
+disposition, and the two stale figures).
+
+### Step 5 — citation scope verified BY FILE, never by count
+
+Exactly TWO sites are corrected by this sub-phase, and both are now clean:
+
+```
+matcher.rs:51 hits in crates/                          → 0
+matcher.rs:51 hits in BEHAVIOR_CONTRACT.md             → 0
+```
+
+Every remaining hit is in an APPEND-ONLY artifact and was NOT touched:
+
+```
+      8 docs/envoy-rust/DECISIONS.md
+      6 docs/envoy-rust/STATE_HISTORY.md
+      6 docs/envoy-rust/phases/75.1-.../PLAN.md
+      4 docs/envoy-rust/phases/75.1-.../PROGRESS.md
+      3 docs/envoy-rust/STATE.md
+      3 docs/envoy-rust/phases/75-headermatcher-absence-parity/SPEC.md
+      3 docs/envoy-rust/phases/72-accesslog-header-filter/PLAN.md
+      2 docs/envoy-rust/phases/75.1-.../SPEC.md
+      2 docs/envoy-rust/phases/74-accesslog-metadata-filter/SPEC.md
+      2 docs/envoy-rust/phases/72-accesslog-header-filter/SPEC.md
+      2 docs/envoy-rust/phases/72-accesslog-header-filter/REVIEW.md
+      1 docs/envoy-rust/ROADMAP.md
+      1 docs/envoy-rust/phases/74-accesslog-metadata-filter/PLAN.md
+      1 docs/envoy-rust/phases/72-accesslog-header-filter/PROGRESS.md
+```
+
+**Adjudicated by FILE and by LINE, never by total count.** The count was 26 when
+the SPEC was written, 32 at the PLAN-write, and is higher again now because this
+session's own `PROGRESS.md` legitimately quotes the defect it fixes. **A rising
+count is expected and is evidence of nothing.** The `DECISIONS.md` LINE NUMBERS
+the SPEC lists were already stale when written and have drifted twice since, so
+this check was done by file, exactly as ADR-0159 correction 2 instructs.
+
+### Step 6 — the §C rewrite stayed inside its boundary
+
+```
+2364:**§C Invert + ABSENT — the MODE-SCOPED absence rule (MEASURED; PARITY since phase 75.1).**
+2423:**§D Name-only + treat_missing_header_as_empty (PV-5, MEASURED — inherited
+```
+
+§D still exists, still immediately follows §C, and its body is byte-unchanged.
+The old framing is gone (`grep -c 'the shared-engine fix is carry-forward
+**CF-72-1**'` → **0**). The diff touches exactly the two intended regions and
+nothing else:
+
+```
+@@ -1878,3 +1878,10 @@   (the C2 correction)
+@@ -2357,5 +2364,18 @@   (§C)
+@@ -2363,15 +2383,39 @@  (§C)
+1 file changed, 67 insertions(+), 23 deletions(-)
+```
+
+Fixture `0083` re-confirmed green after the doc edits: `1 passed; 0 failed`.
+
+**Commit:** `phase 75.1 task 13: BEHAVIOR_CONTRACT §C rewritten to the measured parity rule (CF-72-1 CLOSED); C2 correction; 0078 README`

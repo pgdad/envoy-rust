@@ -66,11 +66,18 @@ line AND on the absence of any line for the dropped probe.
 
 ## Deferred (NOT in this differential — pinned in-process / documented)
 
-- **Absent-drop** and **`invert_match` + absent** parity: the in-tree shared
-  engine keeps absent+invert (`mode_result ^ invert_match`), diverging from
-  upstream (which drops it on BOTH the route and access-log paths) — carry-forward
-  **CF-72-1**. The opener uses a NON-inverted matcher; the divergence is pinned
-  in-process + documented in `BEHAVIOR_CONTRACT.md` §C, not exercised here.
+- **Absent-drop** and **`invert_match` + absent** parity: carry-forward
+  **CF-72-1** is **CLOSED** by phase **75.1** (ADR-0159). The shared engine no
+  longer applies `mode_result ^ invert_match` uniformly — every VALUE mode now
+  short-circuits to `false` on an absent header BEFORE the XOR, matching upstream
+  on BOTH the route and access-log paths, while `present_match` alone still
+  carries an absent header into the inversion (that cell was always PARITY and
+  MUST stay so). This opener still uses a NON-inverted matcher and does not
+  exercise it. The cross-proxy witness is fixture
+  **`0083-headermatcher-absence-parity`** (route path); the ACCESS-LOG-path
+  witness lands in sub-phase **75.2** (fixtures `0084` + `0085`). The rule is
+  documented in `BEHAVIOR_CONTRACT.md` §C and pinned in-process in
+  `crates/envoy-config/src/matcher.rs`.
 - **Name-only `{name}`** and **`treat_missing_header_as_empty`**: upstream accepts
   both; the shared `HeaderMatcher` deserializer rejects both fail-loud (ADR-0049)
   — carry-forward **CF-72-2**. Pinned in-process, documented §D, not in this
