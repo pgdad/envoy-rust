@@ -647,4 +647,94 @@ mod tests {
         assert_eq!(allowed_value(&reg), 2);
         assert_eq!(denied_value(&reg), 0);
     }
+
+    /// Phase 75.1 (ADR-0159): the MODE-SCOPED absence rule propagates into
+    /// JWT-authn requirement-rule matching — call site 4 of 5. Observable
+    /// without minting a token: a rule whose header matcher does NOT match is
+    /// skipped, so a TOKENLESS request is allowed; a rule that DOES match
+    /// demands a token, so a tokenless request is denied.
+    ///
+    /// This mirrors the observable of the neighbouring
+    /// `header_matcher_gates_rule_match`, but with a FRESH registry per
+    /// invocation so the verdict is a clean `denied == 1` rather than a
+    /// cumulative count.
+    #[test]
+    fn jwt_rule_header_matcher_absence_rule_is_mode_scoped() {
+        use envoy_config::{HeaderMatcher, HeaderMatcherMode};
+
+        let (_kp, jwks) = keypair();
+
+        // Returns true iff the RULE MATCHED (a tokenless request got denied).
+        let rule_matched = |mode: HeaderMatcherMode, invert: bool, headers: Vec<(String, String)>| {
+            let reg = registry();
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "prov".to_string(),
+                envoy_config::JwtProvider {
+                    issuer: ISS.to_string(),
+                    audiences: vec![],
+                    local_jwks: envoy_config::DataSource {
+                        filename: None,
+                        inline_string: Some(jwks.clone()),
+                    },
+                    forward: false,
+                },
+            );
+            let cfg = envoy_config::JwtAuthnConfig {
+                providers,
+                rules: vec![envoy_config::RequirementRule {
+                    r#match: envoy_config::RouteMatch {
+                        prefix: Some("/".to_string()),
+                        path: None,
+                        headers: vec![HeaderMatcher {
+                            name: "x-a".to_string(),
+                            mode,
+                            invert_match: invert,
+                        }],
+                    },
+                    requires: envoy_config::JwtRequirement {
+                        provider_name: "prov".to_string(),
+                    },
+                }],
+            };
+            let mut f = JwtAuthnFilter::build_from_config(&cfg, &reg, "ingress_http").unwrap();
+            let mut hs = vec![host()];
+            hs.extend(headers);
+            let mut r = req(hs, "/api");
+            let _ = f.decode_headers(&mut r);
+            denied_value(&reg) == 1
+        };
+
+        let present = vec![("x-a".to_string(), "zzz".to_string())];
+
+        // D1: value matcher + invert + ABSENT → the rule no longer matches.
+        assert!(
+            rule_matched(HeaderMatcherMode::ExactMatch("v".into()), true, present.clone()),
+            "value+invert, present non-matching → rule matches → tokenless denied"
+        );
+        assert!(
+            !rule_matched(HeaderMatcherMode::ExactMatch("v".into()), true, vec![]),
+            "value+invert, ABSENT → rule must NOT match (D1 / CF-72-1 closed)"
+        );
+
+        // D2: plain `present_match: false` requires ABSENCE.
+        assert!(
+            !rule_matched(HeaderMatcherMode::PresentMatch(false), false, present.clone()),
+            "present_match:false, PRESENT → rule must NOT match (D2)"
+        );
+        assert!(
+            rule_matched(HeaderMatcherMode::PresentMatch(false), false, vec![]),
+            "present_match:false, ABSENT → rule matches"
+        );
+
+        // P1 THE GUARD.
+        assert!(
+            rule_matched(HeaderMatcherMode::PresentMatch(true), true, vec![]),
+            "present_match:true+invert, ABSENT → rule STILL matches (P1 parity)"
+        );
+        assert!(
+            !rule_matched(HeaderMatcherMode::PresentMatch(true), true, present),
+            "present_match:true+invert, PRESENT → rule does not match"
+        );
+    }
 }

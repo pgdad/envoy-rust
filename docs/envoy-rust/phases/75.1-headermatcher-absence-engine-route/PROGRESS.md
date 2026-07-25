@@ -602,3 +602,46 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; fi
 `fault.rs` production code is NOT edited.
 
 **Commit:** `phase 75.1 task 7: pin mode-scoped absence propagation through the fault filter header gate`
+
+---
+
+## Task 8 — consumer propagation: JWT-authn rule matching
+
+Call site **4 of 5**: `crates/envoy-filter/src/jwt_authn.rs`, inside
+`fn route_match_matches`. The observable is the one the neighbouring
+`header_matcher_gates_rule_match` already uses, so no new observable was
+invented: when a rule's header matcher does NOT match, the request takes the
+"no rule matched ⇒ allow without JWT check" path and a TOKENLESS request is
+`Continue`d; when the rule DOES match, a tokenless request is DENIED. So
+`denied == 1` ⟺ the rule matched — **no token needs to be minted to read the
+matcher's verdict.**
+
+**Helper check (the plan's implementer note).** All helpers the plan assumed
+exist: `keypair()` (imported from `envoy_jwt::test_support`, NOT defined
+locally), `registry()`, `req(headers, path)`, `host()`, `denied_value(&reg)` and
+`ISS`. The one deliberate deviation from the precedent is a **fresh `registry()`
+per invocation**, so the verdict is a clean `denied_value == 1` rather than the
+precedent's cumulative running count — which is what lets a single closure
+answer six independent questions.
+
+### RED — pre-75.1 engine
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out
+thread 'jwt_authn::tests::jwt_rule_header_matcher_absence_rule_is_mode_scoped' panicked at crates/envoy-filter/src/jwt_authn.rs:715:9:
+value+invert, ABSENT → rule must NOT match (D1 / CF-72-1 closed)
+```
+
+### GREEN — fixed engine
+
+```bash
+cargo test -p envoy-filter --lib jwt_rule_header_matcher_absence_rule_is_mode_scoped
+```
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.09s
+```
+
+`jwt_authn.rs` production code is NOT edited.
+
+**Commit:** `phase 75.1 task 8: pin mode-scoped absence propagation through JWT-authn rule matching`
