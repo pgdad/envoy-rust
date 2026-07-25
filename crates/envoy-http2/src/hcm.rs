@@ -6729,4 +6729,128 @@ static_resources:
             resp.headers()
         );
     }
+
+    /// Phase 75.1 (ADR-0159): H2 has no independent route walker — it calls
+    /// `envoy_http1::hcm::resolve_route` (hcm.rs:475). This pins that the
+    /// MODE-SCOPED absence rule reaches the H2 path through that delegation,
+    /// so the route-path fix is witnessed on BOTH protocols even though
+    /// differential fixture 0083 is H1-only.
+    #[tokio::test]
+    async fn h2_resolve_route_inherits_mode_scoped_absence_rule() {
+        use envoy_config::{HeaderMatcher, HeaderMatcherMode};
+
+        // Two routes on the same prefix: the first carries the matcher under
+        // test and is named "gated"; the second is an unguarded catch-all.
+        let build = |mode: HeaderMatcherMode, invert: bool| {
+            let gated = envoy_config::Route {
+                name: "gated".to_string(),
+                r#match: envoy_config::RouteMatch {
+                    prefix: Some("/".to_string()),
+                    path: None,
+                    headers: vec![HeaderMatcher {
+                        name: "x-a".to_string(),
+                        mode,
+                        invert_match: invert,
+                    }],
+                },
+                action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
+                    status: 200,
+                    body: envoy_config::DataSource {
+                        filename: None,
+                        inline_string: Some("gated".to_string()),
+                    },
+                }),
+                typed_per_filter_config: Default::default(),
+            };
+            let catch_all = envoy_config::Route {
+                name: "catch-all".to_string(),
+                r#match: envoy_config::RouteMatch {
+                    prefix: Some("/".to_string()),
+                    path: None,
+                    headers: vec![],
+                },
+                action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
+                    status: 200,
+                    body: envoy_config::DataSource {
+                        filename: None,
+                        inline_string: Some("catch-all".to_string()),
+                    },
+                }),
+                typed_per_filter_config: Default::default(),
+            };
+            envoy_config::RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![envoy_config::VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![gated, catch_all],
+                }],
+            }
+        };
+
+        // Resolve through the REAL H1 seam H2 delegates to, and report which
+        // route name won. The `envoy_http1::Request` literal mirrors the
+        // sibling `h2_resolve_route_reachable_and_returns_cors_route`.
+        async fn resolved(
+            route_config: envoy_config::RouteConfiguration,
+            headers: Vec<(String, String)>,
+        ) -> String {
+            let cfg = envoy_config::HttpConnectionManagerConfig {
+                stat_prefix: "ingress_http_h2".to_string(),
+                codec_type: envoy_config::CodecType::HTTP2,
+                http2_protocol_options: None,
+                access_log: vec![],
+                route_config: Some(route_config),
+                rds: None,
+                http_filters: vec![envoy_config::HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                        envoy_config::RouterConfig {},
+                    ),
+                }],
+            };
+            let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+            let registry = Arc::new(envoy_stats::StatsRegistry::new());
+            let built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCM config");
+            let mut hs = vec![("host".to_string(), "any.test".to_string())];
+            hs.extend(headers);
+            let req = envoy_http1::Request {
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+                version: envoy_http1::HttpVersion::Http11,
+                headers: hs,
+                bytes_consumed: 0,
+                body: None,
+            };
+            envoy_http1::hcm::resolve_route(&built, &req)
+                .map(|r| r.route().name.clone())
+                .expect("a route always resolves — the catch-all has no matchers")
+        }
+
+        let present = vec![("x-a".to_string(), "zzz".to_string())];
+
+        // D1: value matcher + invert + ABSENT → gated route must NOT win.
+        let rc = build(HeaderMatcherMode::ExactMatch("v".into()), true);
+        assert_eq!(resolved(rc, vec![]).await, "catch-all", "D1 on the H2 path");
+
+        // D2: plain `present_match: false` + header PRESENT → must NOT win.
+        let rc = build(HeaderMatcherMode::PresentMatch(false), false);
+        assert_eq!(
+            resolved(rc, present.clone()).await,
+            "catch-all",
+            "D2 on the H2 path"
+        );
+
+        // P1 THE GUARD: `present_match: true` + invert + ABSENT → still wins.
+        let rc = build(HeaderMatcherMode::PresentMatch(true), true);
+        assert_eq!(
+            resolved(rc, vec![]).await,
+            "gated",
+            "P1 parity preserved on the H2 path"
+        );
+    }
 }

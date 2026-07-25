@@ -440,3 +440,95 @@ assert the old rule as current.** No edit was made to "clean these up" —
 deleting them would destroy the record of what was fixed.
 
 **Commit:** `phase 75.1 task 4: correct eight doc comments stating the pre-75.1 uniform-XOR rule; fix the in-source matcher.rs:51 citation`
+
+---
+
+## Tasks 5-9 — consumer propagation: the RED methodology used for all five
+
+`HeaderMatcher::matches` is evaluated at **exactly five production call sites**
+across five subsystems in three crates. Tasks 5-9 add ONE in-process test per
+call site proving the mode-scoped rule actually reaches it. **No call-site
+production code is edited in any of these tasks** — the behavior comes entirely
+from Task 2's engine fix; these tasks are coverage.
+
+**How RED was honored.** `PLAN.md` Task 5 step 3 says: run the new tests against
+the PRE-Task-2 engine, or — if Tasks 1-2 are already committed, which is the
+normal ordering and was the case here — verify RED in a scratch worktree. A
+scratch worktree `/tmp/wt-75-1-consumers` was created at the Task-4 commit and
+the Task-2 engine fix was **REVERSED in it** (the pre-75.1 uniform-XOR engine
+restored verbatim), leaving every consumer test at its post-fix form. Each new
+test's file was then copied in and run. This is the honest "would this test have
+failed before the fix?" check, per crate, and it is run in a worktree so nothing
+can mutate the main tree mid-run (memory
+`mutation-checks-collide-with-parallel-subagents`).
+
+> **A `0 passed` FALSE GREEN was caught and corrected mid-task.** The first RED
+> attempt returned `test result: ok. 0 passed; 0 failed; 184 filtered out` with
+> **exit code 0** — which looks like a pass and is not one: the worktree was at
+> the Task-4 commit, so the not-yet-committed Task-5 test did not exist in it and
+> **the test never ran** (memory `cargo-test-p-name-false-green-filtered-out`:
+> assert on the passed COUNT, never on the exit code). The test files were copied
+> into the worktree and the presence of the test + the pre-fix engine were both
+> `grep`-confirmed before re-running. Every RED below is from a run that
+> demonstrably executed the test.
+
+---
+
+## Task 5 — consumer propagation: the ROUTE walker (H1 AND H2)
+
+Call site **1 of 5**: `crates/envoy-http1/src/hcm.rs` `route_matches`, which
+serves BOTH protocols — H2 has no independent walker and delegates via
+`envoy_http1::hcm::resolve_route`. This is the call site fixture `0083`
+witnesses cross-proxy.
+
+**Interface correction, anticipated by the plan.** `PLAN.md` Task 5 step 2 wrote
+the H2 test using `envoy_http1::codec::Request::test("GET", "/x", &[])` and its
+implementer note said to mirror the sibling
+`h2_resolve_route_reachable_and_returns_cors_route` if that constructor differs
+in the live tree. **It does** — no such constructor exists; the sibling builds an
+`envoy_http1::Request` STRUCT LITERAL (`method` / `path` / `version` /
+`headers` / `bytes_consumed` / `body`). The literal form was used, exactly as the
+note directs. **No new public constructor was added to `envoy-http1`.** The
+resolved-route accessor is likewise the method form `r.route().name`, as the
+sibling uses.
+
+### RED — on the pre-75.1 engine (scratch worktree)
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 184 filtered out
+thread 'hcm::tests::route_header_matcher_absence_rule_is_mode_scoped' panicked at crates/envoy-http1/src/hcm.rs:10024:9:
+value+invert, ABSENT → route must NOT match (D1 / CF-72-1 closed)
+```
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 110 filtered out
+thread 'hcm::tests::h2_resolve_route_inherits_mode_scoped_absence_rule' panicked at crates/envoy-http2/src/hcm.rs:6838:9:
+assertion `left == right` failed: D1 on the H2 path
+  left: "gated"
+ right: "catch-all"
+```
+
+The H2 failure is the most legible statement of the bug in the whole phase: with
+the header ABSENT and a `exact_match` + `invert_match` route, the PRE-fix engine
+let the **gated** route win — i.e. envoy-rust routed a request to a route whose
+header condition upstream Envoy considers unmet.
+
+### GREEN — on the fixed engine (main tree)
+
+```bash
+cargo test -p envoy-http1 --lib route_header_matcher_absence_rule_is_mode_scoped
+cargo test -p envoy-http2 --lib h2_resolve_route_inherits_mode_scoped_absence_rule
+```
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 184 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 0.00s
+```
+
+`1 passed` on each — asserted on the COUNT, not the exit code.
+
+Each test covers all three cells: **D1** (value matcher + invert + absent must
+not match), **D2** (plain `present_match: false` requires absence), and **P1 THE
+GUARD** (`present_match: true` + invert + absent STILL matches).
+
+**Commit:** `phase 75.1 task 5: pin mode-scoped absence propagation through the route walker (H1 + H2 via resolve_route)`

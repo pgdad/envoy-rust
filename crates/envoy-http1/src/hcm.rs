@@ -9982,4 +9982,70 @@ static_resources:
             "an in-flight reader's owned snapshot is unaffected by a later store (§5.4)"
         );
     }
+
+    /// Phase 75.1 (ADR-0159): the MODE-SCOPED absence rule propagates to the
+    /// ROUTE walker — call site 1 of 5, and the one this sub-phase's
+    /// differential fixture 0083 witnesses cross-proxy. `route_matches`
+    /// AND-combines the route's HeaderMatchers, so a matcher that must now
+    /// return `false` on an absent header must make the whole route not match.
+    #[test]
+    fn route_header_matcher_absence_rule_is_mode_scoped() {
+        use envoy_config::{HeaderMatcher, HeaderMatcherMode};
+
+        let route = |mode: HeaderMatcherMode, invert: bool| Route {
+            name: "r".to_string(),
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![HeaderMatcher {
+                    name: "x-a".to_string(),
+                    mode,
+                    invert_match: invert,
+                }],
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("hi".to_string()),
+                },
+            }),
+            typed_per_filter_config: Default::default(),
+        };
+        let present = [("x-a".to_string(), "zzz".to_string())];
+        let absent: [(String, String); 0] = [];
+
+        // D1: a VALUE matcher + invert + ABSENT must NOT match the route.
+        let r = route(HeaderMatcherMode::ExactMatch("v".into()), true);
+        assert!(
+            route_matches(&r, "/x", &present),
+            "value+invert, present non-matching value → route matches"
+        );
+        assert!(
+            !route_matches(&r, "/x", &absent),
+            "value+invert, ABSENT → route must NOT match (D1 / CF-72-1 closed)"
+        );
+
+        // D2: a plain, NON-inverted `present_match: false` requires ABSENCE.
+        let r = route(HeaderMatcherMode::PresentMatch(false), false);
+        assert!(
+            !route_matches(&r, "/x", &present),
+            "present_match:false with the header PRESENT → route must NOT match (D2)"
+        );
+        assert!(
+            route_matches(&r, "/x", &absent),
+            "present_match:false with the header ABSENT → route matches"
+        );
+
+        // P1 THE GUARD: `present_match: true` + invert + ABSENT still matches.
+        let r = route(HeaderMatcherMode::PresentMatch(true), true);
+        assert!(
+            route_matches(&r, "/x", &absent),
+            "present_match:true+invert, ABSENT → route STILL matches (P1 parity)"
+        );
+        assert!(
+            !route_matches(&r, "/x", &present),
+            "present_match:true+invert, PRESENT → route does not match"
+        );
+    }
 }
