@@ -1386,4 +1386,45 @@ mod tests {
             Err(FilterError::InvalidConfig { .. })
         ));
     }
+
+    /// Phase 75.1 (ADR-0159): the MODE-SCOPED absence rule propagates into the
+    /// RBAC matcher tree — call site 2 of 5. `Permission`/`Principal` header
+    /// conditions delegate straight to `HeaderMatcher::matches`, so an absent
+    /// header must now DROP for value modes and `present_match: false` must
+    /// require absence.
+    #[test]
+    fn rbac_header_condition_absence_rule_is_mode_scoped() {
+        use envoy_config::{HeaderMatcher, HeaderMatcherMode};
+
+        let cond = |mode: HeaderMatcherMode, invert: bool| {
+            RuntimeMatcher::Header(HeaderMatcher {
+                name: "x-a".to_string(),
+                mode,
+                invert_match: invert,
+            })
+        };
+        let present = req_with(vec![("x-a", "zzz")]);
+        let absent = req_with(vec![("x-other", "zzz")]);
+
+        // D1: value matcher + invert + ABSENT → no longer matches.
+        let c = cond(HeaderMatcherMode::ExactMatch("v".into()), true);
+        assert!(eval(&c, &present), "value+invert, present non-matching");
+        assert!(
+            !eval(&c, &absent),
+            "value+invert, ABSENT → must NOT match (D1 / CF-72-1 closed)"
+        );
+
+        // D2: plain `present_match: false` requires ABSENCE.
+        let c = cond(HeaderMatcherMode::PresentMatch(false), false);
+        assert!(!eval(&c, &present), "present_match:false, PRESENT (D2)");
+        assert!(eval(&c, &absent), "present_match:false, ABSENT");
+
+        // P1 THE GUARD.
+        let c = cond(HeaderMatcherMode::PresentMatch(true), true);
+        assert!(
+            eval(&c, &absent),
+            "present_match:true+invert, ABSENT → still matches (P1 parity)"
+        );
+        assert!(!eval(&c, &present), "present_match:true+invert, PRESENT");
+    }
 }

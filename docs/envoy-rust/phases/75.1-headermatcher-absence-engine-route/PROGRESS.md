@@ -532,3 +532,37 @@ not match), **D2** (plain `present_match: false` requires absence), and **P1 THE
 GUARD** (`present_match: true` + invert + absent STILL matches).
 
 **Commit:** `phase 75.1 task 5: pin mode-scoped absence propagation through the route walker (H1 + H2 via resolve_route)`
+
+---
+
+## Task 6 — consumer propagation: HTTP RBAC
+
+Call site **2 of 5**: `crates/envoy-filter/src/rbac.rs`, inside
+`pub(crate) fn eval`. The test lives IN-CRATE because `RuntimeMatcher` and
+`eval` are both `pub(crate)` — they are not reachable from an integration test.
+
+> The shared `crate::types::header_matcher_exact` helper was deliberately NOT
+> used: it builds the `StringMatch` mode, not `ExactMatch`, and this test needs
+> to name the mode explicitly.
+
+### RED — pre-75.1 engine
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 212 filtered out
+thread 'rbac::tests::rbac_header_condition_absence_rule_is_mode_scoped' panicked at crates/envoy-filter/src/rbac.rs:1412:9:
+value+invert, ABSENT → must NOT match (D1 / CF-72-1 closed)
+```
+
+### GREEN — fixed engine
+
+```bash
+cargo test -p envoy-filter --lib rbac_header_condition_absence_rule_is_mode_scoped
+```
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s
+```
+
+`rbac.rs` production code is NOT edited — the behavior comes from Task 2.
+
+**Commit:** `phase 75.1 task 6: pin mode-scoped absence propagation through the HTTP RBAC matcher tree`
