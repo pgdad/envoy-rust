@@ -1178,3 +1178,350 @@ and `#![forbid(unsafe_code)]` still holds at every crate root (the
 > verification gate, which is state-4's job and a SEPARATE session (§5.1,
 > ADR-0127). `cargo test --workspace`, `cargo deny check`, the full differential
 > suite and the conformance suites have **NOT** been run by this session.
+
+---
+
+# §5 STATE-4 VERIFICATION — the §7.5 phase-done gate
+
+> **What this section is.** The §5 **state-4 verification** for sub-phase 75.1,
+> run in a SEPARATE session from the state-3 implementation per §5.1 / ADR-0127
+> (the context that wrote the code must not grade it). It runs the §7.5
+> phase-done gate and quotes every command output verbatim. It did **NOT**
+> re-implement, re-plan, edit `DECISIONS.md`, write `REVIEW.md`, or start 75.2.
+>
+> **Session start state (verified on disk, not inherited).** `git fetch origin
+> --prune` → `HEAD == origin/main == ee865747f1e3fd891e53ec2aa8f98a16bb74b7eb`;
+> `git status --porcelain` EMPTY; branch `main`; the phase directory holds
+> exactly `SPEC.md` + `PLAN.md` + `PROGRESS.md` and **no `REVIEW.md`** — state 4
+> exactly. No sibling session had advanced past state-3.
+
+## STEP 0.5 — CI re-confirmed on the FULL 40-char SHA
+
+```
+$ gh run list --limit 5 --json databaseId,headSha,status,conclusion
+{"conclusion":"success","databaseId":30173334248,
+ "headSha":"ee865747f1e3fd891e53ec2aa8f98a16bb74b7eb","status":"completed"}
+
+$ gh run view 30173334248 --json jobs
+{"conclusion":"success","name":"fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + ...","steps":13}
+{"conclusion":"success","name":"build + test + lint","steps":15}
+```
+
+Both jobs `success` at FULL step counts (**15** and **13**) — no runner-starvation
+signature (`cancelled` + `runner_name:""` + `steps:0`). Matched on the full
+40-char SHA, never a short one.
+
+**This is load-bearing for the adjudication below:** CI on this exact tree is
+GREEN, so every local RED recorded here passed on CI hardware.
+
+---
+
+## Gate (e) — build, clippy, fmt, deny
+
+### `cargo build --workspace --all-targets`
+
+```
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.65s
+```
+
+Exit **0**; `grep -cE '^(warning|error)'` = **0**.
+
+### `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Exit **0**, ZERO warnings. The first run finished in 1.04 s off 8 `Checking`
+lines, which is **partially cached** — memory `mutation-check-needs-forced-rebuild`
+says a fast green must not be believed on its face, and memory
+`clippy-prints-checking-not-compiling` says the token to grep is `Checking`, NOT
+`Compiling` (grepping for `Compiling` here yields a FALSE NEGATIVE). So the eight
+files this sub-phase changed were `touch`ed and clippy re-run:
+
+```
+$ touch crates/envoy-config/src/{matcher,bootstrap}.rs \
+        crates/envoy-accesslog/src/filter.rs \
+        crates/envoy-http{1,2}/src/hcm.rs \
+        crates/envoy-filter/src/{rbac,fault,jwt_authn}.rs
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Checking envoy-accesslog v0.0.0 ...
+    Checking envoy-config v0.0.0 ...
+    Checking envoy-filter v0.1.0 ...
+    Checking envoy-http1 v0.0.0 ...
+    Checking envoy-http2 v0.0.0 ...
+    Finished `dev` profile in 1.98s
+CLIPPY_FORCED_EXIT=0   Checking lines: 14   warnings/errors: 0
+```
+
+**14** crates genuinely re-analysed, including EVERY crate this sub-phase touched.
+The green is real, not a cache replay.
+
+### `cargo fmt --all -- --check`
+
+Exit **0**, silent. (State-3 had to run `cargo fmt --all` to fix five sites copied
+verbatim from `PLAN.md`; that normalisation is committed and holds.)
+
+### `cargo build -p envoy-bin` — BEFORE any differential
+
+Exit **0**. `target/debug/envoy-bin` rebuilt this session. **Not optional** — the
+harness runs the DEBUG binary and a stale one silently mis-reports a fixture
+carrying a new config key (memory `differential-harness-uses-debug-envoy-bin`).
+
+### `cargo deny check`
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+Exit **0**. Four `warning[license-not-encountered]` lines (`MPL-2.0`,
+`Unicode-DFS-2016`, `Zlib`, and one more) are pre-existing unmatched allow-list
+entries in `deny.toml`, not findings. No freshly-published RustSec advisory bit
+this run (the hazard of memory `cargo-deny-reds-on-unrelated-advisory`).
+
+---
+
+## Gate (e) continued — `cargo test --workspace --no-fail-fast`, run TWICE
+
+Run with `--no-fail-fast` and the FULL output redirected to a file, never piped
+through `tail` (a bare `cargo test --workspace` aborts at the first failing
+BINARY and never exercises the rest of the gate; `tail` truncates the `failures:`
+block and destroys the failing test names — memories
+`local-red-set-varies-run-to-run` and `never-pipe-verification-runs-through-tail`).
+
+**Both runs produced IDENTICAL totals across 160 test binaries:**
+
+```
+run 1:  passed=2096  failed=7  ignored=9      (TESTS_EXIT=101)
+run 2:  passed=2096  failed=7  ignored=9
+```
+
+The 9 `ignored` are pre-existing `#[ignore]`d benchmarks (`bench_date_contended`,
+`bench_parse_request_get`, …), not skips introduced here.
+
+### The failing SET is NOT stable between runs — which is the whole diagnosis
+
+| test | run 1 | run 2 | isolation |
+|---|---|---|---|
+| `access_log_rf_upstream_reset` | FAILED | FAILED | **FAILED** |
+| `access_log_rcd_upstream_reset` | FAILED | FAILED | **FAILED** |
+| `access_log_h2_uc_upstream_reset` | FAILED | FAILED | **FAILED** |
+| `access_log_h2_rcd_upstream_reset` | FAILED | FAILED | **FAILED** |
+| `admin_config_dump_server_info` | FAILED | FAILED | **FAILED** |
+| `upstream_active_health_check_fixture` | FAILED | ok | **1 passed** |
+| `upstream_circuit_breaker_budgets_fixture` | FAILED | ok | **1 passed** |
+| `network_filter_direct_response_fixture` | ok | FAILED | **1 passed** |
+| `network_filter_rbac_allow_fixture` | ok | FAILED | **1 passed** |
+
+This is exactly the two-family split memory `local-red-set-varies-run-to-run`
+describes: **a deterministic environmental CORE plus a varying parallel-load
+TAIL.** Every isolation re-run named its target binary and was adjudicated on the
+`N passed` COUNT, never on the exit code (memory
+`cargo-test-p-name-false-green-filtered-out`).
+
+> **One isolation invocation was itself wrong and was caught by reading the
+> text.** `cargo test -p differential --test network_filter_rbac` exited **101**
+> — not a test failure but `error: no test target named 'network_filter_rbac' in
+> 'differential' package` (that target lives in `envoy-bin`; the fixture's real
+> binary is `network_filter_rbac_allow`). Re-run against the correct target it is
+> `1 passed`. An exit code alone would have recorded a phantom RED.
+
+### FAMILY 1 — deterministic in isolation = the ENVIRONMENTAL signature (5 tests)
+
+**(1a) The four upstream-reset fixtures** — `TcpCloseBackend` IPv6-unreachable
+family (memory `tcpclosebackend-ipv6-unreachable-host-flake`, fixtures
+`0061`/`0062`/`0069`). The failure text is decisive:
+
+```
+envoy=      {"rc":503,"rcd":"upstream_reset_before_response_started{
+              remote_connection_failure|immediate_connect_error:_Network_is_unreachable|
+              remote_address:[fdc4:f303:9324::254]:34937}","rf":"UF"}
+envoy-rust= {"rc":503,"rcd":"upstream_reset_before_response_started{
+              connection_termination}","rf":"UC"}
+```
+
+**Real Envoy is the side that is wrong here**, and for a host reason: it resolved
+the close backend to an **IPv6** address (`[fdc4:f303:9324::254]`) and got
+`Network is unreachable`, so it logged a connect-failure `UF` instead of ever
+reaching the backend and observing the reset. envoy-rust logged the CORRECT
+`UC` / `connection_termination`. Nothing about this touches `HeaderMatcher`.
+
+**(1b) `admin_config_dump_server_info`** — the `192.168.65.2` bridge-IP family
+(memory `differential-host-bridge-ip-192-168-65-2`):
+
+```
+envoy-only:      ["backend::192.168.65.2:32965::canary::false", …
+                  "backend::192.168.65.2:32965::hostname::host.docker.internal", …]
+envoy-rust-only: []
+```
+
+This host routes the backend via `192.168.65.2`, which is not in the allow-list.
+
+Both sub-families fail DETERMINISTICALLY in isolation — and per the standing
+traps that determinism **is** the environmental signature, not a regression.
+
+### FAMILY 2 — passes in isolation = parallel-load startup flake (4 tests)
+
+All four share ONE failure text, and it is a **startup** failure that never
+reached a semantic assertion:
+
+```
+Error: upstream Envoy never became accept-ready
+Caused by: 127.0.0.1:55336 not accept-ready within 10s: Connection refused (os error 111)
+```
+
+This is the documented port-reuse startup-race family (memory
+`differential-fixtures-flake-under-parallel-load`;
+`network_filter_direct_response_fixture` is named explicitly in the STATE.md
+standing-traps flake set). Reading the failure TEXT rather than the exit code is
+what distinguishes it from a semantic RED (memory
+`mutation-red-needs-unmutated-control`).
+
+**`upstream_active_health_check` and `upstream_circuit_breaker_budgets` were NOT
+in the documented flake set**, so they were treated as candidate regressions and
+checked structurally rather than assumed:
+
+```
+$ grep -nE 'invert_match|present_match|^\s*headers:' \
+      tests/fixtures/0019-upstream-active-health-check/envoy{,-rust}.yaml \
+      tests/fixtures/0025-upstream-circuit-breaker-retry-budget/envoy{,-rust}.yaml
+    NONE (0 hits across 2 config files)   # per fixture
+```
+
+Both fixtures carry **ZERO** header-matcher constructs in either config, so they
+cannot exercise `HeaderMatcher::matches` at all — structurally outside this
+sub-phase's blast radius. The fixture directories were resolved from the test
+entrypoints rather than from a glob, **because the first attempt used a glob that
+did not resolve and returned a vacuously clean `0 hits`** (the exact trap the
+standing traps warn about: assert the number of files actually scanned).
+
+### Adjudication — no failure is attributable to sub-phase 75.1
+
+1. All 9 distinct failures across both runs are differential/admin fixtures whose
+   failure text is either a host-networking mismatch (IPv6 / bridge IP) or a
+   container startup timeout. **None is an assertion about matching behavior.**
+2. **CI on this exact SHA (`ee86574…`) is GREEN** with both jobs at full step
+   counts — every one of these passed on CI hardware.
+3. The two failures NOT already documented were shown structurally incapable of
+   reaching the changed engine, and both pass in isolation at `1 passed`.
+
+---
+
+## Gate (a) — the new fixture is green
+
+```
+$ cargo test -p differential --test headermatcher_absence_parity
+running 1 test
+INFO envoy-rust listening (http_connection_manager) addr=127.0.0.1:37839
+     stat_prefix=ingress_http codec_type=HTTP1
+test headermatcher_absence_parity_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+`0083-headermatcher-absence-parity` — **`1 passed` in BOTH full runs.** All 22
+probes across 8 matchers green cross-proxy, including the load-bearing
+`p07-absent-keeps-GUARD` (P1) and the `p12` D2 cell.
+
+State-3 already audited this fixture's ~1 s green as genuine (a `docker ps` poll
+caught the real `envoyproxy/envoy:v1.33.0` container, and a negative control
+failed quoting upstream's actual response bytes), so it is not re-litigated here.
+
+## Gate (b) — the pre-existing corpus is green (THE DOMINANT RISK)
+
+This was the phase's dominant risk: a shared-engine change under five subsystems,
+where a pre-existing fixture or test could silently have depended on the old
+semantics. **It did not happen.** Every fixture on the `SPEC.md` §10 watch-list is
+green in BOTH runs:
+
+```
+test http1_direct_response_fixture ... ok     # 0007 — the other route-header witness
+test http_filter_rbac_fixture ... ok          # 0017
+test http_filter_fault_fixture ... ok         # 0018
+test access_log_header_filter ... ok          # 0078
+test access_log_metadata_filter ... ok        # 0081
+test access_log_metadata_filter_key_not_found ... ok   # 0082
+```
+
+and the in-process backstops (`http_filter_rbac_in_process_backstop`,
+`http_filter_fault_in_process_backstop`, `http1_direct_response_round_trip`) are
+green too. **PV-9's prediction — that the complete break set is FOUR in-process
+assertions across THREE tests in ONE file, all amended by Task 2, with ZERO
+fixture risk — is CONFIRMED by measurement.**
+
+## Gate (c) — conformance at the declared threshold
+
+```
+     Running tests/h2spec_runner.rs
+test tests::parse_summary_line_extracts_pass_fail_counts ... ok
+test tests::parse_h2spec_output_extracts_section_failure_ids ... ok
+test h2spec_pass_rate_gate ... ok
+```
+
+`h2spec_pass_rate_gate` **ok in BOTH runs**. `known-failures.txt` is still **21**
+lines and was **NEVER trimmed** — this host scores h2spec 3.5/2 as PASS, so
+trimming on local evidence would break CI (memory
+`h2spec-3-5-2-preface-host-sensitive`).
+
+## Gate (d) — VACUOUS BY DESIGN, and CONFIRMED rather than assumed
+
+```
+new fuzz targets added since 2856976 : 0     (5 targets total, unchanged)
+.github/workflows/ci.yml commits      : 0     (untouched)
+tracked parse_bootstrap corpus seeds  : 63    (unchanged)
+```
+
+No new parser/codec/filter and no new config surface, so §7.4 requires no new
+target, seed or `ci.yml` step — and each was verified on disk rather than
+inherited from the plan.
+
+## Gate (f) — REVIEW.md
+
+**Not this session.** State-5 is a SEPARATE session (§5.1 / ADR-0127).
+
+---
+
+## Ledger and census invariants — all re-verified on disk
+
+```
+fixture directories                    83     (82 + 0083)
+tracked parse_bootstrap corpus seeds   63
+known-failures.txt                     21 lines
+fuzz targets                            5     (0 new)
+ADR-0159 present / ADR-0160 present    1 / 0
+last commit touching DECISIONS.md      78c37a3  (the state-2 PLAN-write)
+#![forbid(unsafe_code)] missing from   (none)
+ROADMAP rows 75 / 75.1 / 75.2          in-progress / in-progress / planned
+```
+
+**`DECISIONS.md` is UNTOUCHED by this session.** No genuinely new decision arose
+at the gate: every RED resolved to an already-documented host-environment family
+or to a parallel-load startup flake, neither of which is a decision. Ledger head
+stays **ADR-0159**; next available **ADR-0160**. **No `ROADMAP.md` edit** — row
+`75.1` flips `done` at state-6, not here.
+
+The engine's arm order was re-confirmed on disk (the P1 guard shape ADR-0159
+decided — `(_, None)` sits AFTER the `PresentMatch` arm, never before it):
+
+```
+26:        let mode_result = match (&self.mode, value) {
+31:            (HeaderMatcherMode::PresentMatch(want_present), v) => v.is_some() == *want_present,
+35:            (_, None) => return false,
+```
+
+The parallel workstream's four `.claude/worktrees/agent-*` and its long-running
+`quizzical_goldstine` container (`envoyproxy/envoy:v1.33.0`) were observed and
+**LEFT ALONE**; this session created no worktrees and no containers of its own
+beyond those testcontainers manages per fixture.
+
+## §7.5 verdict
+
+| gate | verdict |
+|---|---|
+| (a) new/changed differential fixtures green | **PASS** — `0083` = `1 passed` in both runs |
+| (b) pre-existing differential fixtures green | **PASS** — whole watch-list green; all REDs adjudicated to documented host families, none attributable to 75.1 |
+| (c) conformance at declared threshold | **PASS** — `h2spec_pass_rate_gate` ok, `known-failures.txt` untrimmed at 21 |
+| (d) new fuzzer short-budget run | **VACUOUS BY DESIGN, CONFIRMED** — 0 new targets/seeds, `ci.yml` untouched |
+| (e) build / clippy / fmt / test / deny | **PASS** — 0/0/0/`2096 passed`/`ok`; clippy green re-proved under a forced re-check |
+| (f) `REVIEW.md` approved | **state-5, a SEPARATE session** |
+
+**Next: 75.1's §5 state-5 CODE REVIEW** (`superpowers:requesting-code-review`), a
+SEPARATE session per §5.1 / ADR-0127 — the context that ran this gate must not be
+the one that reviews it.
