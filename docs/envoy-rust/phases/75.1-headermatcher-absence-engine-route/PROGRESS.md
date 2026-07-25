@@ -203,3 +203,155 @@ really re-analysed the crate rather than replaying a cache — clippy prints
 NEGATIVE (memory `clippy-prints-checking-not-compiling`).
 
 **Commit:** `phase 75.1 task 2: GREEN — mode-scoped HeaderMatcher absence rule; amend 3 divergence-encoding tests, strengthen 3 guards`
+
+---
+
+## Task 3 — the MUTATION CHECK (guard-level RED evidence)
+
+**Why this task exists.** Task 1 gave TDD's RED for the **fix**. This task gives
+the RED for the **GUARD**: it proves the three P1 guard tests actually catch the
+specific wrong fix `SPEC.md` §2.2 warns about, rather than passing vacuously.
+P1 (`present_match: true` + `invert_match` + ABSENT header) is MEASURED PARITY
+on both proxies, so a naive uniform "absent ⇒ DROP" fix would BREAK it and mint
+a NEW divergence. The mutation IS that wrong fix.
+
+**Run in a scratch `git worktree`, NEVER in the main tree** (memory
+`mutation-checks-collide-with-parallel-subagents`: a parallel reviewer's
+`git checkout -- <file>` can silently revert an in-place mutation mid-run,
+producing a FALSE GREEN that a `Compiling` grep does NOT catch).
+
+### Step 1 — worktree created
+
+```bash
+git worktree add /tmp/wt-75-1-mutation HEAD --detach
+```
+
+```
+Preparing worktree (detached HEAD 723bc3b)
+HEAD is now at 723bc3b phase 75.1 task 2: GREEN — mode-scoped HeaderMatcher absence rule; amend 3 divergence-encoding tests, strengthen 3 guards
+```
+
+### Step 2 — the UNMUTATED CONTROL, run FIRST
+
+A mutation RED is not automatically a SEMANTIC red — a run can "fail" on a build
+or startup error that never reached an assertion (memory
+`mutation-red-needs-unmutated-control`). So the control establishes the baseline
+from the SAME tree:
+
+```bash
+cd /tmp/wt-75-1-mutation && cargo test -p envoy-config --lib matcher
+```
+
+```
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 589 filtered out; finished in 0.00s
+```
+
+### Step 3 — the mutation (a one-line reordering)
+
+The mutation is exactly the mistake the SPEC warns about — a **uniform
+"absent ⇒ DROP"**. In this engine shape that is achieved by hoisting the
+`(_, None) => return false` arm ABOVE the `PresentMatch` arm, so an absent
+header short-circuits for EVERY mode including `present_match`:
+
+```diff
+         let mode_result = match (&self.mode, value) {
++            (_, None) => return false,
+             (HeaderMatcherMode::PresentMatch(want_present), v) => v.is_some() == *want_present,
+-            (_, None) => return false,
+```
+
+**Mutation verified PRESENT on disk before the run** (not merely assumed):
+
+```
+32-            // present_match: false → must be ABSENT.
+33:            (_, None) => return false,
+34-            (HeaderMatcherMode::PresentMatch(want_present), v) => v.is_some() == *want_present,
+```
+
+### Step 4 — the mutated run
+
+```bash
+cargo test -p envoy-config --lib matcher
+```
+
+```
+test result: FAILED. 56 passed; 4 failed; 0 ignored; 0 measured; 589 filtered out; finished in 0.00s
+
+failures:
+    matcher::tests::absence_semantics_matrix_matches_measured_upstream
+    matcher::tests::invert_match_inverts_present_match_result
+    matcher::tests::present_match_false_matches_when_absent
+    matcher::tests::pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream
+```
+
+`grep -c 'Compiling envoy-config'` = **1** — the run really rebuilt, so this is
+not a stale-binary FALSE result (memory `mutation-check-needs-forced-rebuild`).
+
+### The verbatim assertion messages — all four are SEMANTIC, none is a build/startup artifact
+
+```
+---- matcher::tests::invert_match_inverts_present_match_result stdout ----
+thread '...' panicked at crates/envoy-config/src/matcher.rs:439:9:
+assertion failed: m.matches(&[])
+
+---- matcher::tests::present_match_false_matches_when_absent stdout ----
+thread '...' panicked at crates/envoy-config/src/matcher.rs:358:9:
+assertion failed: m.matches(&[])
+
+---- matcher::tests::absence_semantics_matrix_matches_measured_upstream stdout ----
+thread '...' panicked at crates/envoy-config/src/matcher.rs:654:9:
+present(true)+invert: ABSENT must stay KEEP (P1 — MEASURED PARITY)
+
+---- matcher::tests::pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream stdout ----
+thread '...' panicked at crates/envoy-config/src/matcher.rs:489:9:
+present_match absent+invert = KEEP on BOTH proxies (PARITY, not a divergence)
+```
+
+### Adjudication
+
+- **The guards are NOT vacuous.** All THREE guards `PLAN.md` names — `:463`
+  (`pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`), `:425`
+  (`invert_match_inverts_present_match_result`) and `:348`
+  (`present_match_false_matches_when_absent`) — go RED under the wrong fix, each
+  with a genuine left-vs-right assertion failure, against a `60 passed; 0 failed`
+  unmutated control from the SAME worktree.
+- **Every failure is on the P1 cell**, which is the point: the mutation is
+  invisible to every value-mode assertion and detectable ONLY by the
+  `present_match` guards.
+- **`4 failed`, not the plan's `3`** — `PLAN.md` Task 3 step 4 predicted three
+  and then explicitly noted the fourth: "Task 1's matrix also asserts the P1
+  cell, so if it is present in this worktree it fails too — that is expected and
+  additive, not a discrepancy." It is present (Task 1 is committed), it fails on
+  exactly that cell (`matcher.rs:654`), and the count is `56 passed; 4 failed`
+  rather than the pre-flight's `56 passed; 3 failed` measured before Task 1
+  existed. **This CONFIRMS the plan rather than contradicting it.**
+
+### Step 5 — teardown; the mutation is NEVER committed
+
+```bash
+git worktree remove --force /tmp/wt-75-1-mutation
+git worktree list
+git status --porcelain
+```
+
+```
+/home/esa/git/envoy-rust                                            723bc3b [main]
+/home/esa/git/envoy-rust/.claude/worktrees/agent-a0cda5e6afdd64be2  2d6ecda [worktree-agent-a0cda5e6afdd64be2]
+/home/esa/git/envoy-rust/.claude/worktrees/agent-a22debad535db1d78  7140aba [worktree-agent-a22debad535db1d78]
+/home/esa/git/envoy-rust/.claude/worktrees/agent-a54a85accb5dc112f  2b535b5 [worktree-agent-a54a85accb5dc112f]
+/home/esa/git/envoy-rust/.claude/worktrees/agent-ac17c8d4a0ab78914  9e8cfe7 [worktree-agent-ac17c8d4a0ab78914]
+```
+
+`/tmp/wt-75-1-mutation` is GONE and `git status --porcelain` is EMPTY. The four
+`.claude/worktrees/agent-*` entries belong to a PARALLEL WORKSTREAM and were
+LEFT ALONE — only this session's own scratch worktree was removed.
+
+Main-tree arm order re-verified INTACT after teardown (`(_, None)` at
+`matcher.rs:37`, i.e. AFTER the `PresentMatch` arm, not before):
+
+```
+28:        let mode_result = match (&self.mode, value) {
+37:            (_, None) => return false,
+```
+
+**Commit:** `phase 75.1 task 3: mutation check — uniform absent-DROP turns all three P1 guards RED; reverted`
