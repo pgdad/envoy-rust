@@ -25,28 +25,28 @@ impl HeaderMatcher {
             .find(|(n, _)| n.eq_ignore_ascii_case(&self.name))
             .map(|(_, v)| v.as_str());
 
-        let mode_result = match &self.mode {
-            HeaderMatcherMode::ExactMatch(lit) => value == Some(lit.as_str()),
-            HeaderMatcherMode::PrefixMatch(lit) => {
-                value.is_some_and(|v| v.starts_with(lit.as_str()))
+        let mode_result = match (&self.mode, value) {
+            // present_match is the ONLY mode that evaluates with the header
+            // ABSENT, and the only one an absent header carries into
+            // `invert_match`. present_match: true → must be PRESENT;
+            // present_match: false → must be ABSENT.
+            (HeaderMatcherMode::PresentMatch(want_present), v) => v.is_some() == *want_present,
+            // Every VALUE mode short-circuits on an absent header WITHOUT
+            // reaching the XOR below. Order matters: this arm must sit after
+            // the present_match arm and before every value arm.
+            (_, None) => return false,
+            (HeaderMatcherMode::ExactMatch(lit), Some(v)) => v == lit.as_str(),
+            (HeaderMatcherMode::PrefixMatch(lit), Some(v)) => v.starts_with(lit.as_str()),
+            (HeaderMatcherMode::SuffixMatch(lit), Some(v)) => v.ends_with(lit.as_str()),
+            (HeaderMatcherMode::SafeRegexMatch(sr), Some(v)) => sr
+                .compiled
+                .as_ref()
+                .expect("validator ensured HeaderMatcher SafeRegex compiled")
+                .is_match(v),
+            (HeaderMatcherMode::RangeMatch(r), Some(v)) => {
+                v.parse::<i64>().is_ok_and(|n| n >= r.start && n < r.end)
             }
-            HeaderMatcherMode::SuffixMatch(lit) => value.is_some_and(|v| v.ends_with(lit.as_str())),
-            HeaderMatcherMode::SafeRegexMatch(sr) => value.is_some_and(|v| {
-                sr.compiled
-                    .as_ref()
-                    .expect("validator ensured HeaderMatcher SafeRegex compiled")
-                    .is_match(v)
-            }),
-            HeaderMatcherMode::RangeMatch(r) => value
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_some_and(|n| n >= r.start && n < r.end),
-            HeaderMatcherMode::PresentMatch(want_present) => {
-                // present_match: true  → header must be present
-                // present_match: false → no presence requirement (always true)
-                // SPEC §6 signpost 7.
-                if *want_present { value.is_some() } else { true }
-            }
-            HeaderMatcherMode::StringMatch(sm) => value.is_some_and(|v| sm.matches(v)),
+            (HeaderMatcherMode::StringMatch(sm), Some(v)) => sm.matches(v),
         };
 
         mode_result ^ self.invert_match
@@ -339,13 +339,21 @@ mod tests {
         assert!(!m.matches(&[]));
     }
     #[test]
-    fn present_match_false_returns_true_when_present() {
-        // Subtle: present_match: false is "no presence requirement", always true.
+    fn present_match_false_requires_the_header_to_be_absent() {
+        // MEASURED (SPEC §2.3 probe p12, both proxies): upstream
+        // `present_match: false` means the header must be ABSENT. Before phase
+        // 75.1 this test asserted the opposite ("no presence requirement,
+        // always true") and was the in-tree test that PINNED divergence D2.
         let m = hm("authorization", HeaderMatcherMode::PresentMatch(false));
-        assert!(m.matches(&[h("authorization", "Bearer x")]));
+        assert!(!m.matches(&[h("authorization", "Bearer x")]));
     }
     #[test]
-    fn present_match_false_returns_true_when_absent() {
+    fn present_match_false_matches_when_absent() {
+        // Right answer, and after phase 75.1 for the right reason: the rule is
+        // `(present == want)`, so absent + want=false is `(false == false)` =
+        // true. Before 75.1 this passed only because the mode arm returned an
+        // UNCONDITIONAL `true` — the same wrong rule that made
+        // `present_match_false_requires_the_header_to_be_absent` fail.
         let m = hm("authorization", HeaderMatcherMode::PresentMatch(false));
         assert!(m.matches(&[]));
     }
@@ -423,39 +431,43 @@ mod tests {
     }
     #[test]
     fn invert_match_inverts_present_match_result() {
+        // GUARD (phase 75.1): `present_match` is the ONLY mode whose ABSENT
+        // cell still reaches `invert_match`. A uniform "absent => DROP" fix of
+        // the shared engine would flip the first assertion below and mint a NEW
+        // divergence. MEASURED PARITY on both proxies (SPEC §2.3 probe p07).
         let m = hm_inverted("authorization", HeaderMatcherMode::PresentMatch(true));
         assert!(m.matches(&[]));
         assert!(!m.matches(&[h("authorization", "x")]));
     }
 
     #[test]
-    fn pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream() {
-        // MEASURED (ADR-0151; phase-72 §5 state-5 LIVE-PROBE, envoy-rust DEBUG
-        // `envoy-bin` vs. `envoyproxy/envoy:v1.33.0`, port-mapped): a VALUE-based
-        // matcher (exact/prefix/suffix/regex/range/string_match) with
-        // `invert_match` + an ABSENT header DIVERGES — envoy-rust KEEPS, upstream
-        // DROPS. Upstream treats a missing header as an unconditional value
-        // no-match that `invert_match` does NOT resurrect; the in-tree shared
-        // engine (matcher.rs:51) applies `mode_result ^ invert_match` UNIFORMLY,
-        // so absent (mode_result=false) XOR invert(true) = KEEP. This pins that
-        // INHERITED phase-04.2 boundary (shared with ROUTE header matching);
-        // fixing it is carry-forward CF-72-1 (a cross-cutting route+access-log
-        // change), NOT phase 72. The opener fixture 0078 uses a NON-inverted
-        // matcher and does not exercise it. Contrast the PARITY companion
-        // `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`.
+    fn pv4_value_matcher_absent_plus_invert_dropped_is_parity_with_upstream() {
+        // MEASURED (ADR-0151, re-measured at the phase-75 state-2 PLAN-write on
+        // BOTH proxies): a VALUE-based matcher
+        // (exact/prefix/suffix/regex/range/string_match) with `invert_match` +
+        // an ABSENT header DROPS on upstream `envoyproxy/envoy:v1.33.0` — a
+        // missing header is an unconditional value no-match that `invert_match`
+        // does NOT resurrect. Until phase 75.1 the shared engine
+        // (matcher.rs:52) applied `mode_result ^ invert_match` UNIFORMLY and
+        // KEPT it, which was carry-forward CF-72-1; phase 75.1 CLOSED it by
+        // short-circuiting every value mode to `false` on an absent header
+        // BEFORE the XOR. Contrast the PARITY companion
+        // `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`,
+        // which must keep the OPPOSITE verdict — that asymmetry is the whole
+        // point of the mode scoping.
         let hm = hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into()));
         // Direct engine (route path):
         assert!(
-            hm.matches(&[]),
-            "in-tree engine keeps value-matcher absent+invert (upstream DROPS — CF-72-1)"
+            !hm.matches(&[]),
+            "value-matcher absent+invert DROPS, matching upstream (CF-72-1 CLOSED)"
         );
-        // Same divergence through the access-log `HeaderMatch` seam:
+        // Same verdict through the access-log `HeaderMatch` seam:
         let via_trait: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
             hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into())),
         );
         assert!(
-            via_trait.matches(&[]),
-            "access-log path keeps value-matcher absent+invert too (upstream DROPS — CF-72-1)"
+            !via_trait.matches(&[]),
+            "access-log path drops value-matcher absent+invert too (CF-72-1 CLOSED)"
         );
     }
 
@@ -465,12 +477,14 @@ mod tests {
         // `present_match` (the PRESENCE mode, NOT a value matcher) with
         // `invert_match` + an ABSENT header is PARITY — envoy-rust AND upstream
         // BOTH KEEP. Upstream's present-check is `false` for a missing header and
-        // `invert_match` DOES flip it (→ KEEP); the in-tree engine's `false ^
-        // true` also KEEPs. This mode does NOT diverge. A future CF-72-1 fixer
-        // MUST PRESERVE this KEEP — a naive uniform-DROP "fix" of the shared
-        // engine would BREAK this parity case and introduce a NEW divergence.
-        // Contrast the value-matcher divergence pin
-        // `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`.
+        // `invert_match` DOES flip it (→ KEEP); since phase 75.1 the in-tree
+        // engine computes `(present == want)` = `(false == true)` = false and
+        // then XORs the invert, which also KEEPs. This mode does NOT diverge.
+        // The phase-75.1 fixer PRESERVED this KEEP; any future refactor MUST
+        // continue to — a naive uniform-DROP "fix" of the shared engine would
+        // BREAK this parity case and introduce a NEW divergence. Contrast the
+        // value-matcher companion
+        // `pv4_value_matcher_absent_plus_invert_dropped_is_parity_with_upstream`.
         let hm = hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true));
         assert!(
             hm.matches(&[]),
@@ -494,13 +508,13 @@ mod tests {
         assert!(m.matches(&[h("x-log", "yes")]));
         assert!(!m.matches(&[h("x-log", "no")]));
         assert!(!m.matches(&[])); // absent → drop
-        // invert preserves PV-4 through the seam: a VALUE matcher + invert +
-        // absent = KEEP (shared-engine XOR); upstream DROPS this — CF-72-1. See
-        // `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`.
+        // invert now DROPS through the seam too: a VALUE matcher + invert +
+        // absent = DROP, matching upstream (phase 75.1; CF-72-1 CLOSED). See
+        // `pv4_value_matcher_absent_plus_invert_dropped_is_parity_with_upstream`.
         let inv: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
             hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into())),
         );
-        assert!(inv.matches(&[])); // value-matcher absent + invert = keep (upstream DROPS — CF-72-1)
+        assert!(!inv.matches(&[])); // value-matcher absent + invert = drop (parity)
     }
 
     #[test]
