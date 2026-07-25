@@ -132,10 +132,12 @@ impl LogFilter {
                     flags.iter().any(|f| f == response_flags)
                 }
             }
-            // Phase 72: gate on whether the named request header matches. Present-
-            // mismatch AND absent both drop (the engine's own semantics); PV-4's
-            // `mode_result ^ invert_match` is preserved because the injected impl
-            // calls `HeaderMatcher::matches` verbatim.
+            // Phase 72: gate on whether the named request header matches. The
+            // injected impl calls the shared `HeaderMatcher` engine verbatim, so
+            // this arm inherits its MODE-SCOPED absence rule (phase 75.1): for
+            // every VALUE mode an absent header DROPS without reaching
+            // `invert_match`; `present_match` alone carries an absent header
+            // through the inversion.
             LogFilter::Header { matcher } => matcher.matches(headers),
             // Phase 73: boolean composition over the nested predicates. The
             // config validator's `min_items = 2` makes the empty-vec edge

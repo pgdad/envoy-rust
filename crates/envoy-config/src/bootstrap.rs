@@ -1701,7 +1701,11 @@ pub enum ValueMatcher {
     #[serde(rename = "string_match")]
     StringMatch(StringMatcher),
     /// §A1 (phase 36): match on KEY PRESENCE. Semantics `match = present && want`
-    /// (`present_match: false` NEVER matches — NOT the HeaderMatcher `present_match` precedent).
+    /// (`present_match: false` NEVER matches). Distinct from — and NOT derived
+    /// from — the `HeaderMatcher` `present_match`, whose rule is
+    /// `(present == want)` (phase 75.1): the two AGREE when the key/header is
+    /// PRESENT and still DIFFER when it is ABSENT (`ValueMatcher` → false,
+    /// `HeaderMatcher` → true). Do not unify them.
     #[serde(rename = "present_match")]
     PresentMatch(bool),
 }
@@ -3116,9 +3120,12 @@ pub struct HeaderMatcher {
     /// through a hand-rolled Deserialize impl that inspects the YAML mapping
     /// keys and dispatches to the matching variant. SPEC §6 signpost 1.
     pub mode: HeaderMatcherMode,
-    /// If true, the entire mode-specific match result is inverted (XOR after
-    /// the mode match runs, before AND-combination across sibling
-    /// HeaderMatchers). SPEC §6 signpost 5.
+    /// If true, the mode-specific match result is inverted before
+    /// AND-combination across sibling HeaderMatchers. The inversion is NOT
+    /// unconditional: for every VALUE mode an ABSENT header short-circuits to
+    /// `false` WITHOUT being inverted; only `present_match` carries an absent
+    /// header through the inversion (phase 75.1, ADR-0159 — MEASURED). See
+    /// `HeaderMatcher::matches` in `matcher.rs`. SPEC §6 signpost 5.
     pub invert_match: bool,
 }
 
@@ -3139,8 +3146,11 @@ pub enum HeaderMatcherMode {
     /// (decimal) and falls in [start, end). Non-parseable values fail the
     /// match (NOT an error). SPEC §6 signpost 6.
     RangeMatch(Int64Range),
-    /// `present_match: <bool>` — header presence (true) or "no presence
-    /// requirement" (false; SPEC §6 signpost 7 for the subtle false semantics).
+    /// `present_match: <bool>` — the header must be PRESENT (true) or ABSENT
+    /// (false). MEASURED against `envoyproxy/envoy:v1.33.0` at phase 75.1
+    /// (ADR-0159): the rule is `(present == want)`. This variant previously
+    /// documented `false` as "no presence requirement (always true)", which was
+    /// divergence D2. An EMPTY header VALUE counts as PRESENT.
     PresentMatch(bool),
     /// `string_match: <StringMatcher>` — Envoy's modern generic tagged-union
     /// (the only path to Contains; SPEC §6 signpost 8).

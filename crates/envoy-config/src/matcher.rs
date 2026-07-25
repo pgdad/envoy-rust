@@ -19,6 +19,23 @@ impl HeaderMatcher {
     /// variant's `ignore_case` flips it for the value (Exact/Prefix/Suffix/
     /// Contains only — SafeRegex callers express case insensitivity via the
     /// `(?i)` inline flag; SPEC §6 signpost 15).
+    ///
+    /// ABSENCE semantics are MODE-SCOPED (phase 75.1, ADR-0159; MEASURED
+    /// cross-proxy against `envoyproxy/envoy:v1.33.0`):
+    ///
+    /// * `present_match(want)` is the ONLY mode evaluated with the header
+    ///   ABSENT — `(present == want) ^ invert_match`. An absent header
+    ///   therefore still reaches `invert_match` in this mode.
+    /// * EVERY value mode short-circuits to `false` when the header is absent;
+    ///   `invert_match` is NOT applied. Upstream treats a missing header as an
+    ///   unconditional value no-match that inversion does not resurrect.
+    /// * An EMPTY header VALUE counts as PRESENT.
+    ///
+    /// The `present_match` + `invert_match` + absent cell is MEASURED PARITY
+    /// and is guarded by `invert_match_inverts_present_match_result` and
+    /// `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`. A
+    /// uniform "absent => DROP" simplification BREAKS it and mints a NEW
+    /// divergence — do not "simplify" the arm order below.
     pub fn matches(&self, headers: &[(String, String)]) -> bool {
         let value = headers
             .iter()
@@ -58,9 +75,10 @@ impl HeaderMatcher {
 /// depend on `envoy-config` (the reverse edge already exists → cycle), so it
 /// defines the `HeaderMatch` seam and `envoy-config` — which DOES depend on
 /// `envoy-accesslog` — provides the impl here, reusing `HeaderMatcher::matches`
-/// VERBATIM. This keeps PV-4 (`mode_result ^ invert_match`, incl. absent+invert
-/// = keep) identical between route matching and access-log filtering with zero
-/// duplication.
+/// VERBATIM. This keeps the MODE-SCOPED absence rule (phase 75.1: value modes
+/// short-circuit to `false` when the header is absent; `present_match` alone
+/// carries an absent header into `invert_match`) identical between route
+/// matching and access-log filtering with zero duplication.
 impl envoy_accesslog::HeaderMatch for HeaderMatcher {
     fn matches(&self, headers: &[(String, String)]) -> bool {
         // Method-call syntax gives the inherent `HeaderMatcher::matches` (the
@@ -327,7 +345,9 @@ mod tests {
         assert!(!m.matches(&[h("x-version", "vBETA")]));
     }
 
-    // PresentMatch: 4 cells (true × present, true × absent, false × present, false × absent).
+    // PresentMatch: 4 cells (true × present, true × absent, false × present,
+    // false × absent). Phase 75.1 flipped the two `false ×` expectations: the
+    // measured rule is `(present == want)`, not "false ⇒ always true".
     #[test]
     fn present_match_true_returns_true_when_present() {
         let m = hm("authorization", HeaderMatcherMode::PresentMatch(true));

@@ -355,3 +355,88 @@ Main-tree arm order re-verified INTACT after teardown (`(_, None)` at
 ```
 
 **Commit:** `phase 75.1 task 3: mutation check — uniform absent-DROP turns all three P1 guards RED; reverted`
+
+---
+
+## Task 4 — the eight doc comments and the in-source citation fix
+
+**What it does.** Pure documentation: eight comment blocks across three crates
+stated the PRE-75.1 uniform-XOR rule (or D2's rule verbatim) as if it were
+correct. No behavior changes, so the gate is a BY-HAND wrap check plus the
+existing suite staying green.
+
+**The doc-comment hazard is real here** (memory
+`mechanical-fanout-scripts-corrupt-doc-comments`): `cargo fmt` does NOT reflow
+`///` / `//!` / `//` lines, so nothing mechanical catches a mis-wrapped or
+semantically-backwards comment. Every block was edited individually — no
+mechanical fan-out script was used — and hand-checked.
+
+### The eight sites
+
+| # | site | what was wrong |
+|---|---|---|
+| 1 | `matcher.rs` `HeaderMatcher::matches` doc | described name/value casing only; said nothing about absence. Now states the full MODE-SCOPED rule, names both P1 guards, and warns against "simplifying" the arm order |
+| 2 | `matcher.rs` the `PresentMatch` arm's inline comment | stated **D2's rule verbatim** — `present_match: false → no presence requirement (always true)`. REMOVED by Task 2's body replacement; re-verified gone |
+| 3 | `matcher.rs` the ADR-0150 seam doc | asserted `mode_result ^ invert_match, incl. absent+invert = keep` as a design GUARANTEE of the seam |
+| 4 | `matcher.rs` the `// PresentMatch: 4 cells` comment | still 4 cells, but two expectations flipped |
+| 5 | `matcher.rs` the in-SOURCE `matcher.rs:51` citation | the XOR is at `:52`. Removed by Task 2's comment replacement; re-verified gone |
+| 6 | `bootstrap.rs` the `invert_match` field doc | "the entire mode-specific match result is inverted (XOR after the mode match runs)" — no longer unconditional |
+| 7 | `bootstrap.rs` the `PresentMatch` variant doc | repeated the wrong rule (`"no presence requirement" (false)`) |
+| 8 | `bootstrap.rs` the `ValueMatcher` cross-reference (**Trap A**) | said the RBAC rule is "NOT the HeaderMatcher `present_match` precedent" — now restated as: the two AGREE when PRESENT and still DIFFER when ABSENT |
+| 9 | `crates/envoy-accesslog/src/filter.rs` the `LogFilter::Header` arm | "PV-4's `mode_result ^ invert_match` is preserved because the injected impl calls `HeaderMatcher::matches` verbatim" — the delegation stays true, the asserted semantics did not |
+
+> **Trap A was NOT collapsed.** `ValueMatcher.present_match` (RBAC /
+> access-log metadata) keeps its own rule — **`present_match: false` NEVER
+> matches** — which is DIFFERENT and CORRECT. Site 8 restates the comparison; it
+> does not touch the `ValueMatcher` rule itself.
+
+### Verification
+
+```bash
+grep -n 'no presence requirement' crates/envoy-config/src/matcher.rs   # step 2
+grep -n 'matcher.rs:51'           crates/envoy-config/src/matcher.rs   # step 5
+git diff -U0 | grep -E '^\+.*(///|//!|//)' | awk '{ if (length($0) > 83) print "TOO LONG: " $0 }'
+grep -rn 'no presence requirement\|always true' crates/envoy-config/src/ crates/envoy-accesslog/src/
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p envoy-config -p envoy-accesslog
+```
+
+- **The in-source `matcher.rs:51` citation is GONE** — zero hits. This is ONE of
+  the exactly TWO sites this sub-phase corrects; the other is
+  `BEHAVIOR_CONTRACT.md:2369` (Task 13).
+- **The wrap check printed NOTHING** — no added comment line exceeds ~82
+  columns. 37 added `///` lines were reviewed.
+- **`cargo fmt --all -- --check` exit `0`** (silent);
+  **`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit
+  `0`**, zero warnings across the WHOLE workspace, not just the touched crates.
+- **Tests green:**
+
+```
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 649 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+#### The stale-phrase grep returns FOUR hits — adjudicated BY LINE, all four CORRECT
+
+`PLAN.md` step 10 expects this grep to print nothing. It prints four lines, and
+**all four are the OLD rule being QUOTED inside the correction that retires it**
+— exactly the "a record legitimately quotes the defect it fixes" case the plan
+warns about two steps later ("Adjudicate greps by LINE, not by count"):
+
+```
+matcher.rs:350:    // measured rule is `(present == want)`, not "false ⇒ always true".
+matcher.rs:365:        // 75.1 this test asserted the opposite ("no presence requirement,
+matcher.rs:366:        // always true") and was the in-tree test that PINNED divergence D2.
+bootstrap.rs:3152:    /// documented `false` as "no presence requirement (always true)", which was
+```
+
+Read in context, each says the phrase WAS the rule and is no longer:
+`matcher.rs:350` is the `// PresentMatch: 4 cells` comment saying the measured
+rule is `(present == want)` and NOT "always true"; `:365-366` is the amended D2
+pin explaining what it used to assert; `bootstrap.rs:3152` is the `PresentMatch`
+variant doc naming its own former wording as divergence D2. **ZERO sites still
+assert the old rule as current.** No edit was made to "clean these up" —
+deleting them would destroy the record of what was fixed.
+
+**Commit:** `phase 75.1 task 4: correct eight doc comments stating the pre-75.1 uniform-XOR rule; fix the in-source matcher.rs:51 citation`
