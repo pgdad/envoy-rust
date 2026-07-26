@@ -1704,8 +1704,10 @@ pub enum ValueMatcher {
     /// (`present_match: false` NEVER matches). Distinct from — and NOT derived
     /// from — the `HeaderMatcher` `present_match`, whose rule is
     /// `(present == want)` (phase 75.1): the two AGREE when the key/header is
-    /// PRESENT and still DIFFER when it is ABSENT (`ValueMatcher` → false,
-    /// `HeaderMatcher` → true). Do not unify them.
+    /// PRESENT. They differ in exactly ONE of four cells — ABSENT with
+    /// `present_match: false`, where `ValueMatcher` → false and `HeaderMatcher`
+    /// → true; ABSENT with `present_match: true` AGREES (both → false). Do not
+    /// unify them.
     #[serde(rename = "present_match")]
     PresentMatch(bool),
 }

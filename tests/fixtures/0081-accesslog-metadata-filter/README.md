@@ -97,7 +97,7 @@ polarities of the wrapper default cross-proxy.
 > a load-parity gap in the REJECT direction, carry-forward **CF-74-1**.
 > "Implementing" it would CREATE a divergence (ADR-0049 fail-loud posture). Note
 > this is a DIFFERENT field on a DIFFERENT message from `HeaderMatcher.invert_match`
-> (CF-72-1), whose divergence is mode-scoped.
+> (CF-72-1), whose divergence *was* mode-scoped and is CLOSED by sub-phase 75.1.
 
 ## Probes / driver
 

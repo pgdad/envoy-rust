@@ -1880,11 +1880,13 @@ unchanged. It is DISTINCT from — and NOT derived from — the
 `HeaderMatcherMode::PresentMatch` of the route/header engine, whose own MEASURED
 rule is **`(present == want)`** since phase 75.1 (ADR-0159; the parenthetical
 `want ? present : true` recorded here before 75.1 described the pre-75.1 in-tree
-behavior, which was divergence D2 and has been fixed). The two now **AGREE when
-the key/header is PRESENT** and still **DIFFER when it is ABSENT** —
-`ValueMatcher` → `false`, `HeaderMatcher` → `true`. They remain different fields
-on different messages: do NOT unify them, and do not "fix" the `ValueMatcher`
-rule to match. See §C for the `HeaderMatcher` rule in full.
+behavior, which was divergence D2 and has been fixed). The two now differ in
+**exactly ONE of four cells** — ABSENT × `present_match: false`, where
+`ValueMatcher` → `false` and `HeaderMatcher` → `true`. They AGREE in the other
+three, including ABSENT × `present_match: true` (both → `false`). They remain
+different fields on different messages: do NOT unify them, and do not "fix" the
+`ValueMatcher` rule to match. See the **Phase 75** block for the `HeaderMatcher`
+rule in full, and its §E for this four-cell table.
 A present-but-empty header → the `header_to_metadata` producer writes nothing
 (ADR-0084) → key UNSET → `present=false` → `present_match: true` DENIES. Verdicts
 are byte-exact: present → `200` + `ok\n` (3 bytes); absent → `403` + `RBAC:
@@ -2405,7 +2407,7 @@ hypothetical — the exact mutation was applied in a scratch worktree at both th
 75.1 PLAN-write and its implementation, and turns three in-process guards RED
 while leaving every value-mode assertion green.
 
-The engine is `HeaderMatcher::matches` (the XOR is at `matcher.rs:52`), shared
+The engine is `HeaderMatcher::matches` (the XOR that closes the function), shared
 verbatim by five subsystems: route matching (H1 **and** H2), HTTP RBAC, the fault
 header gate, JWT-authn rule matching, and the access-log `header_filter` (the
 last via the ADR-0150 `Arc<dyn HeaderMatch>` trait object). Pinned in-process by
@@ -2594,7 +2596,8 @@ has no `invert` field under `deny_unknown_fields`, so a config carrying it is
 BOOT-FATAL here — a load-parity gap in the REJECT direction (ADR-0049 posture,
 carry-forward CF-74-1). **"Implementing" `invert` here would CREATE a
 divergence.** Note this is a DIFFERENT field on a DIFFERENT message from
-`HeaderMatcher.invert_match` (CF-72-1), whose divergence is mode-scoped.
+`HeaderMatcher.invert_match` (CF-72-1), whose divergence *was* mode-scoped and is
+CLOSED by sub-phase 75.1.
 
 **§D Where envoy-rust is STRICTER** (the §E.1 precedent — all fail-loud at config
 load, never a silent runtime difference): no `invert` field (§C); single-segment

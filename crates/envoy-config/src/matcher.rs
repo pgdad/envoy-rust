@@ -346,8 +346,10 @@ mod tests {
     }
 
     // PresentMatch: 4 cells (true × present, true × absent, false × present,
-    // false × absent). Phase 75.1 flipped the two `false ×` expectations: the
-    // measured rule is `(present == want)`, not "false ⇒ always true".
+    // false × absent). Phase 75.1 flipped exactly ONE expectation —
+    // `false × present`, which went true → false. `false × absent` keeps its
+    // verdict (true), now for the right reason: the measured rule is
+    // `(present == want)`, not "false ⇒ always true".
     #[test]
     fn present_match_true_returns_true_when_present() {
         let m = hm("authorization", HeaderMatcherMode::PresentMatch(true));
