@@ -3,8 +3,15 @@
 > **What this document is.** The §5 **state-3 implementation** log for sub-phase
 > **75.2**, appended per task as each task completed. Written for a stranger with
 > zero prior context (D-3.4). Every command output below was FRESHLY CAPTURED in
-> this session and is pasted VERBATIM — none is transcribed from an earlier tree
-> (the sub-phase-75.1 review's finding M-5 was exactly that defect).
+> this session — none is transcribed from an earlier tree (the sub-phase-75.1
+> review's finding M-5 was exactly that defect). Outputs are pasted VERBATIM with
+> exactly two mechanical exceptions, applied uniformly and flagged here rather than
+> left for a reviewer to discover: (1) the `diff -u` headers' `---`/`+++` lines are
+> dropped, because they carry file mtimes rather than content; (2) in `cargo test`
+> output the `tracing` lines' ANSI colour escapes are stripped and their
+> `2026-07-26T…Z` timestamps removed, leaving the message text unaltered. Nothing
+> else is elided, reordered or retyped — in particular every `test result:` line,
+> every `N passed` count and every assertion message is byte-for-byte as emitted.
 >
 > **Session start state (verified on disk, not trusted from the handoff):**
 > `git status --porcelain` clean; branch `main`; `HEAD` ==
@@ -64,12 +71,23 @@ $ diff -u tests/fixtures/0084-headermatcher-absence-accesslog/envoy.yaml \
      - name: http1_listener
 -      address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
 +      address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+       filter_chains:
+         - filters:
+             - name: envoy.filters.network.http_connection_manager
 @@ -11,12 +10,11 @@
+                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                 stat_prefix: ingress_http
                  codec_type: HTTP1
 -                generate_request_id: false
                  access_log:
+                   - name: envoy.access_loggers.file
+                     typed_config:
+                       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
 -                      path: /tmp/0084-envoy-mount/access.log
 +                      path: /tmp/0084-envoy-rust-mount/access.log
+                       log_format:
+                         text_format_source:
+                           inline_string: "STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%\n"
 ```
 
 Exactly four changes, no fifth hunk. `codec_type: HTTP1` is on BOTH sides and is
@@ -149,15 +167,33 @@ The `Checking differential` line is the evidence the run was not cached
 **Step 3 — four recipe deltas only.** VERBATIM:
 
 ```
-$ diff -u .../0085-.../envoy.yaml .../0085-.../envoy-rust.yaml
+$ diff -u tests/fixtures/0085-headermatcher-absence-accesslog-present-polarity/envoy.yaml \
+          tests/fixtures/0085-headermatcher-absence-accesslog-present-polarity/envoy-rust.yaml
 @@ -1,9 +1,8 @@
+ node: { id: envoy-rust-phase-75-fixture-0085, cluster: envoy-rust-phase-75 }
 -admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+ static_resources:
+   listeners:
+     - name: http1_listener
 -      address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
 +      address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+       filter_chains:
+         - filters:
+             - name: envoy.filters.network.http_connection_manager
 @@ -11,12 +10,11 @@
+                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                 stat_prefix: ingress_http
+                 codec_type: HTTP1
 -                generate_request_id: false
+                 access_log:
+                   - name: envoy.access_loggers.file
+                     typed_config:
+                       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
 -                      path: /tmp/0085-envoy-mount/access.log
 +                      path: /tmp/0085-envoy-rust-mount/access.log
+                       log_format:
+                         text_format_source:
+                           inline_string: "STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%\n"
 ```
 
 **Step 6 — run.** VERBATIM:
