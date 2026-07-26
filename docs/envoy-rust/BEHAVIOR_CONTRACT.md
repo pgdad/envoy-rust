@@ -2674,6 +2674,146 @@ be "cleaned up".
 
 ---
 
+### Phase 75 (ADR-0156/0157/0158/0159/0161/0162): `HeaderMatcher` ABSENCE semantics — the `present_match` POLARITY rule and its two-consumer witnesses
+
+> Fixtures `0083-headermatcher-absence-parity` (ROUTE path, sub-phase 75.1) +
+> `0084-headermatcher-absence-accesslog` and
+> `0085-headermatcher-absence-accesslog-present-polarity` (ACCESS-LOG path,
+> sub-phase 75.2). MEASURED cross-proxy against `envoyproxy/envoy:v1.33.0` on
+> BOTH proxies — a 13-probe backend-free ROUTE matrix (7 matcher modes ×
+> invert polarity × {absent, matching value, non-matching value, numeric value,
+> empty value}) and a nine-sink ACCESS-LOG probe read back after a graceful
+> `docker stop -t 15` flush.
+
+**§A The rule.** One engine, `HeaderMatcher::matches` in
+`crates/envoy-config/src/matcher.rs` — an exhaustive tuple `match` over
+`(&self.mode, value)` whose absent-header arm sits AFTER the `present_match` arm
+and BEFORE every value arm, closed by an XOR with `invert_match`:
+
+```
+present := the named header is present (name matched case-insensitively;
+           an EMPTY VALUE still counts as PRESENT)
+
+if mode is present_match(want):   result = (present == want) XOR invert_match
+else if not present:              result = false      # invert_match NOT applied
+else:                             result = mode_matches(value) XOR invert_match
+```
+
+`present_match(want)` is the **ONLY** mode evaluated with the header ABSENT, and
+therefore the only one that carries an absent header into `invert_match`. In
+particular **`present_match: false` means "the header must be ABSENT"** — it is
+NOT "no presence requirement".
+
+**§B The four-cell polarity matrix** (MEASURED both proxies; `invert_match`
+absent). This is the surface sub-phase 75.1 corrected and sub-phase 75.2
+witnesses cross-proxy on the access-log path:
+
+| | header PRESENT | header ABSENT |
+|---|---|---|
+| `present_match: true` | MATCH | no match |
+| `present_match: false` | **no match** | **MATCH** |
+
+Before 75.1 the in-tree engine returned `true` for BOTH cells of the
+`present_match: false` row (divergence **D2**). The `present_match: true` row was
+already correct. Applying `invert_match` XORs each cell.
+
+**§C The MEASURED access-log matrix** (nine `FileAccessLog` sinks, one per
+`header_filter` under test, each with a distinct `text_format_source`; four
+requests — `/absent` with no `x-a`, `/valmatch` with `x-a: v`, `/valmiss` with
+`x-a: zzz`, `/empty` with an EMPTY-VALUE `x-a`). The "pre-fix" column is the
+pre-75.1 in-tree behavior; every cell now matches the upstream column.
+
+| sink | `header_filter.header` | upstream logged | envoy-rust PRE-75.1 | verdict |
+|---|---|---|---|---|
+| s1 | `exact_match: v` + invert | `/valmiss`, `/empty` | `/absent`, `/valmiss`, `/empty` | **D1** — rust logged an extra `/absent`; **CLOSED**, witnessed by `0084` |
+| s2 | `present_match: false` | `/absent` | all four | **D2** — rust logged 3 extra; **CLOSED**, witnessed by `0085` |
+| s3 | `present_match: false` + invert | `/valmatch`, `/valmiss`, `/empty` | *(nothing)* | **D2** — rust logged 3 too few; **CLOSED** |
+| s4 | `present_match: true` + invert | `/absent` | `/absent` | **P1 — PARITY, the guard** |
+| s5 | name-only `{ name: x-a }` | `/valmatch`, `/valmiss`, `/empty` | *(boot-fatal)* | CF-72-2, reject-direction — see §D of the Phase 72 block |
+| s6 | `string_match {exact: v}` + `treat_missing_header_as_empty` | `/valmatch` | *(boot-fatal)* | CF-72-2, reject-direction |
+| s7 | `exact_match: v` | `/valmatch` | `/valmatch` | PARITY control |
+| s8 | `string_match {exact: v}` + invert | `/valmiss`, `/empty` | `/absent`, `/valmiss`, `/empty` | **D1** — **CLOSED** |
+| s9 | `present_match: true` | `/valmatch`, `/valmiss`, `/empty` | same | PARITY control — an EMPTY value counts as PRESENT on BOTH proxies |
+
+**The access-log table matches the ROUTE-path matrix CELL FOR CELL.** The rule is
+UNIFORM across the five subsystems that share the engine (H1 and H2 route
+matching, HTTP RBAC, the fault-filter header gate, JWT-authn rule matching, and
+the access-log `header_filter`), which is why the fix is one expression and why
+the second witness is about the SEAM rather than about a different rule. The
+access-log path reaches the engine through the ADR-0150 `Arc<dyn HeaderMatch>`
+trait object, injected by `compile_access_log_filter`.
+
+**§D The guard — the rule is MODE-SCOPED and must stay that way.** A naive
+uniform "absent ⇒ DROP" simplification closes the value-matcher case (D1) while
+BREAKING the `present_match: true` + invert + absent PARITY cell (s4 / P1),
+minting a NEW divergence in its place. This is not hypothetical: the exact
+mutation — hoisting the `(_, None)` arm to the TOP of the `match` — was applied in
+a scratch worktree at the 75.1 PLAN-write, again at its implementation, and again
+at the 75.2 implementation. MEASURED at 75.2: it turns **FOUR** in-process
+assertions RED (`present_match_false_matches_when_absent`,
+`invert_match_inverts_present_match_result`,
+`pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` and
+`absence_semantics_matrix_matches_measured_upstream` — `649 passed` becomes
+`645 passed; 4 failed`) while leaving every value-mode assertion green **and both
+access-log fixtures `0084`/`0085` GREEN**. That last fact is the point: this arm
+ORDER is guarded ONLY in-process, so the differential fixtures cannot catch a
+regression in it. **Any future refactor of the arm ORDER must preserve it.**
+
+Note the two mutations are DISTINCT and hit different cells — do not substitute
+one for the other when re-testing. Hoisting the arm (keeping `return`) breaks
+**P1** and leaves D1 correct, because `return false` still short-circuits before
+the XOR. Reverting D1 requires letting the absent-header `false` REACH the XOR
+(`(_, None) => return false` → `(_, None) => false`), which is what makes `0084`
+RED (`envoy_rust=2, envoy=1`). ADR-0162.
+
+**§E TRAP A — two DIFFERENT `present_match` fields; do NOT unify them.**
+`HeaderMatcher.present_match` (this block) and `ValueMatcher.present_match` (the
+RBAC and access-log-METADATA matcher, recorded in the Phase 35/36 material above
+and witnessed by fixture `0044`) are different fields on different messages with
+different MEASURED rules. For the `ValueMatcher` one, `present_match: false`
+**NEVER matches**, even when the key is present — a DIFFERENT and CORRECT rule
+that must NOT be "fixed" to match this one. Since 75.1 the two agree in THREE of
+four cells and differ in exactly ONE:
+
+| | `want = true` | `want = false` |
+|---|---|---|
+| PRESENT | `true` / `true` — agree | `false` / `false` — agree |
+| ABSENT | `false` / `false` — agree | **`false` / `true` — DIFFER** |
+
+(`ValueMatcher` verdict first, `HeaderMatcher` second.)
+
+**§F TRAP B — two DIFFERENT `invert` fields.** `HeaderMatcher.invert_match` (this
+block) and `MetadataMatcher.invert` (Phase 74, carry-forward CF-74-1) are
+unrelated fields on unrelated messages. The latter is MEASURED accepted-but-INERT
+upstream on the access-log path and stays BOOT-FATAL here; "implementing" it
+would CREATE a divergence.
+
+**§G Authoritative fixtures.** `0083` (ROUTE path, `kind: http1_probe_list`,
+8 matchers / ~24 probes) is the FIRST differential witness of `invert_match` OR of
+`HeaderMatcher.present_match` in the corpus. `0084` (ACCESS-LOG path,
+`kind: http1_access_log_byte_exact`) witnesses **D1**: `exact_match: "v"` +
+`invert_match: true` on `x-a`, three probes — absent → DROPPED (the D1 cell),
+`x-a: v` → DROPPED, `x-a: zzz` → KEPT — one byte-identical line
+`STATUS=200 PATH=/x` per side. `0085` witnesses **D2** on a plain, NON-inverted
+`present_match: false`, two probes — `x-a: v` → DROPPED (the D2 cell), no `x-a` →
+KEPT — again one byte-identical line per side. Both are backend-free
+(`direct_response` 200, `clusters: []`) and both order the KEPT probe LAST, so the
+driver's ordering-aware `suppression_settle` charges the cheap 2 s
+`CF70_3_SETTLE`. Neither log line echoes `x-a`: envoy-rust's `%REQ(NAME)%`
+operator is allow-list gated and `%REQ(X-A)%` is boot-fatal, so the witness is the
+keep/drop LINE COUNT plus whole-line cross-proxy equality.
+
+**§H TWO fixtures, not one — a driver constraint, not a preference.** The
+byte-exact access-log driver takes exactly ONE log file per side: `AccessLogPaths`
+(`tests/differential/src/lib.rs`) is `{ envoy: String, envoy_rust: String }` under
+`deny_unknown_fields`, and only the envoy-side parent directory is bind-mounted
+into the container, so a second sink writing elsewhere would be invisible to the
+host. Corpus-wide, the maximum number of `envoy.access_loggers.file` sinks in any
+single fixture config is **1**. One sink per fixture is therefore the only
+available shape (ADR-0158), mirroring the existing sibling pair `0081`/`0082`.
+
+---
+
 ## xDS wire state machine
 
 > **To be filled per-phase as needed.**
