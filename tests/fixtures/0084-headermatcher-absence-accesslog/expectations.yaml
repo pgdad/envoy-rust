@@ -1,0 +1,62 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0084-envoy-mount/access.log
+    envoy_rust: /tmp/0084-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — DROPPED, and FIRST. THE LOAD-BEARING PROBE (divergence D1, the
+    # former carry-forward CF-72-1). NO `x-a` header at all. The matcher is a
+    # VALUE matcher (`exact_match: "v"`) with `invert_match: true`, and a missing
+    # header is an unconditional value no-match that inversion does NOT
+    # resurrect — so BOTH proxies emit NOTHING.
+    #
+    # This is the cell sub-phase 75.1 changed. On a PRE-75.1 tree the in-tree
+    # engine computed `mode_result(false) ^ invert_match(true)` = KEEP, so
+    # envoy-rust would write TWO lines here against upstream's ONE and this
+    # fixture would fail its line-count assertion. That is why 75.2 depends on
+    # 75.1 and could not have landed first.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — DROPPED, and SECOND. `x-a: v` MATCHES `exact_match: "v"`, and
+    # `invert_match` flips the match to a drop: `true ^ true` = false. This is the
+    # ordinary inverted-match cell and is PARITY on both proxies before and after
+    # 75.1 — it is the control that proves the matcher is wired up at all, so
+    # probe 1's absence is attributable to the ABSENCE rule rather than to a
+    # dead filter.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "v"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 3 — KEPT, and LAST. `x-a: zzz` does NOT match `exact_match: "v"`, and
+    # `invert_match` flips the no-match to a keep: `false ^ true` = true. Expected
+    # line (byte-identical on both sides):
+    #   STATUS=200 PATH=/x
+    #
+    # The LAST probe is KEPT, therefore the driver's ordering-aware
+    # `suppression_settle` (tests/differential/src/lib.rs) charges the cheap 2 s
+    # CF70_3_SETTLE rather than the 12 s CF71_1_SETTLE. `suppression_settle`
+    # inspects ONLY `probes.last()`, so it is the identity of the LAST probe that
+    # decides the settle — not the position of any other probe.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "zzz"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). There is NO expected
+  # log-line field on this driver: it asserts (a) each side's file holds exactly
+  # `expected_logged_count(probes)` lines — here ONE — and (b) the lines are
+  # byte-identical between upstream Envoy v1.33.0 and envoy-rust. Both proxies
+  # must agree on ALL THREE halves of the filter decision: the kept `x-a: zzz`
+  # line AND the absence of any line for the absent-header probe AND for the
+  # value-matching probe. A one-sided keep fails the line-count assertion before
+  # the byte compare is reached. The measured line is:
+  #   STATUS=200 PATH=/x
+  # The only route is a direct_response → `clusters: []`, no backend spawns.
