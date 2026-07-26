@@ -2420,11 +2420,36 @@ the first differential witness of `invert_match` and of
 probe is the load-bearing one. The ACCESS-LOG-path cross-proxy witness is
 sub-phase **75.2** (fixtures `0084` + `0085`).
 
-**§D Name-only + treat_missing_header_as_empty (PV-5, MEASURED — inherited
-boundary).** Upstream accepts `header: { name }` (presence match) and
-`treat_missing_header_as_empty: true`; the in-tree `HeaderMatcher` deserializer
-REJECTS both (name-only → "missing mode key"; `treat_missing_header_as_empty` →
-unknown field). Kept fail-loud per ADR-0049; carry-forward **CF-72-2**.
+**§D Name-only, treat_missing_header_as_empty, and the top-level contains_match
+(PV-5, MEASURED — inherited boundary; EXTENDED at phase 75).** Three members,
+all REJECT-direction load-parity gaps: upstream accepts a spelling that
+envoy-rust boot-fatals on, so a config carrying one never runs here and the
+divergence cannot be witnessed differentially until it is implemented.
+Carry-forward **CF-72-2**; owner is a future `HeaderMatcher` wire-shape-parity
+phase, which should decide all three together rather than piecemeal.
+
+1. **Name-only `header: { name: x-a }`** — upstream treats it as a PRESENCE
+   match; the in-tree `HeaderMatcher` deserializer rejects it with "missing mode
+   key". MEASURED at phase 72 and re-measured at the phase-75 pick (access-log
+   sink s5: upstream logged `/valmatch`, `/valmiss` and `/empty` — i.e. every
+   request whose `x-a` was present, empty value included).
+2. **`treat_missing_header_as_empty: true`** — envoy-rust rejects it as an
+   unknown field. Upstream does not merely ACCEPT it, it **HONORS** it: MEASURED
+   at the phase-75 pick (access-log sink s6, `string_match {exact: v}` +
+   `treat_missing_header_as_empty`), an absent header is treated as `""`, which
+   fails `exact: v`, so only `/valmatch` was logged. Combined with
+   `invert_match` it therefore FLIPS the D1 absent cell from DROP back to KEEP —
+   which is why implementing it interacts with the Phase 75 §A rule and must not
+   be done casually.
+3. **The top-level `contains_match` arm** — a THIRD member, NEW at phase 75.
+   Upstream accepts it (with a deprecation warning); envoy-rust rejects it as an
+   unknown field. It is reachable in-tree only as `string_match: { contains: … }`,
+   BY DESIGN — see the `HeaderMatcher` deserializer in
+   `crates/envoy-config/src/bootstrap.rs`, which documents the v1.33.0 rationale
+   for admitting `contains` only through `StringMatcher`.
+
+Kept fail-loud per the ADR-0049 posture: envoy-rust is deliberately STRICTER at
+config load rather than silently different at runtime.
 
 **§E Mutual exclusion.** `header_filter`, `status_code_filter`,
 `response_flag_filter` are mutually-exclusive `AccessLogFilter` arms — exactly
@@ -2439,6 +2464,33 @@ field this phase), so a `%REQ(X-LOG)%` format would be boot-fatal. The
 `header_filter` gates on `x-log` (read from the raw request-header slice), not
 from the record; echoing the header value is a FORMATTER concern orthogonal to
 the FILTER. Pure cross-proxy equality on the kept line AND the dropped absence.
+
+**§G Empty-string `exact_match` degenerates to a PRESENCE match upstream
+(MEASURED at the phase-75 pick; carry-forward CF-75-1).** `header: { name: x-a,
+exact_match: "" }` does NOT mean "the value must be the empty string" upstream —
+it degenerates to a PRESENCE match:
+
+| request | upstream | envoy-rust |
+|---|---|---|
+| no `x-a` | no match | no match |
+| `x-a: v` | **MATCH** | **no match** |
+| `x-a:` (empty value) | MATCH | MATCH |
+
+envoy-rust performs a literal empty-value exact comparison, so it diverges in the
+middle row. The degeneracy is specific to the DEPRECATED top-level scalar arm:
+`string_match: { exact: "" }` does **NOT** degenerate (it is a genuine
+empty-string comparison on both proxies), and PGV separately REJECTS
+`string_match: { prefix: "" }` with *"value length must be at least 1
+characters"*.
+
+**Scope note (re-measured at the sub-phase-75.1 code review).** The
+`exact_match: ""` + `invert_match` + ABSENT cell was DIVERGENT before 75.1 and is
+PARITY after — the mode-scoped absence fix closed it as a side effect, because an
+absent header now short-circuits before the comparison ever runs. CF-75-1's
+remaining divergence is therefore confined to the **PRESENT-value cells, both
+polarities** (the middle row above). BANKED, not fixed: the fix encodes a
+surprising proto3 degeneracy and should be decided alongside §D by the same future
+wire-shape-parity phase.
 
 ---
 
