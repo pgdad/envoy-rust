@@ -33,9 +33,12 @@ driver:
     # is a proto3 `google.protobuf.BoolValue` default — was pinned only by
     # envoy-rust asserting against itself. It is now witnessed CROSS-PROXY.
     #
-    # It must stay SECOND, not last: kept-LAST (ADR-0147) is what lets the
-    # driver's ordering-aware `suppression_settle` pay the cheap 2 s
-    # CF70_3_SETTLE instead of the 12 s CF71_1_SETTLE.
+    # It must stay SECOND, not last — but NOT for settle reasons: the driver's
+    # `suppression_settle` inspects only `probes.last()`, and with the order
+    # [drop, keep, keep] the last probe is KEPT whichever kept probe sits last,
+    # so the cheap 2 s CF70_3_SETTLE applies either way. What placement SECOND
+    # buys is the pinned LINE ORDER — `M=-` before `M=1`, byte-DISTINCT — which
+    # is what makes this fixture assert order and not merely count.
     #
     # Expected line (byte-identical on both sides): STATUS=200 PATH=/x M=-
     # `%DYNAMIC_METADATA(com.example:k)%` renders `-` for an absent key, so this

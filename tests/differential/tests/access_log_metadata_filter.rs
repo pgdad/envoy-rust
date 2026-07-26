@@ -27,8 +27,10 @@
 //! `k="2"` → resolved, value mismatch) → SUPPRESSED (`expect_logged: false`);
 //! (2) `GET /x` with NO `x-a` (key unresolved → the `match_if_key_not_found`
 //! DEFAULT `true`) → KEPT; (3) `GET /x` with `x-a: 1` (metadata `k="1"` → value
-//! matches) → KEPT. Probe 2 is placed SECOND rather than appended, so the LAST
-//! probe is still KEPT and the driver pays the cheap 2 s `CF70_3_SETTLE`.
+//! matches) → KEPT. The LAST probe is KEPT, so the driver's ordering-aware
+//! `suppression_settle` — which inspects only `probes.last()` — pays the cheap
+//! 2 s `CF70_3_SETTLE` rather than the 12 s `CF71_1_SETTLE`. What placing probe 2
+//! SECOND buys is separate: it pins the LINE ORDER (`M=-` before `M=1`).
 //!
 //! Each side's file holds EXACTLY TWO byte-identical lines, in this order:
 //! `STATUS=200 PATH=/x M=-` then `STATUS=200 PATH=/x M=1`. They are byte-DISTINCT,

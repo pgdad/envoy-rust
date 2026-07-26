@@ -2706,8 +2706,10 @@ com.example, path: [{key: k}], value: { string_match: { exact: "1" } } } }`, wit
 DROPPED (key resolves, value mismatch); `GET /x` with NO `x-a` → **KEPT via the
 `match_if_key_not_found` DEFAULT `true`** (line `STATUS=200 PATH=/x M=-`); `GET /x`
 with `x-a: 1` → KEPT (line `STATUS=200 PATH=/x M=1`). The kept probe with no `x-a`
-is placed SECOND, not last, so kept-LAST (ADR-0147) holds; the two kept lines are
-byte-DISTINCT, so the fixture pins line ORDER as well as count. `0082`: the same
+is placed SECOND, not last; kept-LAST (ADR-0147) holds because the LAST probe is
+KEPT, which is all `suppression_settle` inspects. What placing it SECOND buys is
+that the two kept lines are byte-DISTINCT in a pinned ORDER, so the fixture pins
+line ORDER as well as count. `0082`: the same
 shape with `match_if_key_not_found: false` — TWO probes, ONE kept line: `GET /x`
 with no `x-a` → DROPPED (key not found, the §B polarity flip), with `x-a: 1` → KEPT
 (`STATUS=200 PATH=/x M=1`). Both `direct_response` 200, `clusters: []`, no backend.

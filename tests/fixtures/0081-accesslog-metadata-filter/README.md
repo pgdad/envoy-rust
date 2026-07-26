@@ -103,10 +103,12 @@ polarities of the wrapper default cross-proxy.
 
 `kind: http1_access_log_byte_exact`. Probe ordering follows the **kept-LAST**
 convention (ADR-0147): the single DROPPED probe comes first and both KEPT probes
-follow, so the driver's ordering-aware `suppression_settle` pays the cheap 2 s
-`CF70_3_SETTLE` rather than the 12 s `CF71_1_SETTLE`. That is why probe 2 is
-placed SECOND rather than appended last. `expected_logged_count` is therefore
-**2**. The assertion is PURE cross-proxy equality — both proxies must agree on
+follow, so the LAST probe is KEPT and the driver's ordering-aware
+`suppression_settle` pays the cheap 2 s `CF70_3_SETTLE` rather than the 12 s
+`CF71_1_SETTLE`. `suppression_settle` inspects only `probes.last()`, so the cheap
+settle would hold with the two kept probes in either order; probe 2 is placed
+SECOND for a DIFFERENT reason — it pins the LINE ORDER (`M=-` before `M=1`).
+`expected_logged_count` is therefore **2**. The assertion is PURE cross-proxy equality — both proxies must agree on
 the two KEPT lines, in order, AND on the ABSENCE of any line for the
 value-mismatching probe.
 
