@@ -2402,6 +2402,41 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0164: The standing "exactly FIVE tests RED on this host" figure is INCOMPLETE — the local host-flake set is a STABLE CORE of five plus a VARYING startup-race TAIL, and two previously-unlisted binaries (`http1_router_upstream_fixture`, `xds_file_based_rds_fixture`) are adjudicated into the documented startup-race family rather than routed to a §5.2 re-entry
+
+- Date: 2026-07-27
+- Status: accepted (sub-phase 75.2 §5 state-4 RE-VERIFICATION). **Supersedes NOTHING.** It CORRECTS a standing FIGURE repeated in `docs/envoy-rust/STATE.md`'s Standing-traps block, in this phase's earlier `# §5 state-4 — the §7.5 phase-done gate` section of `PROGRESS.md`, and across several session handoffs — namely "**THE LOCAL HOST-FLAKE SET IS MEASURED: exactly FIVE tests RED on this host**". The five are real and their adjudication is unchanged; what is corrected is the claim that five is the COMPLETE set. Landed ADRs are never edited (D-3.5), so the earlier records stand as written and this ADR is the correction of record.
+
+**Context.** Sub-phase 75.2's §5 state-4 RE-VERIFICATION re-ran the full §7.5 gate over HEAD `a0384b2493f9c73e752f088679dda8444b814cbf`. `PLAN.md:1596` requires the gate-(b) sweep to be run "2–3 times and diff the failing SET", because "the startup-race flake family's membership changes run to run". Every previous gate run on this phase observed the SAME five REDs in every sweep, and the inherited record hardened that observation into a closed set of exactly five.
+
+**What was measured.** THREE sweeps of `cargo test --workspace --no-fail-fast`, 162 binaries each, with the full output redirected to a file (never piped through `tail`):
+
+- run 1 — `passed=2099 failed=6 sum=2105`
+- run 2 — `passed=2100 failed=5 sum=2105`
+- run 3 — `passed=2098 failed=7 sum=2105`
+
+The SUM is invariant at **2105** in all three, and equals the independently re-derived CI total on this exact SHA (run `30264483379`: 162 binaries, `passed=2105 failed=0`). The `local passed + failed == CI passed` identity therefore holds on every run.
+
+The failing SET decomposes into two halves that behave in OPPOSITE ways:
+
+- **STABLE CORE — five, present in ALL THREE sweeps:** the four `access_log_*_upstream_reset` binaries (`TcpCloseBackend` IPv6-unreachable: upstream logs `immediate_connect_error:_Network_is_unreachable` at `[fdc4:f303:9324::254]` and reports `rf: UF` where envoy-rust correctly reports `rf: UC`) and `admin_config_dump_server_info` (the `192.168.65.2` bridge-IP family, `envoy-rust-only: []`). **All five fail DETERMINISTICALLY in isolation** — that determinism IS the environmental signature for these two families.
+- **FLOATING TAIL — three, membership varying 1 / 0 / 2 across the three sweeps:** `http1_router_upstream_fixture` (run 1), `xds_file_based_rds_fixture` and `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` (run 3). **All three PASS in isolation** — the exact opposite signature, and the one `PLAN.md:1602` names for the startup-race family.
+
+**The decision, and why it is not a §5.2 re-entry.** Of the three floaters, only `send_request_maps_h2_handshake_failure_to_typed_error` is named in `PLAN.md:1600`'s documented flake list. `http1_router_upstream_fixture` and `xds_file_based_rds_fixture` are NOT. The governing instruction is that a RED outside the documented set routes back to state 3 rather than being argued around, so this required an explicit adjudication rather than a silent pass:
+
+1. **Their failure TEXT is identical to the documented startup-race family's**, and neither RED ever reached an assertion: `fixture passes: upstream Envoy never became accept-ready` / `127.0.0.1:<port> not accept-ready within 10s: Connection refused (os error 111)`. The harness gave up waiting for the upstream container before the fixture's comparison logic ran a single byte. A RED that never reached an assertion carries no information about matching semantics.
+2. **Both PASS in isolation** (`1 passed; 0 failed; 0 filtered out`), which is the startup-race discriminator, and both were ABSENT from at least one sweep.
+3. **Both PASS in CI on this exact HEAD SHA**, re-derived from the run log rather than asserted.
+4. **Neither touches the surface 75.2 changed** — neither configures a `HeaderMatcher`, uses an access-log `header_filter`, or reads fixture `0084` or `0085`. A regression in the `prefix: "/"` widening or in the per-probe `path:` distinctness could not express itself through either.
+
+They are therefore **newly-OBSERVED members of an already-documented family, not a new failure mode**, and gate (b) is GREEN. This is the narrow claim: it licenses no general "if it passes in isolation it is a flake" rule. The four-part test above — assertion never reached, passes in isolation, absent from some sweep, and untouched by the phase's surface — is what carries it, and all four must hold.
+
+**Rejected alternatives.** (1) **Route to a §5.2 state-3 re-entry** on the literal reading that the REDs are outside the documented five. Rejected: the five-member figure is the artefact being corrected here, the two binaries match the documented family's signature on every axis, and a re-entry would have been implementing a fix for a defect that measurement shows does not exist. (2) **Report gate (b) GREEN silently**, treating the floaters as too routine to record. Rejected: the standing figure says five, a future session would hit the same discrepancy and have to re-derive this adjudication from scratch, and D-3.5 requires the decision to be written rather than remembered. (3) **Add the two binaries to `PLAN.md`'s flake list.** Rejected: `PLAN.md` is a landed artefact of state-2 and is not edited at state-4; the enumeration is also the wrong shape, since the whole finding is that the startup-race tail is OPEN-ENDED and cannot be closed by extending a list.
+
+**Consequences.** The correct standing formulation is **"a STABLE CORE of five that fail deterministically in isolation, plus a VARYING startup-race TAIL that passes in isolation"** — not "exactly five". Future gate-(b) adjudications must therefore run the sweep 2–3× and DIFF the SET as `PLAN.md` already requires, and must classify each RED by the four-part test above rather than by membership in any enumerated list; a RED absent from the list is not by itself a regression, and a RED present in it is not by itself excused. The arithmetic identity `local passed + failed == CI passed` is the load-bearing whole-set check and held on all three runs (`2099+6`, `2100+5`, `2098+7`, all `= 2105`). No test was weakened, no fixture edited, no `known-failures.txt` line trimmed and no ROADMAP row flipped by this session. Two further observations are recorded in `PROGRESS.md` and handed to the state-5 re-review rather than fixed here: `cdn_loop_parse` has ZERO tracked fuzz-corpus seeds while the other four targets have 8 / 63 / 3 / 1, and the long-repeated "5 targets / 63 seeds" pairing states one target's seed count against a corpus total that is actually **75**.
+
+---
+
 ## ADR-0163: Sub-phase 75.2 §5 state-5 code review — the state-4 "h2spec conformance gate may be VACUOUS" observation is REFUTED for CI and CONFIRMED only for LOCAL runs; the surviving local half is banked as carry-forward CF-75-3 rather than widening 75.2; and the review verdict is CHANGES-REQUESTED on a MEASURED fixture-attribution gap
 
 - Date: 2026-07-27
