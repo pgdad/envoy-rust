@@ -929,3 +929,640 @@ RE-REVIEW** → **state-6 CLOSE-OUT** (at which ROADMAP row `75.2` AND parent ro
 `75` both flip `done`). Each is its own session.
 
 Ledger head after this review: **ADR-0163**; next available **ADR-0164**.
+
+---
+
+# §5 state-5 RE-REVIEW — the phase's CURRENT verdict
+
+> **What this section is.** The §5 **state-5 RE-REVIEW** for sub-phase 75.2, run in
+> a SEPARATE session from the §5.2 state-3 re-entry and from the §5 state-4
+> RE-VERIFICATION that preceded it (§5.1; ADR-0127 — the context that wrote or
+> gated an artifact must not grade it). Written for a stranger with zero prior
+> context (D-3.4).
+>
+> **The earlier `# Sub-phase 75.2 … §5 state-5 CODE-REVIEW` section at the head of
+> this file is HISTORY and is left exactly as landed** (append-only, D-3.5). Its
+> CHANGES-REQUESTED verdict was discharged: `PROGRESS.md`'s
+> `# §5.2 state-3 RE-ENTRY` section closes its §10 charter, and `PROGRESS.md`'s
+> `# §5 state-4 RE-VERIFICATION` section re-ran the whole §7.5 gate over the
+> result. **The verdict below supersedes it and is the phase's current one.**
+>
+> **Session start state (verified on disk, not trusted from the handoff):**
+> `git status --porcelain` clean; branch `main`; `HEAD` ==
+> `1da066280f20c29ad1b320ce9a05de8821f4f06d`; `git fetch origin --prune` showing
+> `origin/main` at the SAME SHA. CI on that FULL 40-char SHA confirmed GREEN — run
+> **`30294110868`**, `completed`/`success`, both jobs at FULL step counts **15**
+> (`build + test + lint`) and **13** (`fuzz`), so no runner-starvation signature
+> (`steps: 0` + `runner_name: ""`).
+>
+> **State detection:** `SPEC.md`, `PLAN.md`, `PROGRESS.md` AND `REVIEW.md` all
+> exist; `REVIEW.md`'s verdict is CHANGES-REQUESTED, but `PROGRESS.md` carries BOTH
+> the re-entry section that closes its charter AND the state-4 RE-VERIFICATION
+> section that re-gated the result — so the re-entry is SPENT, gates (a)–(e) are
+> landed GREEN, and **gate (f) is the only open gate**. §5 state 5 exactly.
+
+## §R0. Scope, method, and what was reviewed
+
+**Reviewed:** (i) the two new differential fixtures `0084` /
+`0085` and their entrypoints as they stand at HEAD; (ii) the §5.2 re-entry's twelve
+fix files (on disk since `da06059`); (iii) the `BEHAVIOR_CONTRACT.md` Phase 75
+block this sub-phase authored; (iv) whether the state-4 RE-VERIFICATION's gate
+adjudication — **ADR-0164** above all — is sound and was applied honestly.
+
+**Method.** Four READ-ONLY review dimensions were fanned out as subagents
+(`superpowers:dispatching-parallel-agents`), each given full zero-context
+instructions and forbidden to write or to run `cargo`. **Every finding they
+returned was RE-VERIFIED on disk by this session before being recorded here, and
+two were CORRECTED downward in the process** (see §R5). The decisive measurements
+were made by this session ITSELF in its own scratch `git worktree`, created
+`--detach` at HEAD (memories `mutation-checks-collide-with-parallel-subagents`,
+`worktree-subagents-get-stale-base`). **The §7.5 gate was NOT re-run** — it is
+landed and GREEN, and re-running it is not this session's job.
+
+**Not reviewed / deliberately out of scope:** sub-phase 75.1 (landed, `done`, and
+the PREMISE of 75.2), the frozen parent `75/SPEC.md`, any `75.1/` artifact,
+CF-75-3 and CF-75-2 (both open and owned by their own future phases).
+
+## §R1. Verdict
+
+## **CHANGES-REQUESTED — 0 Critical, 2 Important, 7 Minor, 7 Nit. Re-entry is §5.2 step 3, NOT step 4.**
+
+**The engineering is sound and the gate is genuinely green.** No code is wrong, no
+fixture is weakened, no gate is falsely green, and the ADR-0164 judgment call this
+review was pointed at is **correct**. The blocking issue is elsewhere: this
+sub-phase's own contribution to `BEHAVIOR_CONTRACT.md` — the project's canonical
+equivalence reference (`BOOTSTRAP_PROMPT.md` §4.1 invariant 5) — carries a claim
+labelled **MEASURED** that this review **refutes by measurement**, and the practical
+conclusion it draws from that claim is the *opposite* of the truth. A future
+refactorer reading §D is told their differential suite cannot protect them, when in
+fact two fixtures catch the exact regression §D warns about. That is a must-fix in a
+document whose whole purpose is to be trusted without re-derivation.
+
+Everything else is Minor or Nit: factual slips, an over-narrow verification recipe,
+and one genuine coverage carry-forward.
+
+## §R2. MEASURED evidence produced by THIS review (scratch `git worktree`)
+
+Worktree created `--detach` at HEAD `1da0662`, `git status --porcelain` clean at
+creation, with its own `CARGO_TARGET_DIR` so it shares no cargo lock and no build
+artifacts with the main tree. Removed with `git worktree remove --force` at the end;
+**only this session's own worktree was removed** — the four
+`.claude/worktrees/agent-*` belonging to the parallel workstream were left
+untouched and verified present afterwards by `git worktree list`.
+
+### §R2.1 Unmutated control FIRST
+
+```
+$ cargo build -p envoy-bin
+   Compiling envoy-bin v0.0.0 (…/wt-state5/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.12s
+$ cargo test -p differential --test headermatcher_absence_accesslog
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.19s
+$ cargo test -p differential --test headermatcher_absence_accesslog_present_polarity
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+```
+
+`0 filtered out` is asserted explicitly — `0 passed; N filtered out` exits 0 and is a
+FALSE green (memory `cargo-test-p-name-false-green-filtered-out`).
+
+### §R2.2 Mutations P and X — the re-entry's TDD RED, INDEPENDENTLY REPRODUCED
+
+**Mutation P — polarity inversion.** `matcher.rs`, `v.is_some() == *want_present` →
+`!=`. **Mutation X — drop the XOR.** `mode_result ^ self.invert_match` →
+`let _ = self.invert_match; mode_result`. Each was applied alone, `envoy-config` and
+`envoy-bin` were confirmed to RECOMPILE (`Compiling envoy-config` / `Compiling
+envoy-bin` present on every build — memory `mutation-check-needs-forced-rebuild`),
+and the mutation was **re-grepped as still present after the run**.
+
+```
+--- 0085 under mutation P ---
+fixture green: access log byte-exact mismatch: line 0 not byte-identical: envoy="STATUS=200 PATH=/absent" envoy-rust="STATUS=200 PATH=/present"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.14s
+
+--- 0084 under mutation X ---
+fixture green: access log byte-exact mismatch: line 0 not byte-identical: envoy="STATUS=200 PATH=/valmiss" envoy-rust="STATUS=200 PATH=/valmatch"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+```
+
+**Both reproduce the re-entry's recorded failure text CHARACTER FOR CHARACTER**
+(`PROGRESS.md:1446`, `:1474`). One line on each side in both cases, so the COUNT
+assertion still passed and only the byte compare failed — which is precisely the
+regression class the pre-I-1 shared `path: /x` could never catch. **The I-1 fix is
+load-bearing and the re-entry's TDD RED is real, not narrative.**
+
+### §R2.3 Mutation H — the arm-ORDER hoist. **This REFUTES `BEHAVIOR_CONTRACT.md` §D.**
+
+`(_, None) => return false` moved to the TOP of the `match` (keeping `return`) —
+the mutation §D describes.
+
+```
+--- in-process ---
+test result: FAILED. 645 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+--- 0084 ---
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.27s
+--- 0085 ---
+fixture green: envoy-rust emitted 0 access-log lines but 1 were expected to be logged; lines: []
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.21s
+--- 0083 (ROUTE path) ---
+fixture passes: probe p07-absent-keeps-GUARD
+Caused by:
+    byte-exact body mismatch
+      upstream: [112, 48, 55, 61, 77, 65, 84, 67, 72]      ("p07=MATCH")
+      subject:  [112, 48, 55, 61, 78, 79, 77, 65, 84, 67, 72]  ("p07=NOMATCH")
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+--- restored control, SAME worktree ---
+test result: ok. 649 passed; 0 failed  (envoy-config --lib)
+test headermatcher_absence_accesslog_present_polarity ... ok
+test headermatcher_absence_parity_fixture ... ok
+```
+
+**§D's `645 passed; 4 failed` and its `0084` GREEN are both CONFIRMED. Its
+`0085` GREEN is FALSE, and so is the conclusion drawn from it.** The mechanism is
+plain from the rule: with `(_, None)` hoisted, an ABSENT header returns `false` for
+*every* mode — including `present_match: false`, whose absent cell must MATCH. That
+is `0085` probe 2 (`/absent`, `expect_logged: true`), so envoy-rust emits zero lines
+against upstream's one and the COUNT assertion fails. It is also `0083` p07 and p12.
+The 18.21 s runtime is the `ACCESS_LOG_FLUSH_WAIT` timeout waiting for a line that
+never comes — consistent with, and corroborating, the zero-line count.
+
+Both REDs quote a **real assertion**, and both have an unmutated control from the
+same worktree (memory `mutation-red-needs-unmutated-control`).
+
+### §R2.4 The comment-only claim, verified by a STRONGER method
+
+The state-4 recipe (`PROGRESS.md:2424`) runs over `29055a5..HEAD`. Over the TRUE
+sub-phase span — base `3f0ec89` (75.1's landing) — the same recipe prints SIX
+non-empty lines, because `grep -vE '^[+-]\s*///'` strips only DOC comments and lets
+`//` line comments through. So this session proved the claim a different way:
+
+```
+$ for f in $(git diff --name-only 3f0ec89..HEAD -- crates/); do
+    diff <(git show 3f0ec89:$f | grep -vE '^\s*(///|//!|//)' | sed 's/[[:space:]]*$//') \
+         <(git show HEAD:$f    | grep -vE '^\s*(///|//!|//)' | sed 's/[[:space:]]*$//')
+  done
+SAME (comment-stripped): crates/envoy-config/src/bootstrap.rs
+SAME (comment-stripped): crates/envoy-config/src/matcher.rs
+```
+
+**The claim HOLDS over the full phase: sub-phase 75.2 changed ZERO executable
+`crates/` lines.** The recipe, not the claim, is the defect (finding I-2). Note the
+recipe errs CONSERVATIVELY — it can false-FAIL on a `//` comment change but cannot
+false-PASS on a code change, since a code line never begins with `///`.
+
+## §R3. ADR-0164 — the judgment call this review was pointed at: **SOUND**
+
+The handoff named this the highest-value thing to grade, so it is graded on its own
+terms rather than on whether the gate says GREEN.
+
+**The call is correct, and it is under-argued rather than over-argued.** Verified
+independently, on disk:
+
+- **Leg (iv) holds, and is decisive.** `http1_router_upstream_fixture` reads
+  `tests/fixtures/0008-http1-router-upstream`; `xds_file_based_rds_fixture` reads
+  `tests/fixtures/0028-xds-file-based-rds`. Neither fixture contains
+  `header_filter`, `present_match`, `invert_match` or `exact_match`. And 75.2's
+  entire non-docs footprint is: two `crates/` files (comment-only, §R2.4), fixtures
+  `0081` (comment-only — its `expectations.yaml` diff filtered of `#` lines is
+  EMPTY), `0084`, `0085`, and three test entrypoints. **Neither RED binary is in
+  that set.** A 75.2 regression could not express itself through either.
+- **The CI cross-check is real.** Re-derived independently on the FULL 40-char SHA:
+  run `30294110868` on HEAD is `162 binaries / passed=2105 / failed=0`, and the log
+  contains **zero** `test result: FAILED` lines.
+- **ADR-0164 scopes itself correctly.** It states plainly that the two binaries are
+  not in `PLAN.md`'s list rather than glossing it; it says explicitly *"it licenses
+  no general 'if it passes in isolation it is a flake' rule"*; and it records three
+  rejected alternatives with reasons, satisfying D-3.5.
+- **The stable-core / floating-tail decomposition is well-founded** and the
+  discriminator really is in `PLAN.md:1602`, quoted byte-exactly.
+
+**One caveat, recorded as Nit N-7 rather than as a defect:** the ADR's Consequences
+paragraph promotes the four-part test into a standing rule for *all* future
+gate-(b) adjudications, and outside this phase legs (i)–(iii) are weaker than they
+look — a load-dependent regression (one that slows envoy-rust's boot under parallel
+load) would never reach an assertion, would pass in isolation, and would be absent
+from some sweeps. Leg (iv) is what carries the test, and here it is carried by a
+measured EMPTY executable diff, not by inspection. The ADR should bind leg (iv) to
+that measurement.
+
+## §R4. Findings
+
+### §R4.1 Critical
+
+**None.**
+
+### §R4.2 Important (MUST-FIX before this sub-phase can close)
+
+#### I-1 — `BEHAVIOR_CONTRACT.md` §D states a MEASURED claim that measurement refutes, and draws the opposite of the true conclusion
+
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md:2831-2839`:
+
+> `MEASURED at 75.2: it turns FOUR in-process assertions RED (…) while leaving every value-mode assertion green **and both access-log fixtures `0084`/`0085` GREEN**. That last fact is the point: this arm ORDER is guarded ONLY in-process, so the differential fixtures cannot catch a regression in it. **Any future refactor of the arm ORDER must preserve it.**`
+
+**MEASURED by this review (§R2.3): `0085` goes RED under that mutation, and so does
+`0083`.** The `FOUR in-process RED` half and the `0084` GREEN half are both correct;
+the `0085` GREEN half is false, and the generalization from two access-log fixtures
+to *"the differential fixtures"* is false twice over.
+
+The root error is in the sentence above it, at `:2842-2843`: *"Hoisting the arm
+(keeping `return`) breaks **P1**, leaves **D1** correct."* Hoisting breaks P1
+(`present_match: true` + invert + absent) **and also the `present_match: false` ×
+absent MATCH cell** — which is exactly `0085` probe 2 and `0083` p12. §D names only
+the first.
+
+**Why it matters.** `BEHAVIOR_CONTRACT.md` is the canonical reference
+(`BOOTSTRAP_PROMPT.md` §4.1 invariant 5: a divergence between contract and observed
+behavior is resolved by fixing one or the other, *never* left silently). §D is
+precisely the warning a future refactorer reads before touching the arm order.
+Telling them the differential suite cannot catch a regression here invites them to
+read a green sweep as licence, and to dismiss a `0083`/`0085` RED as unrelated
+noise. It also contradicts this sub-phase's own
+`tests/fixtures/0085-…/README.md:179-183`, which correctly says the P1 guard is
+pinned *"in-process … **and cross-proxy on the route path by `0083`**"*.
+
+**Fix.** Correct §D to the measured behavior: the hoist breaks BOTH the P1 cell and
+the `present_match: false` × absent cell; it leaves `0084` GREEN (which uses
+`exact_match`, a value mode the hoist does not change) but REDs `0085` and `0083`.
+Then state the true coverage conclusion — *the arm ORDER is guarded in-process AND
+cross-proxy, by `0083` p07/p12 and by `0085` probe 2; the one fixture that cannot
+catch it is `0084`.* Quote this review's §R2.3 output as the measurement.
+**`STATE.md:28`'s Standing-traps clause (a) carries the same false text and must be
+corrected in the same session.** `DECISIONS.md:2462` (ADR-0162) also carries it —
+that one is append-only and must be left as landed; the correction is stated
+forward, not retro-edited.
+
+#### I-2 — the comment-only proof is scoped to the tail, and its filter is `///`-only, so the quoted recipe FAILS over the span its own prose claims
+
+`docs/envoy-rust/phases/75.2-headermatcher-absence-accesslog/PROGRESS.md:2417-2432`.
+The heading and lead sentence make a **whole-sub-phase** claim — *"75.2 changed no
+`crates/` behaviour: its three `crates/` edits (two at state-3, one at the §5.2
+re-entry) are ALL comment-only"* — while the evidence is
+`git diff -U0 29055a5..HEAD`, which covers only the re-entry. Run the identical
+pipeline over the real phase base `3f0ec89..HEAD` and it prints six non-empty lines,
+because the filter strips `///` but not `//`.
+
+The record IS careful in one place (`:2433`, *"No executable `crates/` line changed
+**since the state-5 head**"*), but the claim actually propagated forward is the
+whole-phase one, and `STATE.md:28` carries the recipe with **no base at all**:
+*"re-prove it with a filtered diff that must print EMPTY."* A future session
+choosing any base earlier than `29055a5` gets a non-empty result and a spurious
+alarm.
+
+**The claim itself is TRUE** — proven in §R2.4 by comment-stripped whole-file
+compare over the full span. The recipe is the defect.
+
+**Fix.** Re-anchor on `3f0ec89..HEAD`, widen the filter to
+`'^[+-]\s*(///|//!|//)'`, and state the base explicitly wherever the recipe is
+propagated. Better still, cite the whole-file comment-stripped compare as primary
+evidence (memory `fmt-only-check-needs-whole-file-compare` makes the same point
+about fmt-only claims) and keep the diff filter as a corroborator.
+
+### §R4.3 Minor
+
+#### M-1 — `command_operator.rs` was never edited by this sub-phase
+
+`PROGRESS.md:1798` — *"The three `crates/` files this sub-phase touched"*, followed
+by a `touch` of `bootstrap.rs`, `matcher.rs` and
+`crates/envoy-accesslog/src/command_operator.rs`. Measured:
+`git log --oneline 3f0ec89..HEAD -- crates/envoy-accesslog/src/command_operator.rs`
+is **empty**. 75.2 edited exactly **two** `crates/` files, in two commits (`939a14c`
+touching both, `da06059` touching `bootstrap.rs`) — which is three *edits* across
+*two files*, and `:2419`'s *"three `crates/` edits"* is right under that reading.
+The `touch` is harmless (it only widens the forced rebuild) but the sentence is
+false. Fix: *"the two `crates/` files 75.2 edited, plus `command_operator.rs` to
+widen the forced rebuild."*
+
+#### M-2 — internally inconsistent count of caught-wrong censuses, inside one commit
+
+`PROGRESS.md:2447` says *"Inherited censuses have been caught wrong **five** times on
+this phase"*; `STATE.md:28`, landed in the **same commit `1da0662`**, says *"**SIX**
+have now been caught"* and enumerates six. The state-4 section's own gate-(d)
+correction is itself one of them, which argues for six. Fix: reconcile to one figure.
+
+#### M-3 — the `awk -F'|' $5` trap narrative names seven rows; only two actually misclassify
+
+`PROGRESS.md:2467-2471` (and `STATE.md:28`) — *"A naive `awk -F'|' $5` pass
+FALSE-REPORTS rows `36`/`38`/`39`/`52`/`54`/`66`/`70` as not-done."* Measured: all
+seven carry unescaped `|`, but in rows 36/38/39/52/54 the stray pipes sit AFTER the
+status column, so `$5` still resolves to `done`. **Only rows 66 and 70 shift**, and
+the naive census yields `done=100`, not 95. The corrective conclusion (split on
+`' | '`, status in field 4, 104/102) is correct and unaffected. Fix: say *"rows 66
+and 70 are misclassified; 36/38/39/52/54 also carry unescaped pipes, but only after
+the status column."* **Do NOT "fix" any of the seven rows — `ROADMAP.md` is
+append-only.**
+
+#### M-4 — the CI-total recipe cannot see a failing CI binary, so its `failed=0` is true by construction
+
+`PROGRESS.md:2027`:
+
+```
+gh run view 30264483379 --log | grep -o 'test result: ok\. [0-9]* passed; [0-9]* failed' | awk '{p+=$4; f+=$6} …'
+```
+
+The pattern is hard-anchored on `test result: ok\.`, so a `test result: FAILED.`
+line is discarded before `awk` sees it: `failed=0` is a property of the regex, and
+the `binaries:` count would silently fall below 162 rather than flag anything. It
+did not bite — this review re-derived the log independently and all 162 result lines
+are `ok.` — but the recipe is not self-validating, and it is the one the whole
+`local passed + failed == CI passed` identity leans on. Fix:
+`grep -oE 'test result: (ok|FAILED)\. …'` and assert the binary count equals 162
+separately.
+
+#### M-5 — three sibling access-log fixtures carry the exact I-1 blindness; §G's new rule is scoped "future" only
+
+`BEHAVIOR_CONTRACT.md:2900` closes the new §G with *"**Apply the same discipline to
+any future `http1_access_log_byte_exact` fixture.**"* Measured census of the
+existing ones (probe paths vs the rendered format):
+
+| fixture | probe paths | format discriminator | blind? |
+|---|---|---|---|
+| `0076` | `/log`, `/nolog` | path | no |
+| `0077` | `/direct`, `/nowhere` | path | no |
+| `0078` | `/x`, `/x` | none — `STATUS=…  PATH=…` only | **YES** |
+| `0079` | `/x`, `/x` | none | **YES** |
+| `0080` | `/x`, `/x`, `/x` | none | **YES** |
+| `0081` | `/x` ×3 | `M=%DYNAMIC_METADATA%` renders `-` / `1` / `2` | no |
+| `0082` | `/x`, `/x` | `M=` renders `-` vs `1` | no |
+| `0040` | `/`, `/` | `ua=` / `xff=` differ per probe | no |
+
+`0078` is the sharpest case and the direct stencil `0084` was copied from: two
+probes, `expected_logged_count == 1`, both rendering `STATUS=200 PATH=/x`, so a
+verdict-inverting regression in the very engine `0084`/`0085` exist to protect swaps
+which probe survives, leaves the count at 1, and passes GREEN. **All three of the
+blind fixtures exercise `header_filter`** — `0078` directly, `0079`/`0080` as leaves
+inside `and_filter` / `or_filter` composition arms
+(`0079/envoy.yaml:26-27`) — so all three sit on the very engine this sub-phase's two
+fixtures exist to protect. Nothing 75.2 shipped
+is wrong here, so this is **not** a re-entry obligation — but the defect I-1 named is
+still live in three corpus fixtures and should be a RECORDED carry-forward rather
+than an implicit "future fixtures only" waiver. Fix: open **CF-75-4** naming
+`0078`/`0079`/`0080`, and adjust §G's closing sentence to say the rule applies to
+existing fixtures too, with those three named as outstanding.
+
+#### M-6 — `PROGRESS.md:1720` points at evidence that is not in the document
+
+> *"The forward obligation stands and was honoured this session: the ADR-0035 delta
+> check **below** was run against the FULL superseded set INCLUDING that bullet."*
+
+There is no delta check below — lines 1725-1755 are `## What this session did NOT
+do` and `## Next`. The numbers live only in the `da06059` commit message. **The
+claim is TRUE** (independently re-derived: 13 removed `STATE.md` lines, each at
+delta +1 in `STATE_HISTORY.md`, 0 history lines lost, including the
+`### Doctrine reminders` §5.1 bullet M-8 warned about). But disk is the only memory
+across sessions, and M-8's whole lesson was that an orphaned relocation is
+self-concealing. Fix: append the delta-check block to `PROGRESS.md`, or reword
+"below" to "recorded in the commit message".
+
+#### M-7 — `STATE.md`'s own stated line-length range excludes the line stating it
+
+`STATE.md:28` — *"`STATE.md` top-section blocks are single 3000-15000 char lines"*.
+Measured: that line is **16577** characters, and it sits in the `## Next expected
+skill` top section. The figure 16577 is itself correctly recorded at `:29`, so the
+session measured it and then left the adjacent range stale. Fix: widen the range, or
+better, drop the number and say "single multi-thousand-character lines — measure
+before editing".
+
+### §R4.4 Nit
+
+- **N-1 — two elided COMMAND lines inside blocks presented as verbatim.**
+  `PROGRESS.md:2231` (`$ for n in 0078 … 0085; do …`) and `:2456`
+  (`$ awk -F' \\| ' '/^\| *[0-9]/ {n++; s=$4; …}'`) are not re-runnable as shown,
+  and the `#![forbid(unsafe_code)]` census at `:2461` has no `$` command line at all
+  inside a fenced block that reads as output. The section's own preamble
+  (`:1774-1778`) declares only two mechanical elisions. Every OTHER recipe in the
+  section is executable — this review ran them all and all reproduce. Note N-7 of
+  the first review already declared an abbreviated-COMMAND elision class for the
+  re-entry section; the state-4 section did not inherit that declaration.
+- **N-2 — "this exact HEAD SHA" is the ADR's own parent.** `PROGRESS.md:2023` and
+  `DECISIONS.md:2429` cite run `30264483379`, which is CI on `a0384b2` — correct at
+  the moment of measurement (the gate necessarily runs before its own commit), but a
+  reader at HEAD `1da0662` querying that SHA gets a different run id. Both claims
+  survive: CI on `1da0662` is run `30294110868`, also `162 / 2105 / 0 / success`.
+  One clause would fix it.
+- **N-3 — ADR-0164 does not cite the on-disk prior art that reached the same
+  decomposition.** `75.1/PROGRESS.md:1326` and `:1360` already name
+  `### FAMILY 1 — deterministic in isolation` and
+  `### FAMILY 2 — passes in isolation`, and `:1377` already adjudicated two binaries
+  outside the flake list on a near-identical test;
+  `74/PROGRESS.md:1943` did the same. This *understates* the finding's support — a
+  rule three independent sessions converged on is far more credible than one
+  session's call. Cite them in the ADR's Context. (ADR-0164 is landed; state this
+  forward rather than editing it.)
+- **N-4 — "0 Critical, 4 Important, 7 Minor" survives in two landed artifacts.**
+  `DECISIONS.md:2451` (ADR-0163) and `STATE_HISTORY.md:42/4590/14250` say 7 Minor
+  where `REVIEW.md:49` says **8** and §5.3 defines M-1..M-8. Both are append-only and
+  must NOT be edited; the correction is already carried forward in `STATE.md`'s
+  traps. Recorded so a future census does not re-inherit the 7.
+- **N-5 — `0084/expectations.yaml`: "ALL THREE halves".** Read "all three parts".
+- **N-6 — `SPEC.md` §2.2 citations have drifted.** `SPEC.md:63` cites
+  `crates/envoy-accesslog/src/filter.rs:139` (actual **`:141`**) and `:65` cites
+  `crates/envoy-config/src/matcher.rs:69` for the `HeaderMatch` impl (actual
+  **`:82`**; `:69` is now `mode_result ^ self.invert_match`). Both drifted from this
+  sub-phase's own comment additions. **`SPEC.md` is a landed state-1 artifact and
+  must NOT be retro-edited** (D-3.5) — recorded so a future reader meets the drift
+  rather than being misled by it. Note deliberately that **neither fixture README nor
+  either entrypoint cites a single line number**, which is the correct pattern and is
+  why the drift never reached the durable artifacts.
+- **N-7 — ADR-0164's leg (i) rationale can be sharpened, and its Consequences
+  paragraph over-generalizes.** Two points. (a) The stated ground — *"a RED that
+  never reached an assertion carries no information about matching semantics"* — is
+  weaker than the evidence actually available: the failure text names **upstream
+  Envoy** failing to become accept-ready, and envoy-rust code cannot cause the
+  *reference* proxy's container to fail to start. That is a much stronger
+  discriminator and it is sitting unused in the quoted text. (b) The Consequences
+  paragraph promotes the four-part test to a standing rule; legs (i)–(iii) are not
+  sufficient without leg (iv), and leg (iv) should be bound to a MEASURED artifact
+  (the phase's comment-stripped executable diff, §R2.4) rather than to
+  per-binary inspection. See §R3.
+
+## §R5. Reported by a review dimension but CORRECTED or DROPPED after re-verification on disk
+
+Recorded because the correction is itself evidence that the fan-out was re-verified
+rather than transcribed.
+
+1. **"Five sibling fixtures are blind" — CORRECTED to THREE.** A dimension listed
+   `0078`/`0079`/`0080`/`0081`/`0082`. Re-verified on disk: `0081` and `0082` render
+   `M=%DYNAMIC_METADATA(com.example:k)%`, which resolves to `-` / `1` / `2` across
+   their probes, so their kept lines ARE distinguishable and a keep-swap would be
+   caught. Only `0078`/`0079`/`0080` — whose format is `STATUS=…  PATH=…` alone with
+   a shared `/x` — carry the true blindness. M-5 records three.
+2. **"`0083` would catch the arm-hoist" — UPGRADED from hand-derivation to
+   MEASUREMENT.** A dimension derived this by hand and flagged it as unverified.
+   This session MEASURED it (§R2.3): `0083` REDs at `p07-absent-keeps-GUARD` with a
+   byte-exact body mismatch. It also found the stronger case the dimension missed —
+   **`0085` REDs too** — which is what makes I-1 a refutation of §D's own named
+   fixtures rather than an argument about a third one.
+3. **"ADR-0164's leg (iv) is asserted, not measured" — DOWNGRADED to a Nit.** The
+   assertion is correct (verified on disk here) and the decisive measurement — 75.2's
+   EMPTY executable diff — was already in the document, just uncited. That makes it a
+   citation gap in the ADR (N-7b), not an evidence gap in the gate.
+
+## §R6. Strengths
+
+- **The I-1 fix is minimal, correct, and generalized.** Distinct `path:` per probe +
+  `prefix: "/"` on the route + a format that ALREADY contained `%REQ(:PATH)%` = the
+  kept line names its own probe at **zero** runtime cost. Choosing `:path` over the
+  gating header is right and rightly justified: `REQ_ALLOW_LIST` really is the seven
+  names claimed, and `%REQ(X-A)%` really is boot-fatal. And the fix did not stop at
+  the two fixtures — it became a standing §G rule with an in-file *"Do NOT collapse
+  these paths back to a common value"* warning at the exact site a future author
+  would break it.
+- **The TDD RED is real and this review reproduced it character for character.**
+  §R2.2. Both REDs show one line per side, so the count assertion still passed —
+  exactly the class the shared `/x` masked. The record does not merely assert RED; it
+  shows the RED has the *predicted shape*, and it re-greps the mutation as still
+  present after the run (defeating the parallel-`git checkout` trap).
+- **Both fixtures witness precisely what they claim.** Every probe was walked by hand
+  through the post-fix and pre-fix engines; all five verdicts match their
+  `expect_logged` values, and both fixtures would have been RED pre-75.1. The
+  per-side config divergence is exactly the four sanctioned items and nothing else —
+  `node:`, `codec_type`, the whole `header_filter` body, the format string, the route
+  table and the ~18-line rationale comment are byte-identical across sides.
+- **The state-4 gate was not a walk-over, and says so.** Three sweeps when two was the
+  stated minimum, specifically because the failing SET moved between runs 1 and 2. A
+  lazier session stops at two and never sees the floating tail at all.
+- **The departure from `PLAN.md`'s flake list is stated plainly rather than glossed**
+  (`PROGRESS.md:2178`), and handed UP for grading rather than declared settled —
+  `STATE.md` explicitly tells this reviewer to decide whether the test is sound *"not
+  merely whether the gate says GREEN"*. That is the right posture for a self-graded
+  gate and it is why I-1 was found.
+- **Gate (c) refused to offer its own local green as evidence**, demonstrating the
+  h2spec self-skip under `--nocapture` and reporting the criterion `PLAN.md`
+  actually states. A weaker session quotes `3 passed` and moves on.
+- **The numbers are overwhelmingly right.** Every hard census re-derived on disk
+  reproduced exactly: 85 fixtures, 85 entrypoints, 104 ROADMAP rows / 102 `done` /
+  exactly `75` and `75.2` `in-progress`, 22-of-22 `#![forbid(unsafe_code)]` (D-3.8
+  HOLDS), 21-line `known-failures.txt` at a 0-line diff, 5 fuzz targets / 75 tracked
+  corpus files / 63 for `parse_bootstrap` / **0** for `cdn_loop_parse`, all five
+  `deny.toml` warning line numbers, every document line count, the ADR ledger head,
+  and all eight rows of the `0078`–`0085` fixture→binary map. The
+  gate-(d) self-correction of the long-repeated "5 targets / 63 seeds" pairing is a
+  session catching its own document's error by measurement.
+- **Append-only and scope discipline are exact across both sessions.** The re-entry
+  is 441 insertions / 0 deletions on `PROGRESS.md` with zero pre-existing lines
+  modified; `ROADMAP.md`, `DECISIONS.md`, `75/SPEC.md` and `75.1/` are absent from
+  every diff; the ADR-0035 relocation checks out at 13/13 at delta +1 with 0 history
+  lines lost. Neither session flipped a ROADMAP row, trimmed `known-failures.txt`, or
+  widened into CF-75-3 or CF-75-2.
+- **M-5 and M-6 of the first review were closed the HARDER way.** M-6 offered
+  "quote the failure text OR admit family-membership adjudication"; the re-entry ran
+  a fresh isolation run and produced verbatim text. M-5 offered disclosure; the
+  re-entry disclosed AND reconstructed the mechanism AND explicitly labelled the
+  reconstruction *"an explanation, not a proof"*.
+
+## §R7. What this review did NOT do
+
+- **Did NOT re-run the §7.5 gate.** It is landed and GREEN on HEAD; re-running it is
+  not state-5's job. The only runs made were this review's own control + mutation
+  measurements, in an isolated worktree with its own `CARGO_TARGET_DIR`.
+- **Did NOT edit any artifact it grades** — no fixture, no `crates/` file, no
+  `PLAN.md`, no `SPEC.md`, no `PROGRESS.md`, no `BEHAVIOR_CONTRACT.md`. A review
+  grades; the re-entry fixes.
+- **Did NOT re-open or re-grade sub-phase 75.1**, and did not touch the frozen
+  `75/SPEC.md` or any `75.1/` artifact.
+- **Did NOT flip ROADMAP row `75.2` or parent row `75`.** Both stay `in-progress`;
+  both flips belong to the state-6 close-out.
+- **Did NOT widen into CF-75-3 or CF-75-2**, and did not re-raise the h2spec
+  vacuity question — SETTLED at ADR-0163.
+- **Did NOT edit a landed ADR.** I-1's correction to `DECISIONS.md:2462` and N-3/N-4
+  are stated FORWARD, not retro-edited (D-3.5).
+- **Did NOT chain into the state-6 close-out**, and created no `stop` file — 102 of
+  104 ROADMAP rows are `done` and the `## Feature Families` are largely unbuilt.
+- **Did NOT disturb the parallel workstream.** Only this session's own worktree was
+  removed; the four `.claude/worktrees/agent-*` were left untouched and verified
+  present afterwards. All censuses used `git ls-files` or the root `Cargo.toml`
+  rather than a repo-wide `find`.
+
+## §R8. Carry-forward disposition after this review
+
+**OPENED by this review:**
+
+- **CF-75-4** — fixtures `0078`, `0079` and `0080` carry the same probe-attribution
+  blindness that finding I-1 removed from `0084`/`0085`: every probe shares
+  `path: /x` under a `STATUS=… PATH=…` format, so a regression that MOVES the keep
+  between probes preserves the line count and passes GREEN. `0078` is the direct
+  stencil `0084` was copied from and is the only other access-log `header_filter`
+  fixture. The fix is the same ~6 lines each. Owner: whoever next touches the
+  access-log fixture family. See M-5.
+
+**CLOSED by this sub-phase (confirmed):** **CF-72-1** (by 75.1's engine fix,
+witnessed cross-proxy on the access-log path by `0084`); **M74-31** (the kept-LAST
+causal non-sequitur, corrected at all four live sites and not propagated anywhere in
+75.2's new material — verified).
+
+**BANKED, NOT fixed (confirmed on disk):** **CF-75-1** and the extended **CF-72-2**
+(name-only `{ name }`, `treat_missing_header_as_empty` accepted AND honored, the
+top-level `contains_match` arm). Owner: a future `HeaderMatcher` wire-shape-parity
+phase, which should decide them together.
+
+**OPEN and OUT OF SCOPE, unchanged:** **CF-75-3** (ADR-0163 — `ci.yml` runs
+`cargo test --workspace` with NO `--no-fail-fast`, so on a RED CI run conformance
+status is UNKNOWN, not green; wants its own phase) and **CF-75-2** (upstream
+COMMA-JOINS duplicate header values before value matching; envoy-rust matches only
+the FIRST occurrence; the PRESENCE axis is PARITY so none of 75.1's rule is
+affected). Re-confirmed: `grep -c "CF-75-2"` in `BEHAVIOR_CONTRACT.md` is **0** — it
+is recorded in `STATE.md`, and both new fixture READMEs were corrected at the
+re-entry to say so.
+
+**Observations handed up by state-4, disposed of here:**
+
+1. **The "exactly FIVE REDs" figure is incomplete** — ACCEPTED as correct and
+   already recorded (ADR-0164). No further action.
+2. **`cdn_loop_parse` has ZERO tracked fuzz-corpus seeds** while the other four have
+   8 / 63 / 3 / 1 — **CONFIRMED on disk** (`git ls-files | grep 'fuzz/corpus/'`
+   yields no row for it), and it DOES have its own `ci.yml` step, so the target runs
+   in CI from an empty corpus. **Disposition: CARRY-FORWARD, not a 75.2 finding.**
+   75.2 added no fuzz surface and §7.4's gate (d) asks only that a *new* fuzzer run
+   clean. Seeding it is a real improvement but belongs to whoever next owns the fuzz
+   surface. Banked as **CF-75-5**.
+3. **The "5 targets / 63 seeds" pairing** — already corrected by measurement in
+   gate (d); the earlier section is correctly left as-landed. No further action.
+
+**Untouched, carried forward:** CF-74-1/2/3/4/6, CF-73-1, N73-R2, M73-R1/M73-R2,
+M71-3, M71-6/7/8, M70-R4/R9, M69-A..I, CF-69-1/2/3/5, M68-1, M-1, CF-67-3/5/6/7,
+M74-3..M74-14, M74-16, M74-17/18/20/21/22/26/27/28/29, M74-30, M74-32..M74-39, the
+older Minors in `67.3/SPEC.md` §10, and the HTTP-filters-family (1)-(4) in
+`STATE_HISTORY.md`.
+
+## §R9. Next state — the §5.2 state-3 RE-ENTRY (step 3, NOT step 4)
+
+Per `BOOTSTRAP_PROMPT.md` §5.2, a CHANGES-REQUESTED verdict re-enters at **step 3**.
+The next session must:
+
+1. **Fix I-1** — correct `BEHAVIOR_CONTRACT.md` §D to the measured behavior (the
+   arm-order hoist breaks BOTH the P1 cell and the `present_match: false` × absent
+   cell; it REDs `0085` and `0083` and leaves only `0084` green), replace the false
+   *"the differential fixtures cannot catch a regression in it"* conclusion with the
+   true coverage statement, and correct the same text in `STATE.md:28`'s
+   Standing-traps clause (a). Quote §R2.3's measurement. **Re-derive the
+   `BEHAVIOR_CONTRACT.md` site BY TEXT ANCHOR, never by the line number quoted here
+   — these numbers are valid at `1da0662` only and every earlier fix shifts the ones
+   below it.**
+2. **Fix I-2** — re-anchor the comment-only proof on `3f0ec89..HEAD`, widen the
+   filter to catch `//` and `//!`, and state the base wherever the recipe is
+   propagated.
+3. **Fix M-1, M-2, M-3, M-6, M-7** — all small factual corrections, appended per
+   D-3.5 rather than retro-edited where the text is landed.
+4. **Record M-5 as CF-75-4** and adjust §G's closing sentence; **record
+   observation 2 as CF-75-5**.
+5. **Take NO action on N-4 and N-6** — both are landed artifacts that must not be
+   retro-edited. N-1/N-2/N-3/N-5/N-7 are optional polish; N-7's ADR-0164 sharpening
+   is stated forward, never by editing the ADR.
+6. **Honour TDD.** I-1 and I-2 are documentation corrections to claims about
+   measured behavior, so the RED is the measurement itself: re-run mutation H and
+   confirm `0085` and `0083` go RED with an unmutated control from the same
+   worktree, in the re-entry's OWN scratch worktree. Do not transcribe §R2.3 —
+   re-measure it.
+7. **Append to `PROGRESS.md`**; fire an ADR only if a genuinely new decision arises.
+   The §D correction is arguably one (it supersedes a MEASURED claim in the canonical
+   contract), and **ADR-0165** is the next available number.
+
+It must **NOT** flip ROADMAP row `75.2` or parent row `75`, re-run the §7.5 gate,
+re-open sub-phase 75.1, edit any `75.1/` artifact or the frozen `75/SPEC.md`, edit a
+landed ADR, widen 75.2 into CF-75-3 or CF-75-2, chain into the close-out, or create
+a `stop` file.
+
+After the re-entry lands, the sequence is: **state-4 RE-VERIFICATION** → **state-5
+RE-REVIEW** → **state-6 CLOSE-OUT** (at which ROADMAP row `75.2` AND parent row `75`
+both flip `done`). Each is its own session.
+
+Ledger head after this review: **ADR-0164**; next available **ADR-0165**.
