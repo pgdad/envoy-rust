@@ -2404,8 +2404,19 @@ place. The phase-75.1 fixer PRESERVED that KEEP by ordering the engine's match
 arms so the absent short-circuit sits AFTER the `present_match` arm and BEFORE
 every value arm; **any future refactor MUST continue to.** This is not
 hypothetical — the exact mutation was applied in a scratch worktree at both the
-75.1 PLAN-write and its implementation, and turns three in-process guards RED
-while leaving every value-mode assertion green.
+75.1 PLAN-write and its implementation, and turns four in-process guards RED
+while leaving every value-mode assertion green. (FOUR is the measured figure, on
+two independent runs — `75.1/PROGRESS.md` `56 passed; 4 failed` and
+`75.2/PROGRESS.md` `645 passed; 4 failed` against a `649 passed` control. An
+earlier `three` here was a PLAN-write pre-flight taken BEFORE the fourth guard was
+added; ADR-0162 records the THREE → FOUR correction.)
+
+**The RED set is NOT the pinning list below.** The four tests this mutation
+reddens and the four named as pins are DIFFERENT sets: the pinning list includes
+`pv4_value_matcher_absent_plus_invert_dropped_is_parity_with_upstream`, which the
+arm-hoist does NOT break, and omits `present_match_false_matches_when_absent`,
+which it does. Phase 75 §D below names all four RED tests explicitly — read it
+there rather than reconciling the two lists by eye.
 
 The engine is `HeaderMatcher::matches` (the XOR that closes the function), shared
 verbatim by five subsystems: route matching (H1 **and** H2), HTTP RBAC, the fault
@@ -2446,9 +2457,14 @@ phase, which should decide all three together rather than piecemeal.
 3. **The top-level `contains_match` arm** — a THIRD member, NEW at phase 75.
    Upstream accepts it (with a deprecation warning); envoy-rust rejects it as an
    unknown field. It is reachable in-tree only as `string_match: { contains: … }`,
-   BY DESIGN — see the `HeaderMatcher` deserializer in
-   `crates/envoy-config/src/bootstrap.rs`, which documents the v1.33.0 rationale
-   for admitting `contains` only through `StringMatcher`.
+   BY DESIGN — the rationale sits on `StringMatcherMode::Contains` in
+   `crates/envoy-config/src/bootstrap.rs` (the `HeaderMatcher` deserializer
+   documents nothing about v1.33.0; it merely omits `contains_match` from its key
+   lists). **That in-source comment is SUPERSEDED on one point:** it says v1.33.0
+   "only supports Contains via the modern string_match field", which the MEASURED
+   fact recorded three lines above refutes — upstream v1.33.0 DOES accept the
+   top-level spelling, with a deprecation warning. The in-tree restriction is a
+   deliberate ADR-0049 fail-loud choice, not an upstream limitation.
 
 Kept fail-loud per the ADR-0049 posture: envoy-rust is deliberately STRICTER at
 config load rather than silently different at runtime.
@@ -2710,8 +2726,9 @@ DROPPED (key resolves, value mismatch); `GET /x` with NO `x-a` → **KEPT via th
 `match_if_key_not_found` DEFAULT `true`** (line `STATUS=200 PATH=/x M=-`); `GET /x`
 with `x-a: 1` → KEPT (line `STATUS=200 PATH=/x M=1`). The kept probe with no `x-a`
 is placed SECOND, not last; kept-LAST (ADR-0147) holds because the LAST probe is
-KEPT, which is all `suppression_settle` inspects. What placing it SECOND buys is
-that the two kept lines are byte-DISTINCT in a pinned ORDER, so the fixture pins
+KEPT, which is all `suppression_settle` inspects. The two kept lines are
+byte-DISTINCT (`M=-` vs `M=1`) whatever the probe order; what placing it SECOND
+buys is the specific ORDER those distinct lines appear in, so the fixture pins
 line ORDER as well as count. `0082`: the same
 shape with `match_if_key_not_found: false` — TWO probes, ONE kept line: `GET /x`
 with no `x-a` → DROPPED (key not found, the §B polarity flip), with `x-a: 1` → KEPT
@@ -2737,10 +2754,12 @@ be "cleaned up".
 > `0084-headermatcher-absence-accesslog` and
 > `0085-headermatcher-absence-accesslog-present-polarity` (ACCESS-LOG path,
 > sub-phase 75.2). MEASURED cross-proxy against `envoyproxy/envoy:v1.33.0` on
-> BOTH proxies — a 13-probe backend-free ROUTE matrix (7 matcher modes ×
-> invert polarity × {absent, matching value, non-matching value, numeric value,
-> empty value}) and a nine-sink ACCESS-LOG probe read back after a graceful
-> `docker stop -t 15` flush.
+> BOTH proxies. The MEASUREMENT basis was a 13-probe backend-free ROUTE matrix at
+> the state-0/state-2 recon (a hand-picked slice over 7 matcher modes, both
+> `invert_match` polarities, and the values {absent, matching, non-matching,
+> numeric, empty} — not the full cross product) plus a nine-sink ACCESS-LOG probe
+> read back after a graceful `docker stop -t 15` flush. **That recon matrix is NOT
+> fixture `0083`**, which ships 22 probes; see §G for the shipped fixtures.
 
 **§A The rule.** One engine, `HeaderMatcher::matches` in
 `crates/envoy-config/src/matcher.rs` — an exhaustive tuple `match` over
@@ -2778,7 +2797,10 @@ already correct. Applying `invert_match` XORs each cell.
 `header_filter` under test, each with a distinct `text_format_source`; four
 requests — `/absent` with no `x-a`, `/valmatch` with `x-a: v`, `/valmiss` with
 `x-a: zzz`, `/empty` with an EMPTY-VALUE `x-a`). The "pre-fix" column is the
-pre-75.1 in-tree behavior; every cell now matches the upstream column.
+pre-75.1 in-tree behavior. **Every cell that RUNS on both proxies now matches the
+upstream column; rows s5 and s6 stay `*(boot-fatal)*` here** — they are the OPEN
+CF-72-2 reject-direction gaps, banked-not-fixed (§D of the Phase 72 block), and a
+config carrying either spelling never boots on the subject side.
 
 | sink | `header_filter.header` | upstream logged | envoy-rust PRE-75.1 | verdict |
 |---|---|---|---|---|
@@ -2846,19 +2868,36 @@ upstream on the access-log path and stays BOOT-FATAL here; "implementing" it
 would CREATE a divergence.
 
 **§G Authoritative fixtures.** `0083` (ROUTE path, `kind: http1_probe_list`,
-8 matchers / ~24 probes) is the FIRST differential witness of `invert_match` OR of
-`HeaderMatcher.present_match` in the corpus. `0084` (ACCESS-LOG path,
-`kind: http1_access_log_byte_exact`) witnesses **D1**: `exact_match: "v"` +
-`invert_match: true` on `x-a`, three probes — absent → DROPPED (the D1 cell),
-`x-a: v` → DROPPED, `x-a: zzz` → KEPT — one byte-identical line
-`STATUS=200 PATH=/x` per side. `0085` witnesses **D2** on a plain, NON-inverted
-`present_match: false`, two probes — `x-a: v` → DROPPED (the D2 cell), no `x-a` →
-KEPT — again one byte-identical line per side. Both are backend-free
-(`direct_response` 200, `clusters: []`) and both order the KEPT probe LAST, so the
-driver's ordering-aware `suppression_settle` charges the cheap 2 s
-`CF70_3_SETTLE`. Neither log line echoes `x-a`: envoy-rust's `%REQ(NAME)%`
-operator is allow-list gated and `%REQ(X-A)%` is boot-fatal, so the witness is the
-keep/drop LINE COUNT plus whole-line cross-proxy equality.
+8 matchers / 22 probes) is the FIRST differential witness of `invert_match` OR of
+`HeaderMatcher.present_match` in the corpus, and — because `http1_probe_list`
+names and asserts every probe individually — the strongest of the three.
+`0084` (ACCESS-LOG path, `kind: http1_access_log_byte_exact`) witnesses **D1**:
+`exact_match: "v"` + `invert_match: true` on `x-a`, three probes — `/absent` with
+no `x-a` → DROPPED (the D1 cell), `/valmatch` with `x-a: v` → DROPPED, `/valmiss`
+with `x-a: zzz` → KEPT — one byte-identical line `STATUS=200 PATH=/valmiss` per
+side. `0085` witnesses **D2** on a plain, NON-inverted `present_match: false`, two
+probes — `/present` with `x-a: v` → DROPPED (the D2 cell), `/absent` with no `x-a`
+→ KEPT — one byte-identical line `STATUS=200 PATH=/absent` per side. Both are
+backend-free (`direct_response` 200 on a `prefix: "/"` route, `clusters: []`) and
+both order the KEPT probe LAST, so the driver's ordering-aware
+`suppression_settle` charges the cheap 2 s `CF70_3_SETTLE`. Neither log line
+echoes `x-a`: envoy-rust's `%REQ(NAME)%` operator is allow-list gated and
+`%REQ(X-A)%` is boot-fatal, so the witness is the keep/drop LINE COUNT plus
+whole-line cross-proxy equality.
+
+**Why every probe carries a DISTINCT `path:` — required, not cosmetic.** The
+`http1_access_log_byte_exact` driver asserts only (a) a per-side line COUNT and
+(b) whole-line cross-proxy equality; there is no per-probe assertion and no
+expected-line field. If every probe renders the SAME line, the fixture cannot
+attribute the surviving line to a probe, and any regression that MOVES the keep
+between probes while preserving the count passes GREEN. Both fixtures originally
+copied the `0078` stencil's shared `path: /x` and were MEASURED blind in exactly
+that way at the sub-phase-75.2 state-5 review: a polarity-inverted engine left
+`0085` GREEN (7 in-process assertions RED) and an engine with the `invert_match`
+XOR removed left `0084` GREEN (4 RED). Distinct paths plus a `prefix: "/"` route
+make `%REQ(:PATH)%` name the surviving probe, and both mutations now RED. `:path`
+is on the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime. **Apply
+the same discipline to any future `http1_access_log_byte_exact` fixture.**
 
 **§H TWO fixtures, not one — a driver constraint, not a preference.** The
 byte-exact access-log driver takes exactly ONE log file per side: `AccessLogPaths`

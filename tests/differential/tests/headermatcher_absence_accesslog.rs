@@ -14,7 +14,8 @@
 //! Shape: one H1 HCM listener; ONE `FileAccessLog` sink with
 //! `text_format_source` `STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%`, gated by
 //! `header_filter { header: { name: x-a, exact_match: "v", invert_match: true } }`;
-//! ONE `direct_response` route `/x` → 200 `hi`; `clusters: []`, no backend spawns.
+//! ONE `direct_response` route `prefix: "/"` → 200 `hi`; `clusters: []`, no backend
+//! spawns.
 //!
 //! THE MEASURED RULE (landed by sub-phase 75.1): `present_match(want)` is the ONLY
 //! mode evaluated with the header ABSENT — `(present == want) ^ invert_match`.
@@ -23,21 +24,32 @@
 //! unconditional value no-match that inversion does not resurrect. An EMPTY header
 //! VALUE counts as PRESENT.
 //!
-//! Three probes, ordered so the LAST is KEPT (ADR-0147):
-//! (1) `GET /x` with NO `x-a` → **DROPPED — the D1 cell.** Before 75.1 the in-tree
-//!     engine computed `false ^ true` = KEEP, so envoy-rust wrote TWO lines against
-//!     upstream's ONE and this fixture would be RED. That is why 75.2 was gated
-//!     behind 75.1.
-//! (2) `GET /x` with `x-a: v` → DROPPED (value matches, `invert_match` flips it to
-//!     a drop). The control that proves the filter is live, so probe 1's silence is
-//!     attributable to the ABSENCE rule and not to a dead matcher.
-//! (3) `GET /x` with `x-a: zzz` → KEPT (value does not match, `invert_match` flips
-//!     it to a keep).
+//! Three probes, ordered so the LAST is KEPT (ADR-0147), **each on its own path**:
+//! (1) `GET /absent` with NO `x-a` → **DROPPED — the D1 cell.** Before 75.1 the
+//!     in-tree engine computed `false ^ true` = KEEP, so envoy-rust wrote TWO lines
+//!     against upstream's ONE and this fixture would be RED. That is why 75.2 was
+//!     gated behind 75.1.
+//! (2) `GET /valmatch` with `x-a: v` → DROPPED (value matches, `invert_match` flips
+//!     it to a drop). Together with probe 3 this pins both polarities of
+//!     `invert_match` on a PRESENT header. It is NOT what makes probe 1's silence
+//!     attributable — the line COUNT already does that, and the distinct paths now
+//!     attribute the kept line directly.
+//! (3) `GET /valmiss` with `x-a: zzz` → KEPT (value does not match, `invert_match`
+//!     flips it to a keep).
 //!
 //! Each side's file holds EXACTLY ONE line, byte-identical ACROSS THE TWO PROXIES:
-//! `STATUS=200 PATH=/x`. Because the LAST probe is KEPT, the driver's
+//! `STATUS=200 PATH=/valmiss`. Because the LAST probe is KEPT, the driver's
 //! ordering-aware `suppression_settle` charges the cheap 2 s `CF70_3_SETTLE`
 //! instead of the 12 s `CF71_1_SETTLE` (it inspects only `probes.last()`).
+//!
+//! THE DISTINCT PATHS ARE LOAD-BEARING (review finding I-1, closed at the §5.2
+//! state-3 re-entry). This driver asserts only a per-side line COUNT plus
+//! whole-line cross-proxy equality — no per-probe assertion, no expected-line
+//! field. While all three probes shared `path: /x` they rendered the byte-identical
+//! `STATUS=200 PATH=/x`, so an engine with the `invert_match` XOR removed left this
+//! fixture GREEN (MEASURED; FOUR in-process assertions RED) because dropping the XOR
+//! merely SWAPS which probe is kept and the count stays 1. With `PATH=` naming the
+//! probe that mutation now REDs here. Do NOT collapse the paths.
 //!
 //! The line deliberately does NOT echo `x-a`: envoy-rust's `%REQ(NAME)%` operator
 //! is ALLOW-LIST gated (`REQ_ALLOW_LIST`,

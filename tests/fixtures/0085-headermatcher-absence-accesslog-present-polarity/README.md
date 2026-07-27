@@ -27,12 +27,12 @@ same way.
 One H1 HCM listener, ONE `FileAccessLog` sink gated by
 `header_filter: { header: { name: x-a, present_match: false } }` — a **plain,
 NON-inverted, single-line** matcher — and ONE `direct_response` route
-(`/x` → 200 `hi`). Two probes:
+(`prefix: "/"` → 200 `hi`). Two probes, **each on its own path**:
 
 | # | request | matcher verdict | emitted? |
 |---|---|---|---|
-| 1 | `GET /x`, `x-a: v` | `PresentMatch(false)`: `(present == want)` = `(true == false)` → `false` | **DROPPED** |
-| 2 | `GET /x`, **no** `x-a` | `(present == want)` = `(false == false)` → `true` | **KEPT** |
+| 1 | `GET /present`, `x-a: v` | `PresentMatch(false)`: `(present == want)` = `(true == false)` → `false` | **DROPPED** |
+| 2 | `GET /absent`, **no** `x-a` | `(present == want)` = `(false == false)` → `true` | **KEPT** |
 
 Probe 1 is the load-bearing one: it is **the D2 cell**. A pre-75.1 tree returned
 `true` UNCONDITIONALLY for `PresentMatch(false)`, so it KEPT both probes — TWO
@@ -40,14 +40,32 @@ lines against upstream's ONE — and this fixture would fail its line-count
 assertion.
 
 **D2 is strictly worse than D1** because it fires on the simplest possible
-spelling: no `invert_match` is needed. Before phase 75 it had NO behavioral test
-anywhere in the tree.
+spelling: no `invert_match` is needed. Before phase 75 the only in-tree tests of
+this cell **ASSERTED the divergence** — `present_match_false_returns_true_when_present`
+and `present_match_false_returns_true_when_absent` pinned the pre-75.1 unconditional
+`true` (`git show f68b160^:crates/envoy-config/src/matcher.rs`) — and there was **no
+cross-proxy witness anywhere**. Sub-phase 75.1 inverted those assertions; a live
+comment at `crates/envoy-config/src/matcher.rs` records it. This fixture is the
+cross-proxy witness that never existed.
 
 The access-log file on EACH proxy holds EXACTLY ONE byte-identical line:
 
 ```
-STATUS=200 PATH=/x
+STATUS=200 PATH=/absent
 ```
+
+**The distinct paths are load-bearing, and are what the §5.2 state-3 re-entry added
+(review finding I-1).** This driver asserts only (a) a per-side line COUNT and
+(b) whole-line cross-proxy equality — there is no per-probe assertion and no
+expected-line field. While both probes shared `path: /x` they rendered the
+byte-identical `STATUS=200 PATH=/x`, so the fixture could not attribute the
+surviving line to a probe. MEASURED: a POLARITY-INVERTED engine — the exact
+regression this fixture is named for — left it GREEN while turning SEVEN in-process
+assertions RED, because inversion merely SWAPS which probe is kept and the count
+stays 1. With `PATH=` naming the probe, that mutation now REDs here with
+`envoy="STATUS=200 PATH=/absent" envoy-rust="STATUS=200 PATH=/present"`. `:path` is
+on the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime — unlike the
+gating header `x-a`, which is BOOT-FATAL to echo.
 
 ## The rule
 
@@ -101,7 +119,7 @@ byte compare is reached.
 |---|---|---|---|
 | `admin` | present (port 0) | absent | envoy-rust has no admin server in this fixture |
 | listener bind | `0.0.0.0` | `127.0.0.1` | envoy-rust binds loopback in-harness |
-| `generate_request_id` | `false` | omitted | upstream defaults it on; envoy-rust does not emit request-ids here |
+| `generate_request_id` | `false` | omitted | envoy-rust's `HttpConnectionManagerConfig` is `#[serde(deny_unknown_fields)]` and has NO such field, so writing it on the rust side would be BOOT-FATAL — it is omitted because it is unsupported, not because it is inert. Upstream defaults it ON, hence the explicit `false` there |
 | access-log path | `/tmp/0085-envoy-mount/access.log` | `/tmp/0085-envoy-rust-mount/access.log` | per-side mount dirs |
 
 `codec_type: HTTP1` is written on **BOTH** sides and is **NOT** a divergence:
@@ -164,4 +182,8 @@ the route table are byte-identical between the two sides.
   and `invert_match_inverts_present_match_result`, and cross-proxy on the route path
   by `0083`. It is documented as §D of the `BEHAVIOR_CONTRACT.md` Phase 75 block.
 
-The three carry-forwards are BANKED in `BEHAVIOR_CONTRACT.md`, not fixed here.
+**CF-72-2 and CF-75-1 are BANKED in `BEHAVIOR_CONTRACT.md`** (the phase-72 `§D` and
+`§G` records), not fixed here. **CF-75-2 is NOT in that file at all** — it is an open
+carry-forward recorded in `docs/envoy-rust/STATE.md` and it needs its own measured
+phase, because it spans all SIX value modes across all FIVE `HeaderMatcher`
+consumers. It is not a regression: the PRESENCE axis this fixture pins is parity.

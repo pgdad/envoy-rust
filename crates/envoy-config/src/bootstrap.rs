@@ -2981,8 +2981,16 @@ pub enum StringMatcherMode {
     SafeRegex(SafeRegex),
     /// `contains: <string>` — substring match. Only reachable through
     /// HeaderMatcherMode::StringMatch(StringMatcher::Contains(...)); there is
-    /// no top-level HeaderMatcherMode::ContainsMatch (Envoy v1.33.0 only
-    /// supports Contains via the modern string_match field; SPEC §6 signpost 8).
+    /// no top-level HeaderMatcherMode::ContainsMatch.
+    ///
+    /// CORRECTED at sub-phase 75.2 (the §5.2 state-3 re-entry, review finding
+    /// I-3). This comment previously read "Envoy v1.33.0 only supports Contains
+    /// via the modern string_match field", which phase 75 MEASURED to be false:
+    /// upstream v1.33.0 DOES accept a top-level `contains_match`, with a
+    /// deprecation warning. Admitting `contains` only through `StringMatcher` is
+    /// therefore a deliberate ADR-0049 fail-loud choice here, NOT an upstream
+    /// limitation — it is the third member of carry-forward CF-72-2, recorded in
+    /// `BEHAVIOR_CONTRACT.md` as the phase-72 §D block. (SPEC §6 signpost 8.)
     Contains(String),
 }
 
@@ -3155,7 +3163,10 @@ pub enum HeaderMatcherMode {
     /// divergence D2. An EMPTY header VALUE counts as PRESENT.
     PresentMatch(bool),
     /// `string_match: <StringMatcher>` — Envoy's modern generic tagged-union
-    /// (the only path to Contains; SPEC §6 signpost 8).
+    /// (the only IN-TREE path to Contains — deliberately, per ADR-0049; upstream
+    /// v1.33.0 also accepts a deprecated top-level `contains_match`, which is the
+    /// third member of CF-72-2. See `StringMatcherMode::Contains` above;
+    /// SPEC §6 signpost 8).
     StringMatch(StringMatcher),
 }
 

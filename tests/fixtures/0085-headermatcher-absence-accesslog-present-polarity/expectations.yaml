@@ -4,6 +4,19 @@ driver:
     envoy: /tmp/0085-envoy-mount/access.log
     envoy_rust: /tmp/0085-envoy-rust-mount/access.log
   probes:
+    # EVERY PROBE CARRIES A DISTINCT `path:`, AND THAT IS LOAD-BEARING (review
+    # finding I-1, closed at the §5.2 state-3 re-entry). The format renders
+    # `PATH=%REQ(:PATH)%`, so the kept line NAMES the probe that produced it. With
+    # a shared `path: /x` every probe rendered the byte-identical
+    # `STATUS=200 PATH=/x`, and this driver asserts only (a) a per-side line COUNT
+    # and (b) whole-line cross-proxy equality — so it could not attribute the
+    # surviving line to a probe, and a POLARITY-INVERTED engine (which merely
+    # SWAPS which probe is kept) passed GREEN while turning SEVEN in-process
+    # assertions RED. Distinct paths make that mutation RED here. `:path` is on
+    # the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime — unlike
+    # the gating header `x-a`, which is BOOT-FATAL to echo. Do NOT collapse these
+    # paths back to a common value, and keep the routes at `prefix: "/"`.
+    #
     # Probe 1 — DROPPED, and FIRST. THE LOAD-BEARING PROBE (divergence D2).
     # `x-a: v` is PRESENT, and `present_match: false` requires the header to be
     # ABSENT: `(present == want)` = `(true == false)` = false. BOTH proxies emit
@@ -15,7 +28,7 @@ driver:
     # `PresentMatch(false)`, so envoy-rust would write TWO lines here against
     # upstream's ONE and this fixture would fail its line-count assertion.
     - method: get
-      path: /x
+      path: /present
       host: envoy-rust.test
       extra_headers:
         - ["x-a", "v"]
@@ -24,14 +37,14 @@ driver:
     # Probe 2 — KEPT, and LAST. NO `x-a` header at all:
     # `(present == want)` = `(false == false)` = true → the record IS emitted.
     # Expected line (byte-identical on both sides):
-    #   STATUS=200 PATH=/x
+    #   STATUS=200 PATH=/absent
     #
     # The LAST probe is KEPT, therefore the driver's ordering-aware
     # `suppression_settle` charges the cheap 2 s CF70_3_SETTLE rather than the
     # 12 s CF71_1_SETTLE. It inspects ONLY `probes.last()`, so it is the identity
     # of the LAST probe that decides the settle.
     - method: get
-      path: /x
+      path: /absent
       host: envoy-rust.test
       expected_status: 200
       expect_logged: true
@@ -41,5 +54,8 @@ driver:
   # byte-identical between upstream Envoy v1.33.0 and envoy-rust. Both proxies
   # must agree on the kept header-absent line AND on the ABSENCE of any line for
   # the header-present probe. The measured line is:
-  #   STATUS=200 PATH=/x
+  #   STATUS=200 PATH=/absent
+  # Because that line NAMES probe 2, an engine that swapped which probe is kept
+  # would render `STATUS=200 PATH=/present` on the envoy-rust side, still ONE
+  # line, and FAIL the byte compare — the class the shared `/x` used to mask.
   # The only route is a direct_response → `clusters: []`, no backend spawns.

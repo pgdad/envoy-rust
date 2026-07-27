@@ -15,13 +15,14 @@ the ROUTE-path witness of the same rule is `0083-headermatcher-absence-parity`.
 
 One H1 HCM listener, ONE `FileAccessLog` sink gated by
 `header_filter: { header: { name: x-a, exact_match: "v", invert_match: true } }`,
-and ONE `direct_response` route (`/x` → 200 `hi`). Three probes:
+and ONE `direct_response` route (`prefix: "/"` → 200 `hi`). Three probes, **each on
+its own path**:
 
 | # | request | matcher verdict | emitted? |
 |---|---|---|---|
-| 1 | `GET /x`, **no** `x-a` | `(ExactMatch, None)` short-circuits to `false`; `invert_match` NOT applied | **DROPPED** |
-| 2 | `GET /x`, `x-a: v` | `"v" == "v"` → `true`; `true ^ true` → `false` | **DROPPED** |
-| 3 | `GET /x`, `x-a: zzz` | `"zzz" == "v"` → `false`; `false ^ true` → `true` | **KEPT** |
+| 1 | `GET /absent`, **no** `x-a` | `(ExactMatch, None)` short-circuits to `false`; `invert_match` NOT applied | **DROPPED** |
+| 2 | `GET /valmatch`, `x-a: v` | `"v" == "v"` → `true`; `true ^ true` → `false` | **DROPPED** |
+| 3 | `GET /valmiss`, `x-a: zzz` | `"zzz" == "v"` → `false`; `false ^ true` → `true` | **KEPT** |
 
 Probe 1 is the load-bearing one: it is **the D1 cell**, the cell sub-phase 75.1
 changed. A pre-75.1 tree computed `mode_result(false) ^ invert_match(true)` = KEEP
@@ -31,11 +32,27 @@ assertion — which is exactly why 75.2 was gated behind 75.1.
 The access-log file on EACH proxy holds EXACTLY ONE byte-identical line:
 
 ```
-STATUS=200 PATH=/x
+STATUS=200 PATH=/valmiss
 ```
 
-Probe 2 is the control that proves the matcher is live at all, so probe 1's
-silence is attributable to the ABSENCE rule and not to a dead filter.
+**The distinct paths are load-bearing, and are what the §5.2 state-3 re-entry added
+(review finding I-1).** This driver asserts only (a) a per-side line COUNT and
+(b) whole-line cross-proxy equality — there is no per-probe assertion and no
+expected-line field. While all three probes shared `path: /x` every probe rendered
+the byte-identical `STATUS=200 PATH=/x`, so the fixture could not attribute the
+surviving line to a probe, and any regression that MOVED the keep between probes
+passed GREEN. MEASURED: an engine with the `invert_match` XOR removed left this
+fixture GREEN while turning FOUR in-process assertions RED. With `PATH=` naming the
+probe, that same mutation now REDs here with
+`envoy="STATUS=200 PATH=/valmiss" envoy-rust="STATUS=200 PATH=/valmatch"`.
+`:path` is on the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime —
+unlike the gating header `x-a`, which is BOOT-FATAL to echo.
+
+Probe 2 covers the value-MATCH half of the XOR, so together with probe 3 the
+fixture pins both polarities of `invert_match` on a PRESENT header. It is NOT what
+makes probe 1's silence attributable: the line COUNT alone already does that (an
+always-log filter yields 3 lines, an always-drop 0), and the distinct paths now
+attribute the kept line directly.
 
 ## The rule
 
@@ -88,7 +105,7 @@ byte compare is reached.
 |---|---|---|---|
 | `admin` | present (port 0) | absent | envoy-rust has no admin server in this fixture |
 | listener bind | `0.0.0.0` | `127.0.0.1` | envoy-rust binds loopback in-harness |
-| `generate_request_id` | `false` | omitted | upstream defaults it on; envoy-rust does not emit request-ids here |
+| `generate_request_id` | `false` | omitted | envoy-rust's `HttpConnectionManagerConfig` is `#[serde(deny_unknown_fields)]` and has NO such field, so writing it on the rust side would be BOOT-FATAL — it is omitted because it is unsupported, not because it is inert. Upstream defaults it ON, hence the explicit `false` there |
 | access-log path | `/tmp/0084-envoy-mount/access.log` | `/tmp/0084-envoy-rust-mount/access.log` | per-side mount dirs |
 
 `codec_type: HTTP1` is written on **BOTH** sides and is **NOT** a divergence:
@@ -136,4 +153,8 @@ the route table are byte-identical between the two sides.
 - **CF-75-2** — upstream comma-joins duplicate header values before value matching;
   envoy-rust matches only the FIRST occurrence.
 
-All three are BANKED in `BEHAVIOR_CONTRACT.md`, not fixed here.
+**CF-72-2 and CF-75-1 are BANKED in `BEHAVIOR_CONTRACT.md`** (the phase-72 `§D` and
+`§G` records), not fixed here. **CF-75-2 is NOT in that file at all** — it is an open
+carry-forward recorded in `docs/envoy-rust/STATE.md` and it needs its own measured
+phase, because it spans all SIX value modes across all FIVE `HeaderMatcher`
+consumers. It is not a regression: the PRESENCE axis this fixture pins is parity.

@@ -14,26 +14,37 @@
 //! Shape: one H1 HCM listener; ONE `FileAccessLog` sink with
 //! `text_format_source` `STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%`, gated by
 //! `header_filter { header: { name: x-a, present_match: false } }` — a plain,
-//! NON-inverted, single-line matcher; ONE `direct_response` route `/x` → 200
-//! `hi`; `clusters: []`, no backend spawns.
+//! NON-inverted, single-line matcher; ONE `direct_response` route `prefix: "/"` →
+//! 200 `hi`; `clusters: []`, no backend spawns.
 //!
 //! THE MEASURED RULE (landed by sub-phase 75.1): upstream `present_match: false`
 //! means **the header must be ABSENT** — `(present == want) ^ invert_match`.
 //! Before 75.1 the in-tree engine modelled this arm as UNCONDITIONALLY TRUE, so
 //! the matcher silently matched every request here and only header-absent
 //! requests upstream. **D2 is strictly worse than D1** because it needs no
-//! `invert_match` to fire, and before phase 75 it had NO behavioral test anywhere
-//! in the tree.
+//! `invert_match` to fire. Before phase 75 the only in-tree tests of this cell
+//! ASSERTED the divergence — `present_match_false_returns_true_when_present` and
+//! `present_match_false_returns_true_when_absent` pinned the unconditional `true`
+//! — and there was NO cross-proxy witness anywhere. This fixture is that witness.
 //!
-//! Two probes, ordered so the LAST is KEPT (ADR-0147):
-//! (1) `GET /x` with `x-a: v` → **DROPPED — the D2 cell.** `(true == false)` is
-//!     false. A pre-75.1 tree KEPT it, writing TWO lines against upstream's ONE.
-//! (2) `GET /x` with NO `x-a` → KEPT. `(false == false)` is true.
+//! Two probes, ordered so the LAST is KEPT (ADR-0147), **each on its own path**:
+//! (1) `GET /present` with `x-a: v` → **DROPPED — the D2 cell.** `(true == false)`
+//!     is false. A pre-75.1 tree KEPT it, writing TWO lines against upstream's ONE.
+//! (2) `GET /absent` with NO `x-a` → KEPT. `(false == false)` is true.
 //!
 //! Each side's file holds EXACTLY ONE line, byte-identical ACROSS THE TWO
-//! PROXIES: `STATUS=200 PATH=/x`. Because the LAST probe is KEPT, the driver's
+//! PROXIES: `STATUS=200 PATH=/absent`. Because the LAST probe is KEPT, the driver's
 //! ordering-aware `suppression_settle` charges the cheap 2 s `CF70_3_SETTLE`
 //! instead of the 12 s `CF71_1_SETTLE` (it inspects only `probes.last()`).
+//!
+//! THE DISTINCT PATHS ARE LOAD-BEARING (review finding I-1, closed at the §5.2
+//! state-3 re-entry). This driver asserts only a per-side line COUNT plus
+//! whole-line cross-proxy equality — no per-probe assertion, no expected-line
+//! field. While both probes shared `path: /x` they rendered the byte-identical
+//! `STATUS=200 PATH=/x`, so a POLARITY-INVERTED engine — the exact regression this
+//! fixture is named for — left it GREEN (MEASURED; SEVEN in-process assertions RED)
+//! because inversion merely SWAPS which probe is kept and the count stays 1. With
+//! `PATH=` naming the probe that mutation now REDs here. Do NOT collapse the paths.
 //!
 //! CONFLATION TRAP — `HeaderMatcher.present_match` (this fixture) and
 //! `ValueMatcher.present_match` (RBAC / access-log METADATA, fixture 0044) are
