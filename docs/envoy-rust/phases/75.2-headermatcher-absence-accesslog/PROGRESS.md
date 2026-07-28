@@ -4007,3 +4007,77 @@ explicitly rather than covered by a blanket claim that would have been false.
 SEPARATE session. It grades the fixtures, the corrected documents and this gate, and
 produces a fresh verdict. Only an APPROVED verdict closes gate (f); only then does
 the state-6 close-out flip ROADMAP row `75.2` **and** parent row `75` to `done`.
+
+## POST-COMMIT ADDENDUM — CI on this gate's own commit went RED once, then GREEN on rerun
+
+Appended after the gate commit `c02f31b3f57de907c3171e97eea3522bbeb9385f` was
+pushed, because the CI confirmation is part of the state-4 session's own record and
+a future session inspecting run `30362142044` would otherwise see a bare failure.
+
+**First attempt: `failure`.** Job `build + test + lint` at FULL step count **15**
+(so NOT the runner-starvation signature, which is `steps: 0` + `runner_name: ""`).
+Exactly ONE test failed, and it is **not** in the differential crate:
+
+```
+---- lds_route_to_unknown_cluster_is_fatal stdout ----
+thread 'lds_route_to_unknown_cluster_is_fatal' (22119) panicked at crates/envoy-bin/tests/xds_file_based_lds.rs:417:5:
+(iv) LDS route to unknown cluster: listener port 127.0.0.1:43093 must NEVER accept a connection on fatal startup
+
+failures:
+    lds_route_to_unknown_cluster_is_fatal
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+error: test failed, to rerun pass `-p envoy-bin --test xds_file_based_lds`
+```
+
+**Note the binary lives in `crates/envoy-bin/tests/`, not `tests/differential/tests/`** —
+the two directories share 33 binary NAMES, and the local floating tail's
+`xds_file_based_lds_fixture` is the DIFFERENTIAL one. Different test, different crate.
+
+**Why this cannot be caused by this gate's commit — MEASURED, not argued:**
+
+```
+$ git diff --name-only 0c541d7..c02f31b
+docs/envoy-rust/STATE.md
+docs/envoy-rust/STATE_HISTORY.md
+docs/envoy-rust/phases/75.2-headermatcher-absence-accesslog/PROGRESS.md
+
+$ git diff --stat 0c541d7..c02f31b -- crates/ tests/ .github/ Cargo.toml Cargo.lock deny.toml rust-toolchain.toml
+(no output — BYTE-IDENTICAL)
+```
+
+Three Markdown files; the executable tree is byte-identical to `0c541d7`, on which
+CI ran GREEN (run `30347643044`) and on which **this very test reported
+`test lds_route_to_unknown_cluster_is_fatal ... ok`**.
+
+**The failure mechanism is the documented ephemeral-port-reuse startup race.** The
+assertion at `xds_file_based_lds.rs:417` is `TcpStream::connect(hcm_addr).is_err()` —
+it proves a listener that must die on a fatal LDS load error never accepted. A
+PARALLEL test that binds the same freed ephemeral port makes that connect SUCCEED,
+so the assertion false-fails. Same family as the recorded
+`eds_cluster_with_neither_is_fatal` and `wait_accept_ready_times_out_for_closed_socket`
+flakes: the RED is about port allocation, not about matching semantics.
+
+**Rerun of the SAME SHA → GREEN.** `gh run rerun 30362142044 --failed`:
+
+```
+$ gh run view 30362142044 --json conclusion,headSha
+{"conclusion":"success","headSha":"c02f31b3f57de907c3171e97eea3522bbeb9385f"}
+
+$ gh run view 30362142044 --json jobs
+build + test + lint   success   steps: 15
+fuzz (…5 targets…)    success   steps: 13
+```
+
+**Gate verdict is UNCHANGED: (a)-(e) GREEN, (f) REFUSED.** No test was weakened, no
+fixture edited, no `known-failures.txt` line trimmed, and nothing was re-run locally
+in response — the RED was adjudicated from its failure TEXT and the byte-identical
+executable diff, then confirmed by a same-SHA rerun.
+
+**One thing this incident DEMONSTRATES rather than merely restates — CF-75-3 is
+real.** `ci.yml` runs `cargo test --workspace` with **no `--no-fail-fast`**, so this
+single RED aborted the remainder of the run: on the first attempt the h2spec
+conformance gate's status was **UNKNOWN, not green**. That is exactly the banked
+CF-75-3 gap (ADR-0163), now observed in the wild rather than reasoned about. It is
+**recorded here, NOT fixed** — CF-75-3 owns its own phase and a state-4 session does
+not touch `ci.yml` (§6.3).
