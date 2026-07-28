@@ -2824,26 +2824,55 @@ trait object, injected by `compile_access_log_filter`.
 
 **§D The guard — the rule is MODE-SCOPED and must stay that way.** A naive
 uniform "absent ⇒ DROP" simplification closes the value-matcher case (D1) while
-BREAKING the `present_match: true` + invert + absent PARITY cell (s4 / P1),
-minting a NEW divergence in its place. This is not hypothetical: the exact
+BREAKING **both** absent-header cells that `present_match` owns — the
+`present_match: true` + invert + absent PARITY cell (s4 / P1) and the
+`present_match: false` × absent MATCH cell (s2 / D2, the `0085` witness) — minting
+TWO new divergences in their place. This is not hypothetical: the exact
 mutation — hoisting the `(_, None)` arm to the TOP of the `match` — was applied in
-a scratch worktree at the 75.1 PLAN-write, again at its implementation, and again
-at the 75.2 implementation. MEASURED at 75.2: it turns **FOUR** in-process
-assertions RED (`present_match_false_matches_when_absent`,
+a scratch worktree at the 75.1 PLAN-write, again at its implementation, at the
+75.2 implementation, at the 75.2 §5 state-5 RE-REVIEW, and again at the §5.2
+state-3 re-entry that corrected this paragraph.
+
+**What the hoist actually does — MEASURED, and NOT what this paragraph said until
+the 75.2 §5.2 state-3 re-entry.** It turns **FOUR** in-process assertions RED
+(`present_match_false_matches_when_absent`,
 `invert_match_inverts_present_match_result`,
 `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` and
 `absence_semantics_matrix_matches_measured_upstream` — `649 passed` becomes
-`645 passed; 4 failed`) while leaving every value-mode assertion green **and both
-access-log fixtures `0084`/`0085` GREEN**. That last fact is the point: this arm
-ORDER is guarded ONLY in-process, so the differential fixtures cannot catch a
-regression in it. **Any future refactor of the arm ORDER must preserve it.**
+`645 passed; 4 failed`), leaves every value-mode assertion green, and REDs **two
+of the three** differential fixtures on this surface:
+
+| fixture | under the hoist | why |
+|---|---|---|
+| `0084` (access-log, D1) | **GREEN** | its matcher is `exact_match` + invert — a VALUE mode, whose absent-header verdict the hoist does not change |
+| `0085` (access-log, D2) | **RED** — `fixture green: envoy-rust emitted 0 access-log lines but 1 were expected to be logged; lines: []` | probe 2 (`/absent`, `expect_logged: true`) is the `present_match: false` × ABSENT cell, which must MATCH; the hoist returns `false` for it, so envoy-rust emits zero lines against upstream's one and the COUNT assertion fails |
+| `0083` (ROUTE path, 22 probes) | **RED** — `fixture passes: probe p07-absent-keeps-GUARD` / `byte-exact body mismatch  upstream: "p07=MATCH"  subject: "p07=NOMATCH"` | p07 IS the P1 guard cell. p12 is the same `present_match: false` × absent cell as `0085` probe 2 and fails for the same reason, but the `http1_probe_list` driver aborts at the FIRST failing probe, so a single run witnesses p07 only |
+
+**The coverage conclusion — the reassuring one.** The arm ORDER is guarded
+**in-process AND cross-proxy**: by `0083` p07/p12 and by `0085` probe 2. The one
+fixture on this surface that CANNOT catch it is `0084`. A future refactorer who
+hoists this arm will see a RED differential sweep, not a green one; do not dismiss
+a `0083` or `0085` RED as unrelated noise. **Any future refactor of the arm ORDER
+must still preserve it** — the in-process assertions remain the sharpest and
+fastest signal, and they name the broken cell directly.
+
+> **History, so this correction is not silently re-inherited.** Until the 75.2
+> §5.2 state-3 re-entry this paragraph asserted, labelled MEASURED, that the hoist
+> left *"both access-log fixtures `0084`/`0085` GREEN"* and concluded that the arm
+> order was *"guarded ONLY in-process, so the differential fixtures cannot catch a
+> regression in it"* — the OPPOSITE of the truth, and the blocking finding (I-1) of
+> the 75.2 §5 state-5 RE-REVIEW. **ADR-0165** is the correction of record.
+> `DECISIONS.md` ADR-0162 carries the same false sentence and is append-only
+> (D-3.5) — it stands as landed and is corrected FORWARD by ADR-0165, never
+> retro-edited. ADR-0162's substantive point (below) survives intact.
 
 Note the two mutations are DISTINCT and hit different cells — do not substitute
 one for the other when re-testing. Hoisting the arm (keeping `return`) breaks
-**P1** and leaves D1 correct, because `return false` still short-circuits before
-the XOR. Reverting D1 requires letting the absent-header `false` REACH the XOR
+**P1** *and* the `present_match: false` × ABSENT MATCH cell, and leaves D1
+correct, because `return false` still short-circuits before the XOR. Reverting D1
+requires letting the absent-header `false` REACH the XOR
 (`(_, None) => return false` → `(_, None) => false`), which is what makes `0084`
-RED (`envoy_rust=2, envoy=1`). ADR-0162.
+RED (`envoy_rust=2, envoy=1`). ADR-0162, as corrected by ADR-0165.
 
 **§E TRAP A — two DIFFERENT `present_match` fields; do NOT unify them.**
 `HeaderMatcher.present_match` (this block) and `ValueMatcher.present_match` (the
@@ -2896,8 +2925,25 @@ that way at the sub-phase-75.2 state-5 review: a polarity-inverted engine left
 `0085` GREEN (7 in-process assertions RED) and an engine with the `invert_match`
 XOR removed left `0084` GREEN (4 RED). Distinct paths plus a `prefix: "/"` route
 make `%REQ(:PATH)%` name the surviving probe, and both mutations now RED. `:path`
-is on the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime. **Apply
-the same discipline to any future `http1_access_log_byte_exact` fixture.**
+is on the seven-name `REQ_ALLOW_LIST`, so this costs nothing at runtime.
+
+**The rule binds EVERY `http1_access_log_byte_exact` fixture, existing ones
+included — it is not a "future fixtures only" waiver.** Measured census of the
+whole family at the 75.2 §5 state-5 RE-REVIEW (probe paths against the rendered
+format): `0076` (`/log`, `/nolog`) and `0077` (`/direct`, `/nowhere`) discriminate
+by path; `0081`, `0082` and `0040` share a path but carry a SECOND discriminator in
+the format (`M=%DYNAMIC_METADATA(com.example:k)%` rendering `-`/`1`/`2`;
+`ua=`/`xff=` differing per probe) and are NOT blind; `0084`/`0085` were fixed at
+the 75.2 §5.2 state-3 re-entry. **`0078`, `0079` and `0080` are still BLIND** —
+every probe shares `path: /x` under a `STATUS=… PATH=…` format with no second
+discriminator, so a regression that MOVES the keep between probes preserves the
+line count and passes GREEN. All three exercise `header_filter` (`0078` directly,
+`0079`/`0080` as leaves inside `and_filter` / `or_filter` composition arms), i.e.
+all three sit on the very engine `0084`/`0085` exist to protect, and `0078` is the
+stencil `0084` was copied from. Nothing sub-phase 75.2 shipped is wrong there, so
+remediation is banked as carry-forward **CF-75-4** (ADR-0165) rather than crammed
+into 75.2 (§6.3); the fix is the same ~6 lines each, and the owner is whoever next
+touches the access-log fixture family.
 
 **§H TWO fixtures, not one — a driver constraint, not a preference.** The
 byte-exact access-log driver takes exactly ONE log file per side: `AccessLogPaths`
