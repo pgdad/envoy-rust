@@ -10877,9 +10877,14 @@ typed_per_filter_config:
         let route = &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0];
 
         let ser = serde_yaml::to_string(route).expect("Route serializes");
+        // Anchor the key to column 0. A bare `ser.contains("redirect:")` is
+        // VACUOUS here: the FIELD name `port_redirect:` contains the substring
+        // `redirect:`, so a mis-keyed arm would still satisfy it. MEASURED — a
+        // mutation serializing this action under the `route` key passed a
+        // `contains` assertion while emitting `route:\n  port_redirect: 70000`.
         assert!(
-            ser.contains("redirect:"),
-            "Route::serialize must emit the `redirect` key; got:\n{ser}"
+            ser.lines().any(|l| l.starts_with("redirect:")),
+            "Route::serialize must emit the `redirect` key at the top level; got:\n{ser}"
         );
         let back: Route = serde_yaml::from_str(&ser).expect("re-parses");
         assert_eq!(&back, route, "Route round-trip must be lossless");
@@ -10894,9 +10899,12 @@ typed_per_filter_config:
         let b = crate::parse_bootstrap(&yaml).expect("parses");
         let action = first_route_action(&b);
         let ser = serde_yaml::to_string(action).expect("RouteAction serializes");
+        // Anchor the key to column 0 — see the note in the T-C7 sibling above.
+        // This is the assertion that distinguishes the two Serialize impls: a
+        // mutation mis-keying THIS impl must RED here while T-C7 stays GREEN.
         assert!(
-            ser.contains("redirect:"),
-            "RouteAction::serialize must emit the `redirect` key; got:\n{ser}"
+            ser.lines().any(|l| l.starts_with("redirect:")),
+            "RouteAction::serialize must emit the `redirect` key at the top level; got:\n{ser}"
         );
         assert!(
             ser.contains("70000"),
