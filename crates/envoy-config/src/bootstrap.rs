@@ -2174,6 +2174,38 @@ pub struct Route {
 /// `impl<'de> Deserialize` for `Route` (below) detects which peer key is
 /// present and constructs the matching variant; both-present and
 /// neither-present are errors.
+/// 76.1 (§4.1): `RedirectAction.RedirectResponseCode` — the five wire values of
+/// Envoy v1.33's `envoy.config.route.v3.RedirectAction.RedirectResponseCode`.
+/// Deserialized as a plain unit enum so that an unknown NAME (`BOGUS`) and a
+/// NUMERIC literal (`response_code: 302`) both fail at serde parse, matching the
+/// two MEASURED upstream rejections J6 and J7. Default = `MovedPermanently`
+/// (301), the Envoy proto default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RedirectResponseCode {
+    #[default]
+    MovedPermanently,
+    Found,
+    SeeOther,
+    TemporaryRedirect,
+    PermanentRedirect,
+}
+
+impl RedirectResponseCode {
+    /// The HTTP status code this redirect response carries on the wire.
+    /// MEASURED against `envoyproxy/envoy:v1.33.0`. Consumed by 76.2 (the
+    /// runtime slice); 76.1 only round-trips the enum.
+    pub fn status(self) -> u16 {
+        match self {
+            RedirectResponseCode::MovedPermanently => 301,
+            RedirectResponseCode::Found => 302,
+            RedirectResponseCode::SeeOther => 303,
+            RedirectResponseCode::TemporaryRedirect => 307,
+            RedirectResponseCode::PermanentRedirect => 308,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {
     /// Direct-response action — write a static body downstream. Phase 04.1 carryover.
@@ -10279,6 +10311,71 @@ static_resources:
             other => panic!("expected HCM typed_config, got {other:?}"),
         };
         &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0].action
+    }
+
+    // --- 76.1 Task 1: RedirectResponseCode (SPEC §4.1) ---
+
+    /// T-A7: each of the five upstream wire names parses to its variant.
+    #[test]
+    fn redirect_response_code_parses_all_five_wire_names() {
+        let cases = [
+            ("MOVED_PERMANENTLY", RedirectResponseCode::MovedPermanently),
+            ("FOUND", RedirectResponseCode::Found),
+            ("SEE_OTHER", RedirectResponseCode::SeeOther),
+            (
+                "TEMPORARY_REDIRECT",
+                RedirectResponseCode::TemporaryRedirect,
+            ),
+            (
+                "PERMANENT_REDIRECT",
+                RedirectResponseCode::PermanentRedirect,
+            ),
+        ];
+        for (wire, want) in cases {
+            let got: RedirectResponseCode =
+                serde_yaml::from_str(wire).unwrap_or_else(|e| panic!("{wire} must parse: {e}"));
+            assert_eq!(got, want, "{wire} must map to {want:?}");
+        }
+    }
+
+    /// The Envoy proto default is MOVED_PERMANENTLY (301).
+    #[test]
+    fn redirect_response_code_defaults_to_moved_permanently() {
+        assert_eq!(
+            RedirectResponseCode::default(),
+            RedirectResponseCode::MovedPermanently
+        );
+    }
+
+    /// The `-> u16` mapping. MEASURED against envoyproxy/envoy:v1.33.0.
+    /// 76.1 only round-trips the enum; 76.2 wires this to the response.
+    #[test]
+    fn redirect_response_code_maps_to_status() {
+        assert_eq!(RedirectResponseCode::MovedPermanently.status(), 301);
+        assert_eq!(RedirectResponseCode::Found.status(), 302);
+        assert_eq!(RedirectResponseCode::SeeOther.status(), 303);
+        assert_eq!(RedirectResponseCode::TemporaryRedirect.status(), 307);
+        assert_eq!(RedirectResponseCode::PermanentRedirect.status(), 308);
+    }
+
+    /// T-R6 (J6) at the enum level: an unknown NAME must not deserialize.
+    #[test]
+    fn redirect_response_code_rejects_unknown_name() {
+        let err = serde_yaml::from_str::<RedirectResponseCode>("BOGUS")
+            .expect_err("unknown enum name must reject");
+        assert!(
+            err.to_string().contains("BOGUS"),
+            "error should name the offending value; got: {err}"
+        );
+    }
+
+    /// T-R7 (J7) at the enum level: a NUMERIC literal must not deserialize.
+    /// Upstream rejects `response_code: 302` via PGV `defined_only`; envoy-rust
+    /// rejects it because a unit enum will not accept an integer.
+    #[test]
+    fn redirect_response_code_rejects_numeric_literal() {
+        serde_yaml::from_str::<RedirectResponseCode>("302")
+            .expect_err("a numeric response_code must reject");
     }
 
     #[test]
