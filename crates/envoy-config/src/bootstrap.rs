@@ -2501,7 +2501,7 @@ impl<'de> serde::Deserialize<'de> for Route {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    "a Route map with `match` and exactly one of `direct_response` or `route`",
+                    "a Route map with `match` and exactly one of `direct_response`, `route` or `redirect`",
                 )
             }
 
@@ -2516,6 +2516,7 @@ impl<'de> serde::Deserialize<'de> for Route {
                 let mut typed_per_filter_config: Option<
                     std::collections::BTreeMap<String, PerFilterConfig>,
                 > = None;
+                let mut redirect: Option<RedirectAction> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -2554,6 +2555,12 @@ impl<'de> serde::Deserialize<'de> for Route {
                                 >>()?,
                             );
                         }
+                        "redirect" => {
+                            if redirect.is_some() {
+                                return Err(M::Error::duplicate_field("redirect"));
+                            }
+                            redirect = Some(map.next_value::<RedirectAction>()?);
+                        }
                         other => {
                             return Err(M::Error::unknown_field(
                                 other,
@@ -2562,6 +2569,7 @@ impl<'de> serde::Deserialize<'de> for Route {
                                     "match",
                                     "direct_response",
                                     "route",
+                                    "redirect",
                                     "typed_per_filter_config",
                                 ],
                             ));
@@ -2570,21 +2578,22 @@ impl<'de> serde::Deserialize<'de> for Route {
                 }
 
                 let r#match = r#match.ok_or_else(|| M::Error::missing_field("match"))?;
-                let action = match (direct_response, route_action) {
-                    (Some(_), Some(_)) => {
+                let action = match (direct_response, route_action, redirect) {
+                    (Some(dr), None, None) => RouteAction::DirectResponse(dr),
+                    (None, Some(ar), None) => RouteAction::Route(ar),
+                    (None, None, Some(rd)) => RouteAction::Redirect(rd),
+                    (None, None, None) => {
                         return Err(M::Error::custom(
-                            "Route must carry exactly one of `direct_response` or `route`; \
-                             both are present",
+                            "Route must carry exactly one of `direct_response`, `route` or \
+                             `redirect`; neither is present",
                         ));
                     }
-                    (None, None) => {
+                    _ => {
                         return Err(M::Error::custom(
-                            "Route must carry exactly one of `direct_response` or `route`; \
-                             neither is present",
+                            "Route must carry exactly one of `direct_response`, `route` or \
+                             `redirect`; more than one is present",
                         ));
                     }
-                    (Some(dr), None) => RouteAction::DirectResponse(dr),
-                    (None, Some(ar)) => RouteAction::Route(ar),
                 };
 
                 Ok(Route {
@@ -10513,6 +10522,156 @@ static_resources:
         assert!(
             msg.contains("unknown field") && msg.contains("regex_rewrite"),
             "error must name the unknown field; got: {msg}"
+        );
+    }
+
+    // --- 76.1 Task 4: the Route visitor's `redirect` key + three-way cardinality ---
+
+    /// Build a bootstrap whose single route carries the given action block.
+    /// Reuses the landed 04.3 helpers `route_action_yaml` / `NO_CLUSTERS`.
+    fn redirect_route_yaml(action_block: &str) -> String {
+        route_action_yaml(
+            &format!("- match: {{ prefix: \"/t\" }}\n                          {action_block}"),
+            NO_CLUSTERS,
+        )
+    }
+
+    /// A `redirect:` route now parses end-to-end and lands as the third variant.
+    #[test]
+    fn parses_route_with_redirect_action() {
+        let yaml = redirect_route_yaml("redirect: { host_redirect: example.com }");
+        let b = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        match first_route_action(&b) {
+            RouteAction::Redirect(rd) => {
+                assert_eq!(rd.host_redirect.as_deref(), Some("example.com"));
+            }
+            other => panic!("expected Redirect(_), got {other:?}"),
+        }
+    }
+
+    /// T-R3 (J3): `redirect` + `route` on one Route → reject.
+    #[test]
+    fn rejects_route_with_both_redirect_and_route() {
+        let yaml = redirect_route_yaml(
+            "redirect: { host_redirect: example.com }\n                          route: { cluster: backend }",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("redirect + route must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("exactly one"), "got: {msg}");
+        assert!(msg.contains("redirect"), "got: {msg}");
+    }
+
+    /// T-R4 (J4): `redirect` + `direct_response` on one Route → reject.
+    #[test]
+    fn rejects_route_with_both_redirect_and_direct_response() {
+        let yaml = redirect_route_yaml(
+            "redirect: { host_redirect: example.com }\n                          direct_response: { status: 200, body: { inline_string: \"ok\" } }",
+        );
+        let err =
+            crate::parse_bootstrap(&yaml).expect_err("redirect + direct_response must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("exactly one"), "got: {msg}");
+        assert!(msg.contains("redirect"), "got: {msg}");
+    }
+
+    /// T-R10: a Route with NO action at all → reject, three-way message.
+    #[test]
+    fn rejects_route_with_no_action_names_all_three_arms() {
+        let yaml = route_action_yaml(r#"- match: { prefix: "/t" }"#, NO_CLUSTERS);
+        let err = crate::parse_bootstrap(&yaml).expect_err("no action must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("direct_response"), "got: {msg}");
+        assert!(msg.contains("route"), "got: {msg}");
+        assert!(
+            msg.contains("redirect"),
+            "the three-way message must name `redirect` too; got: {msg}"
+        );
+    }
+
+    /// T-C6: an unknown Route key still rejects, and the error now names all SIX
+    /// accepted keys (the five 04.x keys plus `redirect`).
+    #[test]
+    fn unknown_route_key_error_names_all_six_accepted_keys() {
+        let yaml = redirect_route_yaml(
+            "redirect: { host_redirect: example.com }\n                          bogus_key: surprise",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("unknown Route key must reject");
+        let msg = err.to_string();
+        for expected in [
+            "name",
+            "match",
+            "direct_response",
+            "route",
+            "redirect",
+            "typed_per_filter_config",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "unknown-field error must list `{expected}`; got: {msg}"
+            );
+        }
+    }
+
+    /// A duplicate `redirect:` key rejects, same as its four peers.
+    #[test]
+    fn rejects_route_with_duplicate_redirect_key() {
+        let yaml = redirect_route_yaml(
+            "redirect: { host_redirect: a.example }\n                          redirect: { host_redirect: b.example }",
+        );
+        crate::parse_bootstrap(&yaml).expect_err("duplicate redirect key must reject");
+    }
+
+    /// T-C1..T-C5: the five pre-existing Route keys still parse after the visitor
+    /// was widened. `name` / `match` / `direct_response` / `typed_per_filter_config`
+    /// in one route, and `route` in another (they are mutually exclusive).
+    #[test]
+    fn all_five_preexisting_route_keys_still_parse() {
+        let dr = route_action_yaml(
+            r#"- name: r1
+                          match: { prefix: "/a" }
+                          direct_response: { status: 204, body: { inline_string: "" } }"#,
+            NO_CLUSTERS,
+        );
+        let b = crate::parse_bootstrap(&dr).expect("name+match+direct_response parses");
+        assert!(matches!(
+            first_route_action(&b),
+            RouteAction::DirectResponse(_)
+        ));
+
+        let rt = route_action_yaml(
+            r#"- name: r2
+                          match: { path: "/b" }
+                          route: { cluster: backend }"#,
+            BACKEND_CLUSTER,
+        );
+        let b = crate::parse_bootstrap(&rt).expect("name+match+route parses");
+        assert!(matches!(first_route_action(&b), RouteAction::Route(_)));
+
+        // T-C5 proper: the FIFTH key, `typed_per_filter_config`, asserted at Route
+        // level rather than through `parse_bootstrap`. It cannot ride the
+        // `route_action_yaml` scaffold because the 23 D3 validator rejects any
+        // per-filter key absent from the HCM's `http_filters` set, and that
+        // scaffold declares only the router. Deserializing `Route` directly
+        // exercises the widened visitor's key arm, which is what this pins.
+        let route: Route = serde_yaml::from_str(
+            r#"
+name: r3
+match: { prefix: "/c" }
+route: { cluster: backend }
+typed_per_filter_config:
+  envoy.filters.http.cors:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+    allow_origin_string_match:
+      - exact: "http://allowed.example.com"
+"#,
+        )
+        .expect("name+match+route+typed_per_filter_config parses");
+        assert_eq!(route.name, "r3");
+        assert!(
+            route
+                .typed_per_filter_config
+                .contains_key("envoy.filters.http.cors"),
+            "the fifth Route key must still be accepted by the widened visitor"
         );
     }
 
