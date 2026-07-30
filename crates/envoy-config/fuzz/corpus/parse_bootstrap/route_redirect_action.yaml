@@ -1,0 +1,37 @@
+node:
+  id: envoy-rust-fuzz-seed
+  cluster: envoy-rust-fuzz-seed
+
+static_resources:
+  listeners:
+    - name: redirect_listener
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/scheme" }
+                          redirect: { https_redirect: true }
+                        - match: { prefix: "/host" }
+                          redirect: { host_redirect: example.com, port_redirect: 8443 }
+                        - match: { prefix: "/path" }
+                          redirect: { path_redirect: "/new", response_code: FOUND }
+                        - match: { prefix: "/prefix" }
+                          redirect: { prefix_rewrite: "/v2", strip_query: true }
+                        - match: { prefix: "/perm" }
+                          redirect: { scheme_redirect: ftp, response_code: PERMANENT_REDIRECT }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []

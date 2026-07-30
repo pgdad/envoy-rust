@@ -8352,6 +8352,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/cluster_maglev_lb.yaml",     // 29 Task 8
             "fuzz/corpus/parse_bootstrap/cluster_lb_subset.yaml",     // 30 Task 9
             "fuzz/corpus/parse_bootstrap/http_filter_cdn_loop.yaml",  // 31 Task 6
+            "fuzz/corpus/parse_bootstrap/route_redirect_action.yaml", // 76.1 Task 7
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
@@ -10910,6 +10911,19 @@ typed_per_filter_config:
             ser.contains("70000"),
             "port_redirect must survive serialization verbatim; got:\n{ser}"
         );
+    }
+
+    /// 76.1 Task 7: the fuzz corpus seed must be a VALID bootstrap, so the
+    /// `parse_bootstrap` fuzz target starts from a reachable state rather than
+    /// from a document that dies in the YAML scanner.
+    #[test]
+    fn redirect_fuzz_corpus_seed_parses() {
+        let seed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fuzz/corpus/parse_bootstrap/route_redirect_action.yaml"
+        ))
+        .expect("the 76.1 corpus seed must exist and be readable");
+        crate::parse_bootstrap(&seed).expect("the corpus seed must parse and validate");
     }
 
     #[test]
