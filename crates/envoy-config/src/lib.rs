@@ -988,6 +988,26 @@ pub enum ConfigError {
     /// matches (ADR-0049). `listener` names the offending HCM; `detail` the specific violation.
     #[error("header_to_metadata filter on listener `{listener}` has an invalid rule: {detail}")]
     HeaderToMetadataInvalidRule { listener: String, detail: String },
+
+    /// Phase 76.1 (§4.3): a `redirect` route action sets BOTH members of the
+    /// `path_rewrite_specifier` oneof (`path_redirect` and `prefix_rewrite`). Envoy rejects this
+    /// boot-fatally, and it does so on FIELD PRESENCE, not on value — `path_redirect: ""` still
+    /// sets the oneof (MEASURED) — so envoy-rust matches on presence (ADR-0049 all-fatal).
+    /// `listener` names the offending HCM; `route` the offending route (empty when unnamed).
+    #[error(
+        "redirect action on listener `{listener}` route `{route}` sets both `path_redirect` and `prefix_rewrite`; they are members of one oneof and are mutually exclusive"
+    )]
+    RedirectPathRewriteConflict { listener: String, route: String },
+
+    /// Phase 76.1 (§4.3): a `redirect` route action sets BOTH members of the
+    /// `scheme_rewrite_specifier` oneof (`https_redirect` and `scheme_redirect`). Presence-based,
+    /// not value-based: `https_redirect: false` plus `scheme_redirect: "ftp"` REJECTS upstream
+    /// while `https_redirect: false` alone ACCEPTS (MEASURED). `listener` names the offending
+    /// HCM; `route` the offending route (empty when unnamed).
+    #[error(
+        "redirect action on listener `{listener}` route `{route}` sets both `https_redirect` and `scheme_redirect`; they are members of one oneof and are mutually exclusive"
+    )]
+    RedirectSchemeRewriteConflict { listener: String, route: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

@@ -4070,11 +4070,21 @@ fn validate_hcm(
                     }
                     validate_data_source(&dr.body, "direct_response.body", Required::InlineString)?;
                 }
-                RouteAction::Redirect(_) => {
-                    // 76.1 Task 3: the variant must be handled for the workspace to
-                    // compile. The two intra-RedirectAction oneof checks land in
-                    // Task 5 — keeping this arm inert here is what makes Task 5's
-                    // reject-direction tests genuinely RED.
+                RouteAction::Redirect(rd) => {
+                    // 76.1 (§4.3): the two intra-RedirectAction oneofs are
+                    // exclusive on FIELD PRESENCE, not on value (MEASURED).
+                    if rd.path_redirect.is_some() && rd.prefix_rewrite.is_some() {
+                        return Err(crate::ConfigError::RedirectPathRewriteConflict {
+                            listener: listener_name.to_string(),
+                            route: r.name.clone(),
+                        });
+                    }
+                    if rd.https_redirect.is_some() && rd.scheme_redirect.is_some() {
+                        return Err(crate::ConfigError::RedirectSchemeRewriteConflict {
+                            listener: listener_name.to_string(),
+                            route: r.name.clone(),
+                        });
+                    }
                 }
                 RouteAction::Route(ar) => {
                     // 04.3 NEW: check the cluster reference against declared clusters.
@@ -10672,6 +10682,84 @@ typed_per_filter_config:
                 .typed_per_filter_config
                 .contains_key("envoy.filters.http.cors"),
             "the fifth Route key must still be accepted by the widened visitor"
+        );
+    }
+
+    // --- 76.1 Task 5: the two intra-RedirectAction oneof validators (SPEC §4.3) ---
+
+    /// T-R1 (J1): `path_redirect` + `prefix_rewrite` → boot-fatal.
+    #[test]
+    fn rejects_redirect_with_both_path_redirect_and_prefix_rewrite() {
+        let yaml =
+            redirect_route_yaml(r#"redirect: { path_redirect: "/p", prefix_rewrite: "/q" }"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("path_rewrite_specifier conflict");
+        assert!(
+            matches!(err, crate::ConfigError::RedirectPathRewriteConflict { .. }),
+            "expected RedirectPathRewriteConflict, got: {err:?}"
+        );
+    }
+
+    /// T-R9 (A7) — THE PRESENCE PIN, path arm. `path_redirect: ""` is EMPTY but
+    /// PRESENT, so upstream still rejects (MEASURED). A validator that tested
+    /// `!s.is_empty()` instead of `.is_some()` would wrongly ACCEPT this.
+    #[test]
+    fn rejects_redirect_with_empty_path_redirect_plus_prefix_rewrite() {
+        let yaml = redirect_route_yaml(r#"redirect: { path_redirect: "", prefix_rewrite: "/q" }"#);
+        let err = crate::parse_bootstrap(&yaml)
+            .expect_err("an EMPTY path_redirect still sets the oneof and must reject");
+        assert!(
+            matches!(err, crate::ConfigError::RedirectPathRewriteConflict { .. }),
+            "expected RedirectPathRewriteConflict, got: {err:?}"
+        );
+    }
+
+    /// T-R5 (J5): `scheme_redirect` + `https_redirect: true` → boot-fatal.
+    #[test]
+    fn rejects_redirect_with_both_scheme_redirect_and_https_redirect() {
+        let yaml =
+            redirect_route_yaml(r#"redirect: { scheme_redirect: "https", https_redirect: true }"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("scheme_rewrite_specifier conflict");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::RedirectSchemeRewriteConflict { .. }
+            ),
+            "expected RedirectSchemeRewriteConflict, got: {err:?}"
+        );
+    }
+
+    /// T-R8 (A5) — THE PRESENCE PIN, scheme arm, and the single most important
+    /// test in this sub-phase. `https_redirect: false` is FALSE but PRESENT, so
+    /// upstream REJECTS (MEASURED), even though `https_redirect: false` ALONE
+    /// ACCEPTS (see the accept-direction suite). **This test is what fails if
+    /// `https_redirect` is ever "simplified" to a bare `bool`** — a bare bool
+    /// cannot distinguish absent from false, so the config would be accepted and
+    /// a brand-new reject-direction divergence would be minted silently.
+    #[test]
+    fn rejects_redirect_with_https_redirect_false_plus_scheme_redirect() {
+        let yaml =
+            redirect_route_yaml(r#"redirect: { https_redirect: false, scheme_redirect: "ftp" }"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err(
+            "https_redirect: false is PRESENT and must reject alongside scheme_redirect",
+        );
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::RedirectSchemeRewriteConflict { .. }
+            ),
+            "expected RedirectSchemeRewriteConflict, got: {err:?}"
+        );
+    }
+
+    /// The conflict error carries the offending listener so an operator can find it.
+    #[test]
+    fn redirect_oneof_conflict_names_the_listener() {
+        let yaml =
+            redirect_route_yaml(r#"redirect: { path_redirect: "/p", prefix_rewrite: "/q" }"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("conflict");
+        assert!(
+            err.to_string().contains("hcm_listener"),
+            "error should name the listener; got: {err}"
         );
     }
 
