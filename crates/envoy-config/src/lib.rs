@@ -30,14 +30,14 @@ pub use bootstrap::{
     LocalityLbEndpoints, MetadataEntry, MetadataFilter, MetadataMatcher, MetadataPathSegment,
     Mutations, NetworkFilter, NetworkRbacConfig, Node, OrFilter, OutlierDetection,
     PathConfigSource, PathMatcher, PayloadDecodeError, PerFilterConfig, Percent, Permission,
-    PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule,
-    ResponseFlagFilter, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
-    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent,
-    RuntimeUInt32, SafeRegex, SetMetadataConfig, SocketAddress, StaticResources, StatusCodeFilter,
-    StringMatcher, StringMatcherMode, SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig,
-    Thresholds, TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig,
-    TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost,
-    parse_duration,
+    PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RedirectAction,
+    RedirectResponseCode, RequirementRule, ResponseFlagFilter, RetryConfig, RetryOn, RetryPolicy,
+    Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
+    RoutingPriority, Rules, RuntimeFractionalPercent, RuntimeUInt32, SafeRegex, SetMetadataConfig,
+    SocketAddress, StaticResources, StatusCodeFilter, StringMatcher, StringMatcherMode,
+    SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds, TlsCertificate,
+    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;

@@ -2249,6 +2249,12 @@ pub enum RouteAction {
 
     /// Route-to-cluster action — proxy through to the named cluster. Phase 04.3 NEW.
     Route(RouteAction_Route),
+
+    /// Redirect action — synthesize a 3xx reply carrying a `location:` header.
+    /// 76.1 NEW: the config surface only. The runtime dispatch arm is an honest
+    /// `synth_501` not-implemented placeholder until 76.2 lands the real
+    /// behaviour (ADR-0169 DECISION 4).
+    Redirect(RedirectAction),
 }
 
 /// 04.3 NEW (under SPEC §3 D2). Names the cluster to forward the matched
@@ -2611,6 +2617,7 @@ impl serde::Serialize for Route {
         match &self.action {
             RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
             RouteAction::Route(ar) => map.serialize_entry("route", ar)?,
+            RouteAction::Redirect(rd) => map.serialize_entry("redirect", rd)?,
         }
         if !self.typed_per_filter_config.is_empty() {
             map.serialize_entry("typed_per_filter_config", &self.typed_per_filter_config)?;
@@ -2632,6 +2639,7 @@ impl serde::Serialize for RouteAction {
         match self {
             RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
             RouteAction::Route(ar) => map.serialize_entry("route", ar)?,
+            RouteAction::Redirect(rd) => map.serialize_entry("redirect", rd)?,
         }
         map.end()
     }
@@ -4052,6 +4060,12 @@ fn validate_hcm(
                         return Err(crate::ConfigError::InvalidStatusCode { status: dr.status });
                     }
                     validate_data_source(&dr.body, "direct_response.body", Required::InlineString)?;
+                }
+                RouteAction::Redirect(_) => {
+                    // 76.1 Task 3: the variant must be handled for the workspace to
+                    // compile. The two intra-RedirectAction oneof checks land in
+                    // Task 5 — keeping this arm inert here is what makes Task 5's
+                    // reject-direction tests genuinely RED.
                 }
                 RouteAction::Route(ar) => {
                     // 04.3 NEW: check the cluster reference against declared clusters.

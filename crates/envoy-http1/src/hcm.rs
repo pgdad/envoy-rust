@@ -2111,6 +2111,14 @@ pub(crate) fn build_response_in(
         RouteAction::DirectResponse(dr) => {
             BuildOutcome::Synth(synth_direct_response(dr, close), Some("direct_response"))
         }
+        // 76.1 (ADR-0169 DECISION 4): HONEST placeholder for the redirect action.
+        // The config surface landed in 76.1; the runtime lands in 76.2. Returning
+        // the EXISTING synth_501 not-implemented outcome makes a configured-but-
+        // unserved redirect loudly wrong rather than silently wrong, which is what
+        // BOOTSTRAP_PROMPT.md §6.3 requires of a placeholder. 76.2 replaces this
+        // arm with the real 3xx + `location` response; the test pinning this
+        // behaviour is deliberately flipped there.
+        RouteAction::Redirect(_) => BuildOutcome::Synth(synth_501(close), None),
         RouteAction::Route(ar) => BuildOutcome::Proxy {
             cluster: ar.cluster.clone(),
             // 16 Task 4: resolve the per-route retry policy. `None` → no retries.
@@ -2350,7 +2358,9 @@ pub(crate) fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_config::{DataSource, HashPolicyHeader, LbMetadata, RouteAction_Route, RouteMatch};
+    use envoy_config::{
+        DataSource, HashPolicyHeader, LbMetadata, RedirectAction, RouteAction_Route, RouteMatch,
+    };
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -9673,6 +9683,67 @@ static_resources:
                     }],
                 }],
             })),
+        }
+    }
+
+    /// 76.1 T-C9: the HONEST PLACEHOLDER pin (ADR-0169 DECISION 4).
+    /// 76.1 lands the `redirect:` CONFIG SURFACE but no runtime behaviour, so the
+    /// dispatch arm returns the EXISTING `synth_501` not-implemented outcome. This
+    /// test exists so the placeholder is EXERCISED rather than silent, and so that
+    /// 76.2 replacing it with a real 3xx + `location` is a visible, deliberate
+    /// change to a named test rather than an unobserved behaviour shift.
+    /// **76.2 MUST flip this test.**
+    async fn redirect_placeholder_config() -> HCMConfig {
+        HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Redirect(RedirectAction {
+                            https_redirect: Some(true),
+                            ..Default::default()
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_response_redirect_is_not_implemented_placeholder() {
+        let config = redirect_placeholder_config().await;
+        let req = make_req("/foo", "localhost");
+        match build_response(&config, &req, true) {
+            BuildOutcome::Synth(resp, detail) => {
+                assert_eq!(
+                    resp.status, 501,
+                    "76.1 ships the config surface only; the redirect runtime is 76.2, \
+                     so the placeholder must be the honest 501 not-implemented synth"
+                );
+                assert_eq!(
+                    detail, None,
+                    "the placeholder must NOT claim a %RESPONSE_CODE_DETAILS% string"
+                );
+            }
+            _other => panic!("expected BuildOutcome::Synth(501)"),
         }
     }
 
