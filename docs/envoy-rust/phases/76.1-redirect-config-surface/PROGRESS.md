@@ -671,3 +671,766 @@ tests, so both figures must GROW** — that is the point. Use
 `grep -oE 'test result: (ok|FAILED)\. …'` with awk fields **4 and 6**, and assert
 the binary count separately; the standing `ok`-only recipe makes `failed=0` true
 by construction.
+
+---
+
+# §5 state-4 VERIFICATION — the full §7.5 gate
+
+**Session:** `superpowers:verification-before-completion`, scoped to sub-phase
+`76.1` only (NOT the parent `76`, NOT `76.2`). A SEPARATE session from the
+state-3 implementation per §5.1 / ADR-0127 — the context that wrote the code is
+not the one that grades it.
+
+**Predecessor `HEAD` at session start:** `9556b2cdc43f2d1b505d1ed3d3ee6d1a1f42a783`
+(the state-3 implementation). Tree clean, branch `main`, `origin/main` in sync at
+`0 0`:
+
+```
+$ git status --porcelain
+$ git rev-parse --abbrev-ref HEAD
+main
+$ git rev-parse HEAD
+9556b2cdc43f2d1b505d1ed3d3ee6d1a1f42a783
+$ git fetch origin --prune && git rev-list --left-right --count HEAD...origin/main
+0	0
+```
+
+**State detection re-confirmed on disk, not inherited:**
+`docs/envoy-rust/phases/76.1-redirect-config-surface/` holds `PLAN.md`,
+`PROGRESS.md`, `SPEC.md` and **no `REVIEW.md`** — §5 state 4 exactly. ROADMAP row
+`76.1` is `in-progress`, parent `76` is `in-progress`, `76.2` is `planned`.
+
+**No `REVIEW.md` was written here** (state 5, a separate session). **No `stop`
+file was created.** **No code was fixed** — the gate produced no RED attributable
+to this phase's surface.
+
+---
+
+## S4.0 Inherited censuses — RE-DERIVED, not trusted
+
+Every figure below was measured this session from the tree, per the standing
+"re-derive every inherited census" trap.
+
+```
+$ ls -d tests/fixtures/*/ | wc -l
+85
+$ ls tests/differential/tests/*.rs | wc -l
+85
+$ awk -F' \| ' '/^\| [0-9]/{c[$4]++; n++} END{printf "rows=%d\n", n; for(k in c) printf "  %s = %d\n", k, c[k]}' docs/envoy-rust/ROADMAP.md
+rows=107
+  planned = 1
+  in-progress = 2
+  done = 104
+$ wc -l tests/conformance/h2spec/known-failures.txt
+21 tests/conformance/h2spec/known-failures.txt
+$ wc -l crates/envoy-config/fuzz/.gitignore ; grep -c '^!' crates/envoy-config/fuzz/.gitignore
+67 crates/envoy-config/fuzz/.gitignore
+64
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/ | wc -l
+64
+$ grep -c '#\[error' crates/envoy-config/src/lib.rs
+125
+$ wc -l crates/envoy-config/src/bootstrap.rs
+21042 crates/envoy-config/src/bootstrap.rs
+$ git ls-files '*/fuzz/fuzz_targets/*.rs'
+crates/envoy-accesslog/fuzz/fuzz_targets/accesslog_format_parse.rs
+crates/envoy-config/fuzz/fuzz_targets/parse_bootstrap.rs
+crates/envoy-filter/fuzz/fuzz_targets/cdn_loop_parse.rs
+crates/envoy-http2/fuzz/fuzz_targets/grpc_health_decode.rs
+crates/envoy-jwt/fuzz/fuzz_targets/jwt_parse.rs
+```
+
+**All nine inherited figures reproduce exactly.** Note `ConfigError` lives in
+`crates/envoy-config/src/lib.rs`, not in an `error.rs` — a first census attempt
+against `crates/envoy-config/src/error.rs` returned a tool warning
+(`No such file or directory`), which is precisely the "disbelieve a clean-looking
+zero" trap; the count was re-taken against the real file.
+
+`git ls-files '*/fuzz/fuzz_targets/*.rs'` was used deliberately in place of a
+`find`, so the four concurrent `.claude/worktrees/agent-*` worktrees cannot
+inflate the target count.
+
+---
+
+## S4.1 Gate (e) — `cargo build --workspace --all-targets`
+
+```
+$ cargo build --workspace --all-targets
+   Compiling envoy-config v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-config)
+   Compiling envoy-listener v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-listener)
+   Compiling envoy-cluster v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-cluster)
+   Compiling envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+   Compiling envoy-tls v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tls)
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+   Compiling envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+   Compiling envoy-http2 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http2)
+   Compiling envoy-admin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http1-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling envoy-health v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-health)
+   Compiling http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.07s
+
+real	0m3.108s
+EXIT=0
+```
+
+**Not a cached no-op:** **13** `Compiling` lines, i.e. real work on the
+`envoy-config` dependency cone. The cached-green trap (a build/clippy exit 0 with
+ZERO `Compiling`/`Checking` lines) does not apply here. The 3.07 s wall against
+34.4 s of user time is this host's core count, not a skip.
+
+---
+
+## S4.2 Gate (e) — `cargo fmt --all -- --check`
+
+```
+$ cargo fmt --all -- --check
+EXIT=0
+$ wc -c -l fmt.txt
+0 0 fmt.txt
+```
+
+Exit 0 with a **byte-empty** output file — zero formatting diff.
+
+---
+
+## S4.3 Gate (e) — `cargo clippy --workspace --all-targets --all-features -- -D warnings`, FORCED
+
+The three files this phase changed were `touch`ed first so the run could not be
+a cached green (the state-3 session hit exactly that trap, and `PROGRESS.md` §4
+warns about it):
+
+```
+$ touch crates/envoy-config/src/bootstrap.rs crates/envoy-config/src/lib.rs crates/envoy-http1/src/hcm.rs
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Checking envoy-config v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-config)
+    Checking envoy-listener v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-cluster v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+    Checking envoy-tls v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tls)
+    Checking envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking envoy-health v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-health)
+    Checking http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.94s
+
+real	0m1.995s
+EXIT=0
+$ grep -c 'Checking' clippy.txt
+13
+$ grep -cE '^(warning|error)' clippy.txt
+0
+```
+
+**13 `Checking` lines with `envoy-accesslog` ABSENT — the ADR-0150 seam witness
+figure, re-measured independently at state 4. There is no 14th line: the seam
+holds.** Zero warning/error lines; exit 0.
+
+---
+
+## S4.4 Gate (e) — `cargo deny check`
+
+```
+$ cargo deny check
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/esa/git/envoy-rust/deny.toml:54:6
+   │
+54 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/esa/git/envoy-rust/deny.toml:52:6
+   │
+52 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/esa/git/envoy-rust/deny.toml:48:6
+   │
+48 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/esa/git/envoy-rust/deny.toml:50:6
+   │
+50 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+EXIT=0
+```
+
+**Exit 0 — `advisories ok, bans ok, licenses ok, sources ok`.** The five
+`license-not-encountered` lines are unmatched ALLOWANCES in `deny.toml`, i.e.
+allow-list entries matching no current dependency — advisory, not violations, and
+the documented benign observation. **No fresh RustSec advisory fired**, so no
+dependency patch-bump was needed.
+
+---
+
+## S4.5 Gate (e) — `cargo test --workspace`, sweep 1 of 2
+
+Run with `--no-fail-fast` and the FULL output redirected to a file. **Never
+`tail`** — `tail` truncates the `failures:` block.
+
+```
+$ cargo test --workspace --no-fail-fast   # full output -> test1.txt
+
+real	5m56.540s
+EXIT=101
+```
+
+Census, using the self-validating recipe (`grep -oE 'test result: (ok|FAILED)'`,
+awk fields **4** and **6**, with the binary count asserted separately — the
+standing `ok`-only recipe makes `failed=0` true by construction):
+
+```
+$ grep -c 'test result:' test1.txt
+162
+$ grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed' test1.txt \
+    | awk '{p+=$4; f+=$6; n++} END{printf "binaries: %d passed=%d failed=%d\n", n, p, f}'
+binaries: 162 passed=2129 failed=8
+$ grep -oE 'test result: (ok|FAILED)\.' test1.txt | sort | uniq -c
+      8 test result: FAILED.
+    154 test result: ok.
+```
+
+**THE ARITHMETIC IDENTITY CLOSES EXACTLY.** The last derived CI total was
+`binaries: 162 passed=2105 failed=0`. This phase adds **32** tests
+(`envoy-config --lib` 649 → 680 = +31, `envoy-http1 --lib` 186 → 187 = +1). So:
+
+```
+local passed + local failed  =  2129 + 8  =  2137
+CI passed + phase delta      =  2105 + 32 =  2137     ✅ identical
+```
+
+Both figures GREW by exactly the expected amount, and the binary count is
+unchanged at **162** (no new test binary — consistent with "no `tests/` file was
+touched"). This is the strongest single piece of evidence that all 8 REDs are
+environmental: every test that exists locally is accounted for, and the 8 are
+precisely the ones CI passes.
+
+### The 8 RED binaries
+
+```
+$ awk '/^     Running/{bin=$2} /^test result: FAILED/{print bin}' test1.txt
+tests/access_log_h2_rcd_upstream_reset.rs
+tests/access_log_h2_uc_upstream_reset.rs
+tests/access_log_rcd_upstream_reset.rs
+tests/access_log_rf_retry_exhausted.rs
+tests/access_log_rf_upstream_reset.rs
+tests/access_log_route_name.rs
+tests/access_log_upstream_cluster.rs
+tests/admin_config_dump_server_info.rs
+```
+
+All eight live in `tests/differential/tests/`, so every isolation re-run below
+passes `-p differential` explicitly — **33 test-binary NAMES are duplicated
+between `tests/differential/tests/` and `crates/envoy-bin/tests/`**, and a bare
+`--test <name>` would silently address the wrong crate.
+
+---
+
+## S4.6 ADR-0164 adjudication of the RED tail — by the four-part test, never by list membership
+
+The failure TEXT splits the eight into two classes, and **the classification is
+made by ISOLATION, not by text** (a whole-sweep startup wave can preempt a core
+member's normal assertion — `admin_config_dump_server_info` did exactly that
+here, failing in the sweep with the startup-wave text and in isolation with its
+own bridge-IP text).
+
+### Isolation re-runs — all eight, one at a time
+
+```
+$ for t in <the eight>; do cargo test -p differential --test $t; done
+access_log_h2_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset  | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset    | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rf_upstream_reset     | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rf_retry_exhausted    | exit=0   | test result: ok. 1 passed; 0 failed
+access_log_route_name            | exit=0   | test result: ok. 1 passed; 0 failed
+access_log_upstream_cluster      | exit=0   | test result: ok. 1 passed; 0 failed
+admin_config_dump_server_info    | exit=101 | test result: FAILED. 0 passed; 1 failed
+```
+
+The `passed`/`failed` COUNTS are asserted above, not the exit code:
+`cargo test -p <pkg> <name>` lies both ways (`0 passed; N filtered out` exits 0
+and is a FALSE GREEN; `error: no test target named …` exits 101 exactly like a
+real RED).
+
+### Class A — the stable core of five. Fails DETERMINISTICALLY in isolation, and that determinism IS the environmental signature.
+
+Five binaries: the four `access_log_*_upstream_reset` and
+`admin_config_dump_server_info`.
+
+**The four `*_upstream_reset` binaries — `TcpCloseBackend` IPv6-unreachable.**
+Verbatim from the sweep:
+
+```
+---- access_log_rcd_upstream_reset stdout ----
+fixture green: access log byte-exact mismatch: line 0 not byte-identical:
+  envoy="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:43671}\",\"rf\":\"UF\"}"
+  envoy-rust="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}"
+```
+
+`immediate_connect_error:_Network_is_unreachable` at
+`remote_address:[fdc4:f303:9324::254]` is the host's IPv6 stack, not a proxy
+divergence: upstream Envoy resolves the closed-backend target to an IPv6 address
+this host cannot route, yielding `UF`/`remote_connection_failure`, where
+envoy-rust reaches the same closed port over IPv4 and correctly reports
+`UC`/`connection_termination`. Fixtures `0061`/`0062`/`0069`/`0070`.
+
+**`admin_config_dump_server_info` — the `192.168.65.2` bridge-IP family.** In the
+sweep it failed with the startup-wave text; in ISOLATION it shows its own
+signature:
+
+```
+---- admin_config_dump_server_info stdout ----
+fixture green: admin body rule: /clusters
+Caused by:
+    text_lines diverged after allow-lists:
+      envoy-only:      ["backend::192.168.65.2:45187::canary::false", …, "backend::192.168.65.2:45187::hostname::host.docker.internal", …]
+      envoy-rust-only: []
+```
+
+Upstream Envoy inside Docker resolves `host.docker.internal` to the Docker
+Desktop bridge IP `192.168.65.2` and emits a whole host block envoy-rust (running
+natively, resolving to loopback) has no counterpart for. Fixture `0014`.
+
+### Class B — the open-ended startup-race tail. Never reached an assertion; passes in isolation.
+
+Three binaries: `access_log_rf_retry_exhausted`, `access_log_route_name`,
+`access_log_upstream_cluster`. All three fail with:
+
+```
+fixture green: upstream Envoy never became accept-ready
+Caused by:
+    127.0.0.1:56724 not accept-ready within 10s: Connection refused (os error 111)
+```
+
+and the four ports involved in the wave — `56724`, `56726`, `56728`, `56730` —
+are **consecutive even numbers allocated in one burst**, the signature of the
+reserve-then-drop `reserve_port()` contention (CF-75-6) under whole-workspace
+parallel load. **`Connection refused` at container start means the assertion was
+NEVER REACHED**, so the run carries no information about the proxies' behaviour
+at all. All three PASS in isolation (above).
+
+### The four-part test, leg by leg
+
+| leg | Class A (5) | Class B (3) |
+|---|---|---|
+| (i) assertion never reached | NO — reached, and shows a host-environment signature (IPv6-unreachable / bridge-IP), not a proxy divergence | **YES** — `Connection refused` before any comparison |
+| (ii) passes in isolation | NO — fails deterministically, **and that determinism IS the documented signature** for this family | **YES** — all three green in isolation |
+| (iii) absent from some sweep | — see S4.7 (sweep 2) | — see S4.7 (sweep 2) |
+| (iv) untouched by the phase's surface | **YES** | **YES** |
+
+**Leg (iv), measured — not asserted.** The phase touched exactly five files and
+**no `tests/` file at all**:
+
+```
+$ git diff --name-only cf5cf85d0a2c477b90636b74fd93f6d36038f890..HEAD
+crates/envoy-config/fuzz/.gitignore
+crates/envoy-config/fuzz/corpus/parse_bootstrap/route_redirect_action.yaml
+crates/envoy-config/src/bootstrap.rs
+crates/envoy-config/src/lib.rs
+crates/envoy-http1/src/hcm.rs
+docs/envoy-rust/STATE.md
+docs/envoy-rust/STATE_HISTORY.md
+docs/envoy-rust/phases/76.1-redirect-config-surface/PROGRESS.md
+$ git diff --numstat cf5cf85..HEAD -- crates/ tests/ | awk '{a+=$1;d+=$2} END{printf "added=%d deleted=%d net=%d\n",a,d,a-d}'
+added=793 deleted=19 net=774
+```
+
+and **none of the eight fixtures configures a `redirect:` route action** — the
+only fixture in the tree containing the string `redirect` at all is `0011`, and
+there it is seven Prometheus metric NAMES in an allow-list:
+
+```
+$ grep -rln "redirect" tests/fixtures/ --include=*.yaml
+tests/fixtures/0011-admin-stats-prometheus/expectations.yaml
+$ grep -n "redirect" tests/fixtures/0011-admin-stats-prometheus/expectations.yaml
+127:          - envoy_http_downstream_rq_redirected_with_normalized_path
+150:          - envoy_http_passthrough_internal_redirect_bad_location
+151:          - envoy_http_passthrough_internal_redirect_no_route
+152:          - envoy_http_passthrough_internal_redirect_predicate
+153:          - envoy_http_passthrough_internal_redirect_too_many_redirects
+154:          - envoy_http_passthrough_internal_redirect_unsafe_scheme
+157:          - envoy_http_rq_redirect
+```
+
+The failing binaries map to fixtures `0070`, `0069`, `0062`, `0061`, `0059`,
+`0049`, `0051`, `0014` (derived FROM THE TREE via
+`grep -oE 'tests/fixtures/[0-9]{4}-[a-z0-9-]+' tests/differential/tests/<name>.rs`,
+never from the binary name). **Not one of them reaches the new
+`RouteAction::Redirect` arm** — the arm is unreachable unless a route configures
+`redirect:`, and none does.
+
+---
+
+## S4.7 `cargo test --workspace`, sweep 2 of 2 — leg (iii), the set DIFF
+
+```
+$ cargo test --workspace --no-fail-fast   # full output -> test2.txt
+
+real	5m22.333s
+EXIT=101
+$ grep -c 'test result:' test2.txt
+162
+$ grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed' test2.txt \
+    | awk '{p+=$4; f+=$6; n++} END{printf "binaries: %d passed=%d failed=%d\n", n, p, f}'
+binaries: 162 passed=2130 failed=7
+$ grep -oE 'test result: (ok|FAILED)\.' test2.txt | sort | uniq -c
+      7 test result: FAILED.
+    155 test result: ok.
+```
+
+`2130 + 7 = 2137` — **the identity closes again**, on a different partition.
+
+### The failing SET changed — which is the point of running it twice
+
+Failing test names extracted from the `---- <name> stdout ----` markers (the
+`failures:` block is NOT safe to `awk` on indentation — the failure BODY is also
+indented and, measured here, injects the stray line
+`text_lines diverged after allow-lists:` into any such census):
+
+| test | sweep 1 | sweep 2 | in isolation |
+|---|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | RED | RED | **RED (deterministic)** |
+| `access_log_h2_uc_upstream_reset` | RED | RED | **RED (deterministic)** |
+| `access_log_rcd_upstream_reset` | RED | RED | **RED (deterministic)** |
+| `access_log_rf_upstream_reset` | RED | RED | **RED (deterministic)** |
+| `admin_config_dump_server_info` | RED | RED | **RED (deterministic)** |
+| `access_log_rf_retry_exhausted` | RED | — | GREEN |
+| `access_log_route_name` | RED | — | GREEN |
+| `access_log_upstream_cluster` | RED | — | GREEN |
+| `lb_subset_fixture` | — | RED | GREEN |
+| `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` | — | RED | GREEN |
+
+**Union across the two sweeps: 10 distinct tests. Intersection: exactly the
+stable core of five.** Every one of the five tail members is ABSENT from at least
+one sweep — **leg (iii) is satisfied for the whole tail**, and the tail's
+membership varying (3 in sweep 1, 2 in sweep 2, disjoint) is the documented
+open-ended-tail signature whose SIZE carries no signal.
+
+The two sweep-2-only members, verbatim:
+
+```
+---- lb_subset_fixture stdout ----
+fixture passes: upstream Envoy never became accept-ready
+Caused by:
+    127.0.0.1:56866 not accept-ready within 10s: Connection refused (os error 111)
+
+---- client::tests::send_request_maps_h2_handshake_failure_to_typed_error stdout ----
+thread '…' panicked at crates/envoy-http2/src/client.rs:551:22:
+expected H2ClientHandshake, got Ok(ClientStream { host: "test.example", .. })
+```
+
+`lb_subset_fixture` is the same never-reached-an-assertion startup race.
+The `envoy-http2` handshake test is the documented pre-existing host flake — this
+host's networking lets the handshake unexpectedly SUCCEED. Both GREEN in
+isolation:
+
+```
+$ cargo test -p differential --test lb_subset
+test result: ok. 1 passed; 0 failed
+$ cargo test -p envoy-http2 --lib client::tests::send_request_maps_h2_handshake_failure_to_typed_error
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out
+```
+
+(The `1 passed` is asserted, not the exit code — `0 passed; N filtered out` also
+exits 0 and would be a false green.)
+
+---
+
+## S4.8 The stable core of five — PROVED PRE-EXISTING by a control run at the pre-`76.1` commit
+
+The core five satisfy legs (i)-(iii) NEGATIVELY: they reach their assertion, they
+fail deterministically in isolation, and they appear in both sweeps. Per the
+standing rule that determinism-in-isolation IS this family's environmental
+signature, that is expected — **but "it is the documented signature" is a quote,
+not a measurement.** So the control was MEASURED directly.
+
+A scratch worktree was created `--detach` at
+`cf5cf85d0a2c477b90636b74fd93f6d36038f890` — the state-2 PLAN-write commit,
+**before a single line of `76.1`'s code existed** — and the five were re-run
+there:
+
+```
+$ git worktree add --detach <scratch> cf5cf85d0a2c477b90636b74fd93f6d36038f890
+HEAD is now at cf5cf85 phase 76.1 state-2 PLAN-write: 8 TDD-ordered tasks on a re-derived ~515 LoC — no split [ADR-0170]
+$ cargo build --workspace --all-targets      # exit 0
+$ ls target/debug/ | grep -E '^(tcp-echo-server|http1-echo-server|http2-echo-server|envoy-bin)$'
+envoy-bin
+http1-echo-server
+http2-echo-server
+tcp-echo-server
+$ for t in <the five>; do cargo test -p differential --test $t; done
+PRE-76.1 access_log_rf_upstream_reset     | exit=101 | test result: FAILED. 0 passed; 1 failed
+PRE-76.1 access_log_rcd_upstream_reset    | exit=101 | test result: FAILED. 0 passed; 1 failed
+PRE-76.1 access_log_h2_uc_upstream_reset  | exit=101 | test result: FAILED. 0 passed; 1 failed
+PRE-76.1 access_log_h2_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+PRE-76.1 admin_config_dump_server_info    | exit=101 | test result: FAILED. 0 passed; 1 failed
+```
+
+and the SIGNATURES are byte-identical to the ones at `HEAD`:
+
+```
+PRE-76.1 access_log_rf_upstream_reset:
+  envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"
+PRE-76.1 access_log_rcd_upstream_reset:
+  …upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:44849}…
+PRE-76.1 admin_config_dump_server_info:
+  text_lines diverged after allow-lists:
+    envoy-only: ["backend::192.168.65.2:43651::canary::false", …]
+```
+
+**All five fail identically at a commit that predates every line of `76.1`.
+They are pre-existing host-environment divergences, not regressions.**
+
+### A false RED was caught in the middle of this control, and it is recorded
+
+The FIRST control attempt built only `cargo build -p envoy-bin` in the worktree.
+All five "failed" — but with:
+
+```
+fixture green: spawning TcpCloseBackend
+Caused by:
+    0: locating tcp-echo-server binary
+    1: tcp-echo-server not found at <worktree>/target/debug/tcp-echo-server; run `cargo build -p tcp-echo-server` or `cargo test --workspace`
+```
+
+**That RED never reached an assertion and is NOT evidence** — it would have
+"confirmed" the desired conclusion for entirely the wrong reason. The control was
+re-run after `cargo build --workspace --all-targets`, and only that second run is
+quoted above. Recorded here because a control that fails for a bookkeeping reason
+is the easiest way to fake a green adjudication.
+
+### Adjudication — final
+
+**ZERO of the ten RED tests is attributable to sub-phase `76.1`.** The verdict
+rests on four independent measurements, not on list membership:
+
+1. **The phase touched no test code at all** — five `crates/` files, `net=774`,
+   and **no `tests/` file** (`git diff --name-only cf5cf85..HEAD`).
+2. **The new `RouteAction::Redirect` arm is unreachable for all 85 fixtures** —
+   no fixture configures a `redirect:` route action.
+3. **The five deterministic members fail identically at `cf5cf85`** (§S4.8).
+4. **The five non-deterministic members pass in isolation and each is absent
+   from at least one of the two sweeps** (§S4.7).
+
+And the arithmetic closes on both sweeps: `2129+8 = 2130+7 = 2137 = 2105+32`.
+
+**No code was changed in response to any RED.** There was nothing to repair — no
+§5.2-style fix was needed or made.
+
+---
+
+## S4.9 Gate (c) — conformance. The local green IS vacuous; CI is authoritative.
+
+`h2spec_pass_rate_gate` reports `ok` inside the workspace sweep, but that green
+carries no information locally. Re-run with `--nocapture`, which is the only way
+to see it:
+
+```
+$ cargo test -p h2spec-conformance --test h2spec_runner -- --nocapture
+running 3 tests
+test tests::parse_summary_line_extracts_pass_fail_counts ... ok
+test tests::parse_h2spec_output_extracts_section_failure_ids ... ok
+h2spec_runner: h2spec not found — skipping locally
+test h2spec_pass_rate_gate ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+EXIT=0
+```
+
+**`h2spec not found — skipping locally` — the gate SELF-SKIPPED.** This host has
+no `h2spec` binary; CI provisions it (`.github/workflows/ci.yml:43-49`,
+`install h2spec`). Per **ADR-0163** the gate is **NOT** vacuous in CI — that scare
+is settled and is not re-raised here. So **gate (c) is CI-AUTHORITATIVE** and is
+confirmed by this session's own CI run (§S4.11), not by the local sweep.
+
+`tests/conformance/h2spec/known-failures.txt` was **NOT touched** — still **21**
+lines. This host scores h2spec 3.5/2 as PASS where CI does not, so trimming it on
+local evidence would break CI. **Threshold unchanged** (`PASS_RATE_GATE = 0.95`,
+`tests/conformance/h2spec/tests/h2spec_runner.rs:18`); `76.1` adds no HTTP/2
+surface at all.
+
+---
+
+## S4.10 Gate (a), (b) and (d)
+
+**(a) New/changed differential fixtures green — VACUOUSLY MET, and deliberately
+so.** `76.1` adds **NO** differential fixture. Fixture `0086-route-redirect-action`
+belongs to `76.2`. **This is stated explicitly so a reviewer does not read the
+absence as an oversight** — it is the same disposition `PROGRESS.md` §4 already
+records, re-confirmed here rather than inherited. Re-derived this session:
+**85** fixture dirs and **85** differential test files, unchanged. `76.1`'s
+differential surface is the REJECT direction (the seven MEASURED upstream
+rejections J1-J7, now boot-fatal here), proved in-process by the +32 tests, plus
+gate (b).
+
+**(b) Pre-existing differential fixtures still green — MET.** All 85 fixtures ran
+in both sweeps. Every RED is adjudicated environmental in §S4.6-§S4.8, with the
+five deterministic members proved to fail identically at a pre-`76.1` commit. The
+regression argument holds structurally too: `RouteAction` gained a variant that
+**no existing config can reach**, since no fixture configures a `redirect:` route
+action (measured in §S4.6). `envoy-bin` was rebuilt from this tree before the
+sweeps — 13 `Compiling` lines in §S4.1 — so no fixture ran against a stale binary
+that would have rejected the new `redirect` config key.
+
+**(d) Fuzz — MET, and NO `ci.yml` edit was needed.** `76.1` adds **no new fuzz
+target**, so no `ci.yml` step is required; the existing short-budget
+`parse_bootstrap` run covers the new seed. Re-verified from the tree:
+
+```
+$ git ls-files '*/fuzz/fuzz_targets/*.rs'
+crates/envoy-accesslog/fuzz/fuzz_targets/accesslog_format_parse.rs
+crates/envoy-config/fuzz/fuzz_targets/parse_bootstrap.rs
+crates/envoy-filter/fuzz/fuzz_targets/cdn_loop_parse.rs
+crates/envoy-http2/fuzz/fuzz_targets/grpc_health_decode.rs
+crates/envoy-jwt/fuzz/fuzz_targets/jwt_parse.rs
+```
+
+**5 targets across 5 crates — unchanged**, and all five already have a `ci.yml`
+step (`.github/workflows/ci.yml:102-134`). The new seed is TRACKED, not merely
+present:
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/route_redirect_action.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/route_redirect_action.yaml
+$ grep -n 'route_redirect_action' crates/envoy-config/fuzz/.gitignore
+65:!corpus/parse_bootstrap/route_redirect_action.yaml
+$ git check-ignore -v crates/envoy-config/fuzz/corpus/parse_bootstrap/route_redirect_action.yaml ; echo "exit=$?"
+exit=1
+```
+
+`check-ignore` exit **1** = the file is NOT ignored. Without the explicit `!`
+line the seed would be untracked and invisible to CI.
+
+Although not required, the short-budget `parse_bootstrap` run was executed
+locally so the new seed is covered by a real libFuzzer run and not only by the
+in-process `fuzz_corpus_seeds_parse_or_reject_cleanly` cohort walk. It was run
+from the CRATE directory (`cargo fuzz` does not run from the repo root) with the
+same budget CI uses:
+
+```
+$ cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30
+INFO:    12432 files found in /home/esa/git/envoy-rust/crates/envoy-config/fuzz/corpus/parse_bootstrap
+INFO: seed corpus: files: 12432 min: 1b max: 3642b total: 6927989b rss: 55Mb
+#12433	INITED cov: 17088 ft: 36158 corp: 3484/2368Kb exec/s: 6216 rss: 382Mb
+…
+Done 76013 runs in 96 second(s)
+EXIT=0
+$ grep -cE 'ERROR: libFuzzer|deadly signal|panicked at|SUMMARY: ' fuzz.txt
+0
+$ ls crates/envoy-config/fuzz/artifacts/parse_bootstrap/
+(empty)
+```
+
+**Exit 0, zero crash markers, empty artifacts directory.** (The 12 432 files are
+this host's accumulated local corpus, which is gitignored; CI starts from the
+**64** TRACKED seeds. The run left the working tree clean and the tracked seed
+count unchanged at 64.)
+
+---
+
+## S4.11 Gate-by-gate verdict
+
+| §7.5 gate | verdict | evidence |
+|---|---|---|
+| **(a)** new/changed fixtures green | **VACUOUSLY MET** — no new fixture by design; `0086` is `76.2`'s | §S4.10 |
+| **(b)** pre-existing fixtures still green | **MET** — all 85 ran; every RED adjudicated environmental, 5 of them proved pre-existing at `cf5cf85` | §S4.5-§S4.8, §S4.10 |
+| **(c)** conformance at declared threshold | **CI-AUTHORITATIVE** — the local gate self-skips (`h2spec not found`); `known-failures.txt` untouched at 21 lines; threshold unchanged | §S4.9 |
+| **(d)** new fuzzer clean short-budget | **MET, no `ci.yml` edit needed** — no new target; seed tracked; local 30 s run clean | §S4.10 |
+| **(e)** build / clippy / fmt / test / deny | **MET** — build exit 0 (13 `Compiling`), clippy exit 0 (13 forced `Checking`, 0 warnings), fmt exit 0 (empty), deny exit 0 (`advisories ok, bans ok, licenses ok, sources ok`), test `2129+8 = 2130+7 = 2137` with zero phase-attributable RED | §S4.1-§S4.5, §S4.7 |
+| **(f)** `REVIEW.md` approved | **NOT APPLICABLE HERE — state 5, a SEPARATE session** (§5.1; ADR-0127: the context that verified must not grade). No `REVIEW.md` was written. | — |
+
+**Gates (a), (b), (d) and (e) are MET. Gate (c) is met at its unchanged threshold
+in CI. Gate (f) is the only one still open, and it belongs to state 5.**
+
+### Census deltas re-confirmed at state 4
+
+| quantity | state-3 claim | state-4 measurement |
+|---|---|---|
+| `ConfigError` variants | 125 | **125** ✅ |
+| `crates/envoy-config/fuzz/.gitignore` lines | 67 | **67** ✅ |
+| `^!` lines in that file | 64 | **64** ✅ |
+| tracked `parse_bootstrap` seeds | 64 | **64** ✅ |
+| `bootstrap.rs` lines | 21 042 | **21 042** ✅ |
+| differential fixture dirs | 85 | **85** ✅ |
+| differential test files | 85 | **85** ✅ |
+| fuzz targets | 5 (across 5 crates) | **5** ✅ |
+| `known-failures.txt` lines | 21 | **21** ✅ |
+| ROADMAP rows / done / in-progress / planned | 107 / 104 / 2 / 1 | **107 / 104 / 2 / 1** ✅ |
+| clippy `Checking` lines, forced | 13 (ADR-0150 seam) | **13, `envoy-accesslog` absent** ✅ |
+| net `crates/`+`tests/` LoC `cf5cf85..HEAD` | 774 | **added=793 deleted=19 net=774** ✅ |
+| test binaries | — | **162** (unchanged; no new test binary) |
+| workspace tests | 2105 + 32 | **2137** ✅ |
+
+**Every inherited figure reproduced. None was refuted.**
+
+---
+
+## S4.12 What state 4 did NOT do
+
+- **No `REVIEW.md`** — state 5, a separate session (§5.1; ADR-0127).
+- **No code fix.** The gate produced no RED attributable to `76.1`, so there was
+  nothing to repair and no §5.2-style re-entry was triggered.
+- **No `SPEC.md` edit** — `76/SPEC.md`, `76.1/SPEC.md` and `76.2/SPEC.md` all stay
+  BYTE-UNCHANGED (ADR-0169 DECISION 5, ADR-0170).
+- **No `ROADMAP.md` edit** — a state-4 commit flips no status cell; row `76.1`
+  stays `in-progress`, parent `76` stays `in-progress`, `76.2` stays `planned`.
+- **No new ADR.** Nothing here is a new decision: every call is an application of
+  ADR-0164's adjudication rule, ADR-0163 (h2spec in CI), ADR-0150 (the seam) and
+  ADR-0127 (state isolation). Ledger head stays **ADR-0170**; **ADR-0171** is the
+  next free number.
+- **No landed ADR edited**; **`known-failures.txt` NOT trimmed**; **no fixture
+  weakened**; **`location` NOT added to the 3-entry `HEADER_ALLOW_LIST`**.
+- **No carry-forward fixed opportunistically** — **CF-76-1**, **CF-75-2**..
+  **CF-75-6** all remain OPEN and untouched (§6.3). In particular the four
+  `Connection refused` startup races observed here are **CF-75-6**, whose owner is
+  its own phase; no test was weakened to make them go away.
+- **No `stop` file.** The mission is not complete: 107 rows with **three**
+  non-`done` (`76`, `76.1`, `76.2`), `76.1` implemented but unreviewed, `76.2`
+  wholly unimplemented, and **four** of the 11 `ROADMAP.md` family headings still
+  carrying zero rows.
+- **No sub-phase `76.2` work started.** No parent-`76` `PLAN.md` was written —
+  §6.2 step 1, it will never have one.
+
+---
+
+## S4.13 What state 5 inherits
+
+The next session is **§5 state 5, `superpowers:requesting-code-review` → `REVIEW.md`**,
+scoped to `76.1`, and it is a **SEPARATE session**. Gate (f) is the only unmet
+gate. Things a reviewer should be handed rather than have to rediscover:
+
+- **The `Option`s are load-bearing.** Upstream's oneofs are exclusive on FIELD
+  PRESENCE, not value, so `https_redirect: Option<bool>` and
+  `path_redirect`/`prefix_rewrite`/`scheme_redirect: Option<String>` are correct
+  and the validators must test **`.is_some()`** — never truthiness, never
+  `!s.is_empty()`, never `.unwrap_or(false)`. T-R8/T-R9 paired with T-A5 pin it in
+  both directions. **Do not accept a "simplification" here.**
+- **`port_redirect` has NO PGV bound** — `0` and `70000` both ACCEPT upstream and
+  `70000` round-trips verbatim. Do not add `1..=65535`.
+- **The `synth_501` placeholder is intentional** (ADR-0169 DECISION 4), pinned by
+  T-C9, and `76.2` deliberately flips it. A 501 for a configured redirect is the
+  CORRECT behaviour at this sub-phase — it is not an unfinished stub.
+- **Error TEXT is not part of the equivalence contract** for J1-J7 — the VERDICT
+  is. J2 rejects via `deny_unknown_fields` rather than upstream's oneof error: a
+  different mechanism, the same verdict.
+- `PROGRESS.md` §6 records **four deliberate deviations from `PLAN.md`**, all of
+  which ADD coverage, and §3 records the **two mutation findings that corrected
+  the plan** — a misaimed mutation and a vacuous assertion. Those are the two most
+  review-relevant items in the state-3 record.
