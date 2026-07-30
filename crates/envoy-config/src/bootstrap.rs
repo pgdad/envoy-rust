@@ -2206,6 +2206,42 @@ impl RedirectResponseCode {
     }
 }
 
+/// 76.1 (§4.2): `envoy.config.route.v3.RedirectAction` — the THIRD `Route.action`
+/// oneof arm. 76.1 lands the CONFIG SURFACE only; no runtime behaviour (76.2).
+///
+/// **The `Option`s are load-bearing — do NOT "simplify" them to bare scalars.**
+/// `path_redirect`/`prefix_rewrite` and `https_redirect`/`scheme_redirect` are
+/// protobuf `oneof` members, and MEASURED upstream behaviour is that they are
+/// exclusive on FIELD PRESENCE, not on value: `https_redirect: false` PLUS
+/// `scheme_redirect: "ftp"` REJECTS, while `https_redirect: false` ALONE
+/// ACCEPTS, and `path_redirect: ""` plus `prefix_rewrite: "/q"` REJECTS. A
+/// `#[serde(default)] pub https_redirect: bool` loses that presence bit and
+/// would silently ACCEPT a config upstream rejects.
+///
+/// `port_redirect` deliberately carries NO range bound: MEASURED, upstream
+/// accepts both `0` and `70000` (no PGV bound at all), so adding a `1..=65535`
+/// check would manufacture a reject-direction divergence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectAction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_redirect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_redirect: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_redirect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_rewrite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_redirect: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme_redirect: Option<String>,
+    #[serde(default)]
+    pub strip_query: bool,
+    #[serde(default)]
+    pub response_code: RedirectResponseCode,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {
     /// Direct-response action — write a static body downstream. Phase 04.1 carryover.
@@ -10376,6 +10412,94 @@ static_resources:
     fn redirect_response_code_rejects_numeric_literal() {
         serde_yaml::from_str::<RedirectResponseCode>("302")
             .expect_err("a numeric response_code must reject");
+    }
+
+    // --- 76.1 Task 2: RedirectAction schema (SPEC §4.2) ---
+
+    /// T-A6: a bare `{}` parses, with the two MEASURED proto defaults.
+    #[test]
+    fn redirect_action_bare_map_uses_proto_defaults() {
+        let rd: RedirectAction = serde_yaml::from_str("{}").expect("bare redirect parses");
+        assert!(!rd.strip_query, "strip_query defaults to false");
+        assert_eq!(
+            rd.response_code,
+            RedirectResponseCode::MovedPermanently,
+            "response_code defaults to MOVED_PERMANENTLY (301)"
+        );
+        assert_eq!(rd.host_redirect, None);
+        assert_eq!(rd.port_redirect, None);
+        assert_eq!(rd.path_redirect, None);
+        assert_eq!(rd.prefix_rewrite, None);
+        assert_eq!(rd.https_redirect, None);
+        assert_eq!(rd.scheme_redirect, None);
+    }
+
+    /// T-A1 + T-A2: `port_redirect` has NO PGV bound upstream — `0` and `70000`
+    /// both ACCEPT (MEASURED), and 70000 must round-trip VERBATIM. Adding a
+    /// `1..=65535` check here would manufacture a reject-direction divergence.
+    #[test]
+    fn redirect_action_port_redirect_has_no_range_bound() {
+        let zero: RedirectAction =
+            serde_yaml::from_str("port_redirect: 0").expect("port_redirect: 0 must parse");
+        assert_eq!(zero.port_redirect, Some(0));
+        let big: RedirectAction =
+            serde_yaml::from_str("port_redirect: 70000").expect("port_redirect: 70000 must parse");
+        assert_eq!(
+            big.port_redirect,
+            Some(70000),
+            "70000 must survive verbatim — upstream renders it verbatim in `location`"
+        );
+    }
+
+    /// T-A3 + T-A4: the empty string is a LEGAL value for both string members.
+    #[test]
+    fn redirect_action_accepts_empty_string_members() {
+        let h: RedirectAction =
+            serde_yaml::from_str(r#"host_redirect: """#).expect("empty host_redirect parses");
+        assert_eq!(h.host_redirect.as_deref(), Some(""));
+        let s: RedirectAction =
+            serde_yaml::from_str(r#"scheme_redirect: """#).expect("empty scheme_redirect parses");
+        assert_eq!(s.scheme_redirect.as_deref(), Some(""));
+    }
+
+    /// T-A5 — HALF ONE OF THE PRESENCE PIN. `https_redirect: false` ALONE is
+    /// ACCEPTED upstream (MEASURED), and it must land as `Some(false)`, NOT as
+    /// `None` and NOT as a bare `false`. If `https_redirect` were modelled
+    /// `#[serde(default)] pub https_redirect: bool` this assertion could not even
+    /// be written — which is exactly why the field is `Option<bool>`.
+    #[test]
+    fn redirect_action_https_redirect_false_is_present_not_absent() {
+        let rd: RedirectAction =
+            serde_yaml::from_str("https_redirect: false").expect("https_redirect: false parses");
+        assert_eq!(
+            rd.https_redirect,
+            Some(false),
+            "writing the key at all sets the oneof — `false` is PRESENT, not absent"
+        );
+    }
+
+    /// The other presence case: `path_redirect: ""` is PRESENT, not absent.
+    /// This is what makes T-R9 (A7) reject in Task 5.
+    #[test]
+    fn redirect_action_empty_path_redirect_is_present_not_absent() {
+        let rd: RedirectAction =
+            serde_yaml::from_str(r#"path_redirect: """#).expect("empty path_redirect parses");
+        assert_eq!(rd.path_redirect.as_deref(), Some(""));
+    }
+
+    /// T-R2 (J2) mechanism: `regex_rewrite` inside `redirect` is an explicit
+    /// NON-GOAL and is boot-fatal here via `deny_unknown_fields`. Upstream
+    /// rejects the J2 config through its oneof instead — a DIFFERENT mechanism,
+    /// the SAME verdict, which is all the equivalence contract requires.
+    #[test]
+    fn redirect_action_rejects_unknown_field() {
+        let err = serde_yaml::from_str::<RedirectAction>("regex_rewrite: { pattern: x }")
+            .expect_err("regex_rewrite must reject (deny_unknown_fields)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("regex_rewrite"),
+            "error must name the unknown field; got: {msg}"
+        );
     }
 
     #[test]
