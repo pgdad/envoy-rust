@@ -1258,7 +1258,7 @@ EXIT=0
 no `h2spec` binary; CI provisions it (`.github/workflows/ci.yml:43-49`,
 `install h2spec`). Per **ADR-0163** the gate is **NOT** vacuous in CI — that scare
 is settled and is not re-raised here. So **gate (c) is CI-AUTHORITATIVE** and is
-confirmed by this session's own CI run (§S4.11), not by the local sweep.
+confirmed by this session's own CI run (§S4.14), not by the local sweep.
 
 `tests/conformance/h2spec/known-failures.txt` was **NOT touched** — still **21**
 lines. This host scores h2spec 3.5/2 as PASS where CI does not, so trimming it on
@@ -1350,14 +1350,15 @@ count unchanged at 64.)
 | §7.5 gate | verdict | evidence |
 |---|---|---|
 | **(a)** new/changed fixtures green | **VACUOUSLY MET** — no new fixture by design; `0086` is `76.2`'s | §S4.10 |
-| **(b)** pre-existing fixtures still green | **MET** — all 85 ran; every RED adjudicated environmental, 5 of them proved pre-existing at `cf5cf85` | §S4.5-§S4.8, §S4.10 |
-| **(c)** conformance at declared threshold | **CI-AUTHORITATIVE** — the local gate self-skips (`h2spec not found`); `known-failures.txt` untouched at 21 lines; threshold unchanged | §S4.9 |
-| **(d)** new fuzzer clean short-budget | **MET, no `ci.yml` edit needed** — no new target; seed tracked; local 30 s run clean | §S4.10 |
-| **(e)** build / clippy / fmt / test / deny | **MET** — build exit 0 (13 `Compiling`), clippy exit 0 (13 forced `Checking`, 0 warnings), fmt exit 0 (empty), deny exit 0 (`advisories ok, bans ok, licenses ok, sources ok`), test `2129+8 = 2130+7 = 2137` with zero phase-attributable RED | §S4.1-§S4.5, §S4.7 |
+| **(b)** pre-existing fixtures still green | **MET** — all 85 ran; every RED adjudicated environmental, 5 of them proved pre-existing at `cf5cf85`, and **all ten pass in CI (`162 binaries, passed=2137, failed=0`)** | §S4.5-§S4.8, §S4.10, §S4.14 |
+| **(c)** conformance at declared threshold | **MET in CI at the unchanged 0.95 threshold** — the LOCAL gate self-skips (`h2spec not found`), so the local green is vacuous; CI provisions h2spec 2.6.0 and `h2spec_pass_rate_gate ... ok` there for real. `known-failures.txt` untouched at 21 lines | §S4.9, §S4.14 |
+| **(d)** new fuzzer clean short-budget | **MET, no `ci.yml` edit needed** — no new target; seed tracked; local 30 s run clean; **CI loaded `64 files` for `parse_bootstrap`** and all 5 targets ran 31 s with zero crash markers | §S4.10, §S4.14 |
+| **(e)** build / clippy / fmt / test / deny | **MET** — build exit 0 (13 `Compiling`), clippy exit 0 (13 forced `Checking`, 0 warnings), fmt exit 0 (empty), deny exit 0 (`advisories ok, bans ok, licenses ok, sources ok`), test `2129+8 = 2130+7 = 2137 = CI's 2137+0` with zero phase-attributable RED | §S4.1-§S4.5, §S4.7, §S4.14 |
 | **(f)** `REVIEW.md` approved | **NOT APPLICABLE HERE — state 5, a SEPARATE session** (§5.1; ADR-0127: the context that verified must not grade). No `REVIEW.md` was written. | — |
 
-**Gates (a), (b), (d) and (e) are MET. Gate (c) is met at its unchanged threshold
-in CI. Gate (f) is the only one still open, and it belongs to state 5.**
+**Gates (a), (b), (c), (d) and (e) are MET — (c) in CI at its unchanged
+threshold, confirmed in §S4.14 on the state-4 commit's own run. Gate (f) is the
+only one still open, and it belongs to state 5.**
 
 ### Census deltas re-confirmed at state 4
 
@@ -1434,3 +1435,100 @@ gate. Things a reviewer should be handed rather than have to rediscover:
   which ADD coverage, and §3 records the **two mutation findings that corrected
   the plan** — a misaimed mutation and a vacuous assertion. Those are the two most
   review-relevant items in the state-3 record.
+
+---
+
+## S4.14 CI confirmation on the state-4 commit — the identity's other half
+
+The state-4 commit `ff2871c877457d7a198454f29855195e012b9de6` was pushed and its
+CI run confirmed on the FULL 40-char SHA:
+
+```
+$ gh run view 30585270124 --json headSha,status,conclusion,attempt
+headSha=ff2871c877457d7a198454f29855195e012b9de6
+status=completed
+conclusion=success
+attempt=1
+$ gh api repos/pgdad/envoy-rust/actions/runs/30585270124/jobs --jq '.jobs[] | "\(.name) | conclusion=\(.conclusion) | steps=\(.steps|length) | runner=\"\(.runner_name)\""'
+fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse + grpc_health_decode,… | conclusion=success | steps=13 | runner="GitHub Actions 1000004773"
+build + test + lint | conclusion=success | steps=15 | runner="GitHub Actions 1000004774"
+```
+
+**`conclusion=success`, first attempt, step counts 15 / 13, both jobs on real
+runners** (a `runner_name:""` with `steps:0` would mean starvation, not a result).
+
+### The CI test total — 2137, exactly as predicted
+
+Logs were fetched PER JOB via the API, not via `gh run view --log` (which returns
+only ONE job and would make a fuzz-only failure invisible), and from the repo
+root (a `gh` invoked outside the repo writes a ~120-byte error file over which
+the census returns a believable `passed= failed=`). The build log is 400 431
+bytes.
+
+```
+$ grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed' ci_build.log \
+    | awk '{p+=$4; f+=$6; n++} END{printf "binaries: %d passed=%d failed=%d\n", n, p, f}'
+binaries: 162 passed=2137 failed=0
+$ grep -oE 'test result: (ok|FAILED)\.' ci_build.log | sort | uniq -c
+    162 test result: ok.
+```
+
+**`162 binaries, passed=2137, failed=0` — every binary `ok`, zero FAILED.**
+
+This closes the identity from the other side and is the decisive, independent
+confirmation of §S4.6-§S4.8:
+
+```
+local sweep 1:  2129 passed +  8 failed  = 2137
+local sweep 2:  2130 passed +  7 failed  = 2137
+CI:             2137 passed +  0 failed  = 2137     ✅
+```
+
+**All ten local REDs pass in CI on a tree whose `crates/` and `tests/` are
+byte-identical to the one they failed on.** There is no remaining reading under
+which any of them is a `76.1` regression.
+
+### Gate (c) actually ran in CI
+
+```
+H2SPEC_VERSION="2.6.0"  # pinned; revisit at phase 06+
+curl -fsSL --retry 5 --retry-all-errors "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
+h2spec --version
+…
+     Running tests/h2spec_runner.rs (target/debug/deps/h2spec_runner-73485d2bad653f8a)
+test h2spec_pass_rate_gate ... ok
+```
+
+CI provisions h2spec 2.6.0 and the gate passes there for real — **not the local
+self-skip**. Gate (c) is MET at its unchanged 0.95 threshold, with
+`known-failures.txt` untouched at 21 lines.
+
+### Gate (d) — CI consumed the new seed
+
+```
+$ grep -oE '[0-9]+ files found in .*parse_bootstrap' ci_fuzz.log
+64 files found in /home/runner/work/envoy-rust/envoy-rust/crates/envoy-config/fuzz/corpus/parse_bootstrap
+$ grep -oE 'Done [0-9]+ runs in [0-9]+ second' ci_fuzz.log
+Done 178940 runs in 31 second
+Done 4185048 runs in 31 second
+Done 2977444 runs in 31 second
+Done 2673954 runs in 31 second
+Done 18189242 runs in 31 second
+$ grep -cE 'ERROR: libFuzzer|deadly signal' ci_fuzz.log
+0
+```
+
+**CI sees exactly the 64 TRACKED seeds** — the new `route_redirect_action.yaml`
+among them, which is what the explicit `!` un-ignore line buys. All **five**
+targets ran their 31-second budget with **zero** crash markers.
+
+Note only **FOUR** `INFO: seed corpus:` lines appear for five targets (`64`, `2`,
+`7`, `1`): `cdn_loop_parse` runs with an EMPTY seed corpus. That is the
+pre-existing **CF-75-5**, owned by its own phase and deliberately NOT fixed here
+(§6.3).
+
+---
+
+**With this, gates (a), (b), (c), (d) and (e) are all MET and evidenced. Gate (f)
+— an approved `REVIEW.md` — is the only one still open, and it belongs to §5
+state 5, a separate session.**
