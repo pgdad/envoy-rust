@@ -10763,6 +10763,147 @@ typed_per_filter_config:
         );
     }
 
+    // --- 76.1 Task 6: end-to-end accept direction + Serialize round-trips ---
+
+    /// T-A1..T-A6 through the FULL pipeline (parse AND validate). Each of these
+    /// is a MEASURED upstream ACCEPT; envoy-rust must not reject any of them.
+    #[test]
+    fn accepts_every_measured_redirect_acceptance_end_to_end() {
+        let cases: &[(&str, &str)] = &[
+            ("T-A1 port_redirect: 0", "redirect: { port_redirect: 0 }"),
+            (
+                "T-A2 port_redirect: 70000 (no PGV upper bound)",
+                "redirect: { port_redirect: 70000 }",
+            ),
+            (
+                "T-A3 empty host_redirect",
+                r#"redirect: { host_redirect: "" }"#,
+            ),
+            (
+                "T-A4 empty scheme_redirect",
+                r#"redirect: { scheme_redirect: "" }"#,
+            ),
+            (
+                "T-A5 https_redirect: false ALONE",
+                "redirect: { https_redirect: false }",
+            ),
+            ("T-A6 bare redirect: {}", "redirect: {}"),
+        ];
+        for (label, action_block) in cases {
+            let yaml = redirect_route_yaml(action_block);
+            crate::parse_bootstrap(&yaml)
+                .unwrap_or_else(|e| panic!("{label} must ACCEPT but was rejected: {e}"));
+        }
+    }
+
+    /// T-A7 end-to-end: all five response_code names accept, and each lands as
+    /// its variant with the right wire status.
+    #[test]
+    fn accepts_all_five_response_code_names_end_to_end() {
+        let cases = [
+            (
+                "MOVED_PERMANENTLY",
+                RedirectResponseCode::MovedPermanently,
+                301,
+            ),
+            ("FOUND", RedirectResponseCode::Found, 302),
+            ("SEE_OTHER", RedirectResponseCode::SeeOther, 303),
+            (
+                "TEMPORARY_REDIRECT",
+                RedirectResponseCode::TemporaryRedirect,
+                307,
+            ),
+            (
+                "PERMANENT_REDIRECT",
+                RedirectResponseCode::PermanentRedirect,
+                308,
+            ),
+        ];
+        for (wire, want, status) in cases {
+            let yaml = redirect_route_yaml(&format!("redirect: {{ response_code: {wire} }}"));
+            let b =
+                crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("{wire} must accept: {e}"));
+            match first_route_action(&b) {
+                RouteAction::Redirect(rd) => {
+                    assert_eq!(rd.response_code, want, "{wire}");
+                    assert_eq!(rd.response_code.status(), status, "{wire}");
+                }
+                other => panic!("expected Redirect, got {other:?}"),
+            }
+        }
+    }
+
+    /// T-R6 (J6) end-to-end: an unknown response_code NAME is boot-fatal.
+    #[test]
+    fn rejects_unknown_response_code_name_end_to_end() {
+        let yaml = redirect_route_yaml("redirect: { response_code: BOGUS }");
+        let err = crate::parse_bootstrap(&yaml).expect_err("BOGUS must reject");
+        assert!(err.to_string().contains("BOGUS"), "got: {err}");
+    }
+
+    /// T-R7 (J7) end-to-end: a NUMERIC response_code is boot-fatal.
+    #[test]
+    fn rejects_numeric_response_code_end_to_end() {
+        let yaml = redirect_route_yaml("redirect: { response_code: 302 }");
+        crate::parse_bootstrap(&yaml).expect_err("numeric response_code must reject");
+    }
+
+    /// T-R2 (J2) end-to-end: `regex_rewrite` inside `redirect` is boot-fatal here
+    /// (via deny_unknown_fields — a different mechanism from upstream's oneof
+    /// error, the same VERDICT, which is all the contract requires).
+    #[test]
+    fn rejects_regex_rewrite_inside_redirect_end_to_end() {
+        let yaml = redirect_route_yaml(
+            r#"redirect: { path_redirect: "/p", regex_rewrite: { pattern: x } }"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("regex_rewrite must reject");
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    /// T-C7: round-trip through `impl Serialize for Route` — the `redirect` key is
+    /// emitted and the result re-parses to an equal Route.
+    #[test]
+    fn route_serialize_round_trips_the_redirect_key() {
+        let yaml = redirect_route_yaml(
+            r#"redirect: { host_redirect: example.com, port_redirect: 8443, strip_query: true, response_code: SEE_OTHER }"#,
+        );
+        let b = crate::parse_bootstrap(&yaml).expect("parses");
+        let listener = &b.static_resources.listeners[0];
+        let filter = &listener.filter_chains[0].filters[0];
+        let hcm = match filter.typed_config.as_ref().expect("typed_config") {
+            TypedConfig::HttpConnectionManager(hcm) => hcm,
+            other => panic!("expected HCM, got {other:?}"),
+        };
+        let route = &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0];
+
+        let ser = serde_yaml::to_string(route).expect("Route serializes");
+        assert!(
+            ser.contains("redirect:"),
+            "Route::serialize must emit the `redirect` key; got:\n{ser}"
+        );
+        let back: Route = serde_yaml::from_str(&ser).expect("re-parses");
+        assert_eq!(&back, route, "Route round-trip must be lossless");
+    }
+
+    /// T-C8: round-trip through the SEPARATE `impl Serialize for RouteAction`.
+    /// These are two distinct impls — `Route::serialize` does not delegate — so
+    /// both need their own coverage.
+    #[test]
+    fn route_action_serialize_round_trips_the_redirect_key() {
+        let yaml = redirect_route_yaml("redirect: { port_redirect: 70000 }");
+        let b = crate::parse_bootstrap(&yaml).expect("parses");
+        let action = first_route_action(&b);
+        let ser = serde_yaml::to_string(action).expect("RouteAction serializes");
+        assert!(
+            ser.contains("redirect:"),
+            "RouteAction::serialize must emit the `redirect` key; got:\n{ser}"
+        );
+        assert!(
+            ser.contains("70000"),
+            "port_redirect must survive serialization verbatim; got:\n{ser}"
+        );
+    }
+
     #[test]
     fn parses_route_with_direct_response_action() {
         let routes = r#"- match: { prefix: "/" }
