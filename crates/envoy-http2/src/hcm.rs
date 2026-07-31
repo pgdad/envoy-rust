@@ -517,7 +517,7 @@ async fn handle_one_stream(
         envoy_filter::Decision::Continue => {
             H2RequestPath::Match(build_response(
                 &config.inner,
-                &envoy_req,
+                &mut envoy_req,
                 /* close = */ false,
             ))
         }

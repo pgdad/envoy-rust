@@ -37,6 +37,7 @@ that forced it. Running list:
 |---|---|---|---|
 | D-1 | 2, 3, 4 | `PLAN.md`'s Global Constraint *"`clippy -D warnings` must be clean at every task boundary"* is **NOT ACHIEVABLE under the plan's own task split**, and Task 2 Step 3's *"no `unused_imports` warning"* is **REFUTED**. Measured: Task 2 leaves `RedirectAction` unused (`clippy` exit **101**); Task 3 leaves `RedirectPlan`/`plan_redirect` dead (`never constructed` / `never used`, exit **101**); Task 4 will leave `synth_redirect` dead. | Structural, one root cause: Tasks 2-4 each add a **non-test** item whose only **non-test** consumer is Task 5's dispatch arm. The plan's §2 pre-flight applied Tasks 1-5 as **one patch**, so the unbundled intermediate states never existed there. Accepted, not papered over — `#[allow(dead_code)]` would be cruft deleted at Task 5, and folding 2-4 into 5 would destroy the TDD granularity and the unambiguous REDs. **Self-closes at Task 5**, verified there. `cargo build` and `cargo fmt --check` stay green throughout; only the lint gate is transiently red. |
 | D-2 | 3 | `PLAN.md` T3-3's literal `Some("/é"[..2].into())` **panics in the test itself** and never reaches `plan_redirect`. Replaced with a 2-byte ASCII prefix, `Some("ab")`. | `"/é"` is **3 bytes** (`/`=1, `é`=2), so byte index 2 is **not a char boundary** and `str` slicing there aborts. The replacement witnesses the identical cell honestly: `matched_len` is 2, `"/é".get(2..)` lands mid-`é` and returns `None`, so the `unwrap_or("")` inside `plan_redirect` — the very thing being tested — is what keeps the function total. The plan's §2 pre-flight **ran only two representative tests**, so a runtime panic in a third was invisible to it (`fmt`/`clippy` do not execute tests). |
+| D-4 | 5 | `PLAN.md` Task 5 Step 2's prediction *"the compile fails first on `&mut req` (the signature is still `&Request`)"* is **REFUTED** — it compiles, and the RED is the assertion `left: 501, right: 301`. No code change; the plan's expected-output text is simply wrong. | Rust **coerces `&mut T` to `&T`** at a call site, so passing `&mut req` to a fn still declared `&Request` is legal. The observed RED is strictly *better* evidence than the plan expected: a pure behavioural flip of the placeholder, mirroring the pre-flight's `left: 301, right: 501` from the other side. Recorded so a reviewer comparing the plan's expected text against `PROGRESS.md` does not read the difference as a skipped step. |
 | D-3 | 3 | `PLAN.md` T3-2's assert message `"a bare redirect{} rewrites nothing"` **does not compile**. Escaped to `redirect{{}}`. | `assert_eq!`'s third argument is a **format string**, so the bare `{}` is parsed as a positional placeholder: `error: 1 positional argument in format string, but no arguments were given`. Rendered output is unchanged. Note this contradicts `PLAN.md` §2's claim that the Task-3 block passed `clippy -D warnings` — a block that does not compile cannot have. Recorded as a measured fact about the plan, not repaired in `PLAN.md` (D-3.5: it is this state's input). |
 
 ---
@@ -384,3 +385,114 @@ deliberately, by grep, every time.
 
 **Lint gate:** still transiently red per deviation **D-1** (`synth_redirect` now also has no
 non-test consumer until Task 5). Closes at Task 5.
+
+---
+
+## Task 5 — the real dispatch arm + `&mut Request` + the deliberate flip of T-C9
+
+**Status: COMPLETE.** Commit message: `phase 76.2 task 5: the real redirect dispatch arm + &mut Request; T-C9 deliberately flipped`.
+
+The integration task: `plan_redirect` (Task 3) and `synth_redirect` (Task 4) are wired into the
+single `match &route.action` seam, which serves **both codecs** because HTTP/2 has no route-action
+dispatch of its own.
+
+### The call-site census — the plan's REFUTATION independently reproduced
+
+`76.2/SPEC.md` claimed "**8** `build_response` call sites"; `PLAN.md` refuted that to
+"**7 call sites + 2 definitions**". Re-measured here by grep, and the plan is right:
+
+| site | file |
+|---|---|
+| definition | `hcm.rs:2039` `pub fn build_response` |
+| definition | `hcm.rs:2051` `pub(crate) fn build_response_in` |
+| 1 | `hcm.rs:919` `build_response_in(&route_snapshot, …)` |
+| 2 | `hcm.rs:2045` `build_response_in(&config.current_route_config(), …)` — text unchanged; `req` is now `&mut Request` and reborrows |
+| 3-5 | `hcm.rs:9860` / `:9887` / `:9904` — the **three** in-file test call sites (the SPEC said two; `76.1`'s own T-C9 added the third) |
+| 6 | `uring.rs:287` |
+| 7 | `envoy-http2/src/hcm.rs:518` |
+
+Line numbers here are **this session's**, re-derived by grep — Tasks 3 and 4 shifted every
+`hcm.rs` anchor below `synth_status`, so the plan's `:9734`/`:9761`/`:9778` no longer apply. This
+is the same lesson the plan itself banked: **anchor on text, never on a number.**
+
+### Step 1 — the flip, and N-3 fixed for free
+
+`76.1` attached the T-C9 doc block — including the words **"76.2 MUST flip this test"** — to the
+`redirect_placeholder_config` **helper** rather than to the test. That is banked finding **N-3**,
+and it is confirmed on disk: the block sat at `hcm.rs:9815-9821`, immediately above
+`async fn redirect_placeholder_config`, while the test began at `:9856`.
+
+Fixed as the plan directs: the helper keeps a plain two-line doc describing what it builds, and
+the rewritten doc block — explaining the flip and pinning the `%RESPONSE_CODE_DETAILS%`
+observable — now sits on the **test**. The test is renamed
+`build_response_redirect_is_not_implemented_placeholder` →
+`build_response_redirect_emits_301_and_location`. **The rename is the point:** the placeholder's
+replacement is a visible, named change rather than a silent behaviour shift.
+
+### Step 2 — RUN RED, and a REFUTED plan prediction (deviation **D-4**)
+
+```
+$ cargo test -p envoy-http1 --lib -- build_response_redirect_emits_301_and_location
+exit=101
+test hcm::tests::build_response_redirect_emits_301_and_location ... FAILED
+thread '...' panicked at crates/envoy-http1/src/hcm.rs:9872:17:
+  left: 501
+ right: 301
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 191 filtered out
+```
+
+`PLAN.md` Step 2 predicted *"The compile fails first on `&mut req` (the signature is still
+`&Request`)"*. **Measured: it does not.** Rust coerces `&mut T` to `&T` at a call site, so the test
+compiled against the OLD signature and failed straight on the assertion. The RED is therefore
+*cleaner* than the plan expected — a pure behavioural `left: 501, right: 301`, the exact designed
+flip, and the mirror image of the pre-flight's `left: 301, right: 501`. Recorded as **D-4**.
+
+### Steps 3-4 — the signature widening and the arm
+
+Two signatures widened to `&mut Request`; the 7 call sites updated (sites 3-5 also needed
+`let req =` → `let mut req =`). The H2 site took `&mut envoy_req` at `:518` only, after the
+`mem::take` write-back and the `matched_route` borrow of `config.inner` have ended — the
+borrow-checker caveat the plan flagged **did not materialise**, exactly as its pre-flight said.
+
+The arm itself was transcribed verbatim. Note it re-reads `Host` into an **owned `String`**
+deliberately: that ends the immutable borrow of `req.headers` before the `req.path` write-back.
+
+`synth_501` is **not** dead code after this replacement — re-verified by grep, it remains in use by
+the chunked-`Transfer-Encoding` path at `hcm.rs:915`:
+
+```
+$ grep -n 'synth_501' crates/envoy-http1/src/hcm.rs
+915:                    BuildOutcome::Synth(synth_501(close), None)
+2501:pub(crate) fn synth_501(close: bool) -> Response {
+```
+
+### Step 5 — GREEN across the whole H1 + H2 regression surface
+
+```
+$ cargo test -p envoy-http1 --lib --no-fail-fast     # --no-fail-fast BEFORE the --
+h1-exit=0
+test result: ok. 192 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+$ cargo test -p envoy-http2 --lib --no-fail-fast
+h2-exit=0
+test result: ok. 110 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.53s
+```
+
+Zero `^error` lines in either log. Output was redirected to files and read, never piped through
+`tail` — `tail` truncates the `failures:` block and hides `Compiling`.
+
+### Deviation **D-1 CLOSED** — the lint gate is green again
+
+Tasks 2-4 each left a non-test item with no non-test consumer. Task 5 consumes all three, so the
+full workspace gate now passes:
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+clippy-exit=0 Checking=7
+
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+```
+
+Exit 0 with a **non-zero** `Checking` count — a clippy green with ZERO `Checking` lines would be a
+fully-cached no-op rather than evidence. **D-1 is closed exactly where it was predicted to close.**

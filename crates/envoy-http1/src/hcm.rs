@@ -916,7 +916,7 @@ async fn serve_connection(
                 } else {
                     // Reuse the per-request snapshot taken at resolve time —
                     // no second RwLock read, identical table to `resolve_route_in`.
-                    build_response_in(&route_snapshot, &req, close)
+                    build_response_in(&route_snapshot, &mut req, close)
                 };
                 RequestPath::Match(outcome)
             }
@@ -2036,7 +2036,7 @@ pub(crate) fn resolve_route_in(
     })
 }
 
-pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
+pub fn build_response(config: &HCMConfig, req: &mut Request, close: bool) -> BuildOutcome {
     // Public entry: take the §5.4 read-once snapshot here, then delegate. The
     // H1 handler instead shares one snapshot with `resolve_route_in` (see the
     // handler comment) — behaviour-identical for a stable table, and strictly
@@ -2050,7 +2050,7 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
 /// `RwLock`. See [`resolve_route_in`] for why the H1 loop shares one snapshot.
 pub(crate) fn build_response_in(
     route_config: &Arc<RouteConfiguration>,
-    req: &Request,
+    req: &mut Request,
     close: bool,
 ) -> BuildOutcome {
     // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
@@ -2111,14 +2111,33 @@ pub(crate) fn build_response_in(
         RouteAction::DirectResponse(dr) => {
             BuildOutcome::Synth(synth_direct_response(dr, close), Some("direct_response"))
         }
-        // 76.1 (ADR-0169 DECISION 4): HONEST placeholder for the redirect action.
-        // The config surface landed in 76.1; the runtime lands in 76.2. Returning
-        // the EXISTING synth_501 not-implemented outcome makes a configured-but-
-        // unserved redirect loudly wrong rather than silently wrong, which is what
-        // BOOTSTRAP_PROMPT.md §6.3 requires of a placeholder. 76.2 replaces this
-        // arm with the real 3xx + `location` response; the test pinning this
-        // behaviour is deliberately flipped there.
-        RouteAction::Redirect(_) => BuildOutcome::Synth(synth_501(close), None),
+        // 76.2: the REAL redirect arm, replacing 76.1's honest `synth_501`
+        // placeholder (ADR-0169 DECISION 4). ONE arm serves BOTH codecs — H2 has
+        // no route-action dispatch of its own and calls this function.
+        RouteAction::Redirect(rd) => {
+            // The authority comes from the `Host:` header VERBATIM (port
+            // included), NOT from the socket. Re-read it as an OWNED string so
+            // the immutable borrow of `req.headers` ends before the `req.path`
+            // write-back below.
+            let authority = find_header(&req.headers, headers::HOST)
+                .unwrap_or_default()
+                .to_string();
+            let plan = plan_redirect(&authority, &req.path, route.r#match.prefix.as_deref(), rd);
+            // MEASURED: `prefix_rewrite` MUTATES the logged `:path` while
+            // `path_redirect` does NOT. `build_access_log_record` reads
+            // `req.path` AFTER this function returns, so the rewrite must land
+            // in the request itself.
+            if let Some(new_path) = plan.rewritten_path {
+                req.path = new_path;
+            }
+            // MEASURED: `%RESPONSE_CODE_DETAILS%` for a redirect is
+            // `direct_response` — the SAME bare literal the arm above emits. No
+            // new detail string, `Op` or `AccessLogRecord` field is needed.
+            BuildOutcome::Synth(
+                synth_redirect(plan.status, plan.location, close),
+                Some("direct_response"),
+            )
+        }
         RouteAction::Route(ar) => BuildOutcome::Proxy {
             cluster: ar.cluster.clone(),
             // 16 Task 4: resolve the per-route retry policy. `None` → no retries.
@@ -9812,13 +9831,8 @@ static_resources:
         }
     }
 
-    /// 76.1 T-C9: the HONEST PLACEHOLDER pin (ADR-0169 DECISION 4).
-    /// 76.1 lands the `redirect:` CONFIG SURFACE but no runtime behaviour, so the
-    /// dispatch arm returns the EXISTING `synth_501` not-implemented outcome. This
-    /// test exists so the placeholder is EXERCISED rather than silent, and so that
-    /// 76.2 replacing it with a real 3xx + `location` is a visible, deliberate
-    /// change to a named test rather than an unobserved behaviour shift.
-    /// **76.2 MUST flip this test.**
+    /// Config fixture for the redirect dispatch tests: one `prefix: "/"` route
+    /// whose action is `RouteAction::Redirect` with `https_redirect: true`.
     async fn redirect_placeholder_config() -> HCMConfig {
         HCMConfig {
             stat_prefix: "test".to_string(),
@@ -9853,23 +9867,49 @@ static_resources:
         }
     }
 
+    /// 76.2 T5-1: THE DELIBERATE FLIP of 76.1's T-C9.
+    ///
+    /// 76.1 shipped the `redirect:` CONFIG surface with an honest `synth_501`
+    /// not-implemented placeholder at the dispatch arm, pinned by a test named
+    /// `build_response_redirect_is_not_implemented_placeholder` whose doc block
+    /// said "76.2 MUST flip this test". This is that flip: the arm now serves a
+    /// real 301 carrying a `location:` header. The rename is the point — the
+    /// replacement is a visible, named change rather than an unobserved
+    /// behaviour shift.
+    ///
+    /// Also pins the access-log observable: `%RESPONSE_CODE_DETAILS%` for a
+    /// redirect is `direct_response` (MEASURED — the SAME string upstream uses
+    /// for a `direct_response:` route, and the same bare literal envoy-rust
+    /// already emits), so 76.2 adds NO new detail string, `Op` or
+    /// `AccessLogRecord` field.
     #[tokio::test]
-    async fn build_response_redirect_is_not_implemented_placeholder() {
+    async fn build_response_redirect_emits_301_and_location() {
         let config = redirect_placeholder_config().await;
-        let req = make_req("/foo", "localhost");
-        match build_response(&config, &req, true) {
+        let mut req = make_req("/foo", "localhost");
+        match build_response(&config, &mut req, true) {
             BuildOutcome::Synth(resp, detail) => {
+                assert_eq!(resp.status, 301, "the default response_code is 301");
                 assert_eq!(
-                    resp.status, 501,
-                    "76.1 ships the config surface only; the redirect runtime is 76.2, \
-                     so the placeholder must be the honest 501 not-implemented synth"
+                    resp.headers
+                        .iter()
+                        .find(|(n, _)| n == "location")
+                        .map(|(_, v)| v.as_str()),
+                    Some("https://localhost/foo"),
+                    "https_redirect:true forces the scheme; the authority comes \
+                     from the Host header"
+                );
+                assert!(
+                    !resp.headers.iter().any(|(n, _)| n == "content-type"),
+                    "a redirect MUST NOT carry content-type"
                 );
                 assert_eq!(
-                    detail, None,
-                    "the placeholder must NOT claim a %RESPONSE_CODE_DETAILS% string"
+                    detail,
+                    Some("direct_response"),
+                    "MEASURED: %RESPONSE_CODE_DETAILS% for a redirect is \
+                     `direct_response`"
                 );
             }
-            _other => panic!("expected BuildOutcome::Synth(501)"),
+            _other => panic!("expected BuildOutcome::Synth(301)"),
         }
     }
 
@@ -9883,8 +9923,8 @@ static_resources:
             envoy_lb: envoy_lb.clone(),
         }))
         .await;
-        let req = make_req("/foo", "localhost");
-        match build_response(&config, &req, true) {
+        let mut req = make_req("/foo", "localhost");
+        match build_response(&config, &mut req, true) {
             BuildOutcome::Proxy { subset_match, .. } => {
                 assert_eq!(
                     subset_match,
@@ -9900,8 +9940,8 @@ static_resources:
     async fn build_response_subset_match_none_without_metadata_match() {
         // Route WITHOUT metadata_match → subset_match == None (the no-subset no-op).
         let config = subset_match_test_config(None).await;
-        let req = make_req("/foo", "localhost");
-        match build_response(&config, &req, true) {
+        let mut req = make_req("/foo", "localhost");
+        match build_response(&config, &mut req, true) {
             BuildOutcome::Proxy { subset_match, .. } => {
                 assert_eq!(
                     subset_match, None,

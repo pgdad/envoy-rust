@@ -284,7 +284,7 @@ async fn serve_conn(config: Arc<HCMConfig>, mut down: TcpStream) -> Result<(), H
         let outcome = if chunked {
             BuildOutcome::Synth(synth_501(close), None)
         } else {
-            crate::hcm::build_response(&config, &req, close)
+            crate::hcm::build_response(&config, &mut req, close)
         };
 
         match outcome {
