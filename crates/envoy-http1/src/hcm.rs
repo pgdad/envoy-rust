@@ -9,8 +9,8 @@ use crate::response::{Http1Response, Response};
 
 use bytes::{Buf, Bytes, BytesMut};
 use envoy_config::{
-    AttemptOutcome, DirectResponse, HashPolicy, HttpConnectionManagerConfig, RetryConfig, Route,
-    RouteAction, RouteConfiguration, VirtualHost,
+    AttemptOutcome, DirectResponse, HashPolicy, HttpConnectionManagerConfig, RedirectAction,
+    RetryConfig, Route, RouteAction, RouteConfiguration, VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::{Arc, RwLock};
@@ -2358,9 +2358,7 @@ pub(crate) fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_config::{
-        DataSource, HashPolicyHeader, LbMetadata, RedirectAction, RouteAction_Route, RouteMatch,
-    };
+    use envoy_config::{DataSource, HashPolicyHeader, LbMetadata, RouteAction_Route, RouteMatch};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
