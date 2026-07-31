@@ -194,7 +194,16 @@ pub(crate) fn canonical_reason(status: u16) -> &'static str {
         204 => "No Content",
         301 => "Moved Permanently",
         302 => "Found",
+        // 76.2: MEASURED on the wire against envoyproxy/envoy:v1.33.0 —
+        // `HTTP/1.1 303 See Other` / `307 Temporary Redirect` /
+        // `308 Permanent Redirect`. Before 76.2 all three fell through to
+        // `_ => "OK"`, so a `SEE_OTHER` redirect emitted `HTTP/1.1 303 OK`.
+        // The differential fixture CANNOT catch this — the harness parses the
+        // status CODE only — so these three are pinned in-process.
+        303 => "See Other",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -501,5 +510,20 @@ mod tests {
         assert_eq!(sink.data, reference);
         assert_eq!(sink.write_calls, 1, "one plain write");
         assert_eq!(sink.write_vectored_calls, 0, "no writev for empty body");
+    }
+
+    /// 76.2: the three redirect reason phrases MEASURED on the wire against
+    /// `envoyproxy/envoy:v1.33.0`. Before 76.2 all three fell through to
+    /// `_ => "OK"`, so a `SEE_OTHER` redirect emitted `HTTP/1.1 303 OK`.
+    /// The differential fixture CANNOT catch this — the harness parses the
+    /// status CODE only — so this in-process pin is the ONLY guard.
+    #[test]
+    fn canonical_reason_covers_the_three_redirect_codes() {
+        assert_eq!(canonical_reason(303), "See Other");
+        assert_eq!(canonical_reason(307), "Temporary Redirect");
+        assert_eq!(canonical_reason(308), "Permanent Redirect");
+        // Guard the two that already worked, so a careless table edit is caught.
+        assert_eq!(canonical_reason(301), "Moved Permanently");
+        assert_eq!(canonical_reason(302), "Found");
     }
 }
