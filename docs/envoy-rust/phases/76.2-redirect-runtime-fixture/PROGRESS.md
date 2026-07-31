@@ -35,7 +35,9 @@ that forced it. Running list:
 
 | # | task | deviation | why |
 |---|---|---|---|
-| D-1 | 2 | `PLAN.md` Task 2 Step 3's expectation *"success, no `unused_imports` warning"* is **REFUTED**. Standalone, Task 2 leaves `RedirectAction` imported-but-unused in the non-test lib build, so `clippy -D warnings` exits **101** at this one boundary. | The import is consumed only by Task 3's `plan_redirect`. The plan's §2 pre-flight applied Tasks 1-5 **together** in one worktree, so it never observed the standalone state. Accepted rather than "fixed": Task 2 exists precisely so Task 3's RED is unambiguous, and inventing an `#[allow(unused_imports)]` would be cruft removed one commit later. **Self-closes at Task 3.** |
+| D-1 | 2, 3, 4 | `PLAN.md`'s Global Constraint *"`clippy -D warnings` must be clean at every task boundary"* is **NOT ACHIEVABLE under the plan's own task split**, and Task 2 Step 3's *"no `unused_imports` warning"* is **REFUTED**. Measured: Task 2 leaves `RedirectAction` unused (`clippy` exit **101**); Task 3 leaves `RedirectPlan`/`plan_redirect` dead (`never constructed` / `never used`, exit **101**); Task 4 will leave `synth_redirect` dead. | Structural, one root cause: Tasks 2-4 each add a **non-test** item whose only **non-test** consumer is Task 5's dispatch arm. The plan's §2 pre-flight applied Tasks 1-5 as **one patch**, so the unbundled intermediate states never existed there. Accepted, not papered over — `#[allow(dead_code)]` would be cruft deleted at Task 5, and folding 2-4 into 5 would destroy the TDD granularity and the unambiguous REDs. **Self-closes at Task 5**, verified there. `cargo build` and `cargo fmt --check` stay green throughout; only the lint gate is transiently red. |
+| D-2 | 3 | `PLAN.md` T3-3's literal `Some("/é"[..2].into())` **panics in the test itself** and never reaches `plan_redirect`. Replaced with a 2-byte ASCII prefix, `Some("ab")`. | `"/é"` is **3 bytes** (`/`=1, `é`=2), so byte index 2 is **not a char boundary** and `str` slicing there aborts. The replacement witnesses the identical cell honestly: `matched_len` is 2, `"/é".get(2..)` lands mid-`é` and returns `None`, so the `unwrap_or("")` inside `plan_redirect` — the very thing being tested — is what keeps the function total. The plan's §2 pre-flight **ran only two representative tests**, so a runtime panic in a third was invisible to it (`fmt`/`clippy` do not execute tests). |
+| D-3 | 3 | `PLAN.md` T3-2's assert message `"a bare redirect{} rewrites nothing"` **does not compile**. Escaped to `redirect{{}}`. | `assert_eq!`'s third argument is a **format string**, so the bare `{}` is parsed as a positional placeholder: `error: 1 positional argument in format string, but no arguments were given`. Rendered output is unchanged. Note this contradicts `PLAN.md` §2's claim that the Task-3 block passed `clippy -D warnings` — a block that does not compile cannot have. Recorded as a measured fact about the plan, not repaired in `PLAN.md` (D-3.5: it is this state's input). |
 
 ---
 
@@ -172,3 +174,145 @@ times: **an expectation inherited from a bundled measurement does not survive be
 `#[allow(unused_imports)]` would be cruft deleted one commit later, and folding Task 2 into Task 3
 would destroy the disambiguation the task exists for. The boundary closes at Task 3, where
 `plan_redirect` consumes the import — verified there.
+
+---
+
+## Task 3 — the pure `location`-builder: `RedirectPlan` + `plan_redirect`
+
+**Status: COMPLETE.** Commit message: `phase 76.2 task 3: the pure location-builder — all 22 MEASURED cells pinned`.
+
+This is the phase's centre of gravity: one pure, total function encoding the whole MEASURED
+upstream rule set, so all 22 cells are unit-testable **without a socket**.
+
+### Anchors re-verified on disk (at `c7d3735`)
+
+- Insertion point: `synth_status` ends at `hcm.rs:2225`; the next item is
+  `synth_no_healthy_upstream`, whose **doc block starts at `:2227`** (`/// 12.2 (parent-12 D6.2 per
+  ADR-0037): …`). `PLAN.md` is explicit that the insert goes **above that doc block, never between
+  it and its function** — this is the exact hazard that produced `76.1`'s M-1. Honoured: verified
+  after the edit that `/// 12.2 …` still sits immediately above `pub(crate) fn
+  synth_no_healthy_upstream`.
+- `strip_port` at `hcm.rs:2146` ✓ (consumed by rule (b)).
+- `76.1`'s types, re-read rather than assumed: `RedirectAction` at `bootstrap.rs:2226` derives
+  **`Default`** (`:2224`) — required by the table's `RedirectAction::default()` rows;
+  `strip_query` is a bare `bool` (`:2240`); `response_code` is `RedirectResponseCode` (`:2242`);
+  the enum's five variants are `MovedPermanently`/`Found`/`SeeOther`/`TemporaryRedirect`/
+  `PermanentRedirect` (`:2185-2192`) with `status()` at `:2198`.
+
+### Step 2 — RUN RED, twice, and the second run is the honest one
+
+First run surfaced **two** distinct errors — the intended one plus a defect in the plan's own
+literal (deviation **D-3**):
+
+```
+exit=101
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+error: 1 positional argument in format string, but no arguments were given
+error[E0425]: cannot find function `plan_redirect` in this scope   (x6)
+error: could not compile `envoy-http1` (lib test) due to 7 previous errors
+```
+
+After escaping `{}` → `{{}}`, the RED is **unambiguous**, which is the whole point of Task 2
+existing:
+
+```
+$ cargo test -p envoy-http1 --lib -- plan_redirect
+exit=101
+      6 error[E0425]: cannot find function `plan_redirect` in this scope
+      1 error: could not compile `envoy-http1` (lib test) due to 6 previous errors
+```
+
+Six errors, all the same, all "the function does not exist". Because Task 2 already landed the
+import, this error **can only mean** the function is missing — a missing-import error would have
+been textually identical, and that is precisely why the plan split Task 2 out.
+
+### Step 3 — implementation, transcribed verbatim
+
+`RedirectPlan` + `plan_redirect` inserted verbatim from `PLAN.md` (which `cargo fmt --check`
+confirms was already canonical — see below). Rules (a) scheme, (b) the authority asymmetry,
+(c) path, (d) query, (e) status, each carrying its MEASURED provenance comment.
+
+### Step 4 — GREEN
+
+```
+$ cargo test -p envoy-http1 --lib -- plan_redirect
+exit=0
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+test hcm::tests::plan_redirect_is_total_on_degenerate_spans ... ok
+test hcm::tests::plan_redirect_reports_a_rewritten_path_only_for_prefix_rewrite ... ok
+test hcm::tests::plan_redirect_matches_every_measured_location_cell ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s
+```
+
+**`3 passed`** — asserted on the count, never the exit code. All **22** measured cells pass, and
+the test itself asserts `cells.len() == 22` so a silently dropped row fails loudly.
+
+The 22 cells were kept **table-driven**, per `PLAN.md` §4's binding mitigation: written as 22
+house-style `#[test]` fns this group would grow from ~255 to ~400 LoC and consume the entire §6.1
+headroom. Each row carries its own `label`, so attribution is not lost — proved by the mutation
+check below, which names its cell exactly.
+
+```
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+```
+
+### Step 5 — MUTATION CHECK: the authority asymmetry really is pinned
+
+The single most likely from-scratch mistake is treating `host_redirect` symmetrically with the
+scheme change. Run under full hygiene: **the clean work was committed FIRST** (`d53a38b`) and the
+mutation applied in a **scratch `git worktree --detach` at that commit** — never in the main tree,
+because a parallel agent's `git checkout` can silently revert an in-place mutation, and four
+sibling `.claude/worktrees/agent-*` worktrees were live during this session.
+
+**Control first, from the same worktree** (a RED that never reached an assertion is not evidence):
+
+```
+$ git worktree add --detach <scratch> d53a38b
+worktree at: d53a38b372c88b19ecdacce520fc0f6e9ba70506
+$ cargo test -p envoy-http1 --lib -- plan_redirect_matches_every_measured_location_cell
+CONTROL exit=0
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 190 filtered out
+```
+
+Mutation applied — `let host_part = rd.host_redirect.as_deref().unwrap_or(authority);` →
+`let host_part = authority;`:
+
+```
+MUTATED exit=101
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+test hcm::tests::plan_redirect_matches_every_measured_location_cell ... FAILED
+thread '...' panicked at crates/envoy-http1/src/hcm.rs:10573:13:
+assertion `left == right` failed: cell R1 host_redirect replaces the authority: location
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 190 filtered out
+```
+
+**RED, naming `cell R1 host_redirect replaces the authority: location`** — the exact cell
+`PLAN.md` Step 5 predicted, which also demonstrates the table's per-row `label` preserves
+attribution. `Compiling envoy-http1` on both runs proves neither used a stale binary.
+
+Post-run integrity re-grep (a sibling agent can revert a mutation mid-run):
+
+```
+mutation still present? -> 1 (expect 1)
+original still absent?  -> 0 (expect 0)
+```
+
+Worktree removed; `git worktree list` re-checked from the repo root shows only the main tree and
+the **four pre-existing sibling `agent-*` worktrees, left untouched**. Main tree re-verified
+unmutated (`grep -c` of the original line → **1**) and `git status --porcelain` clean.
+
+### Lint gate at this boundary — deviation **D-1**, widened
+
+```
+$ cargo clippy -p envoy-http1 --all-targets --all-features -- -D warnings
+clippy-exit=101 Checking=1
+error: struct `RedirectPlan` is never constructed
+error: function `plan_redirect` is never used
+```
+
+Same root cause as Task 2's: the only **non-test** consumer of `plan_redirect` is Task 5's
+dispatch arm. `cargo build` and `cargo fmt --check` are green; the lint gate is transiently red
+across Tasks 2-4 and **closes at Task 5**. See deviation **D-1** for why this is accepted rather
+than suppressed.

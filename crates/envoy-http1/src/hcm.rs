@@ -2224,6 +2224,108 @@ pub(crate) fn synth_status(status: u16, close: bool) -> Response {
     synth_with(status, Bytes::new(), close)
 }
 
+/// 76.2 (SPEC 2.4): the pure, total outcome of applying a `RedirectAction` to
+/// one request. Produced by [`plan_redirect`] with no I/O, so every measured
+/// upstream cell is unit-testable without a socket.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RedirectPlan {
+    /// The `location:` header value.
+    pub location: String,
+    /// The wire status, from `RedirectResponseCode::status()`.
+    pub status: u16,
+    /// `Some(new_path)` exactly when `prefix_rewrite` applied. The dispatch arm
+    /// writes it back into `req.path` so the access log observes the rewrite —
+    /// MEASURED: `prefix_rewrite` MUTATES the logged `:path` while
+    /// `path_redirect` does NOT.
+    pub rewritten_path: Option<String>,
+}
+
+/// 76.2 (SPEC 2.4): build the redirect plan from the MEASURED upstream rules
+/// (a)-(e). Pure and total — it never panics and never touches the network.
+///
+/// * `authority` — the request's `Host:` header VERBATIM, port included. The
+///   authority in `location` comes from that header, NOT from the socket
+///   (MEASURED: a `Host:` port differing from the listen port is echoed).
+/// * `target` — the raw request target, query included.
+/// * `matched_prefix` — the matched route's `match.prefix`, the span that
+///   `prefix_rewrite` replaces. `None` (a `path:`-matched route) means the
+///   whole path is the matched span.
+fn plan_redirect(
+    authority: &str,
+    target: &str,
+    matched_prefix: Option<&str>,
+    rd: &RedirectAction,
+) -> RedirectPlan {
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target, None),
+    };
+
+    // (a) Scheme. `scheme_redirect` wins and is NOT validated against any
+    // allow-list (MEASURED: the literal `ftp` is accepted and emitted
+    // verbatim); else `https_redirect: true` forces https; else the scheme the
+    // request arrived on. An explicit `https_redirect: false` is the default.
+    let scheme = match (rd.scheme_redirect.as_deref(), rd.https_redirect) {
+        (Some(s), _) => s,
+        (None, Some(true)) => "https",
+        (None, _) => "http",
+    };
+
+    // (b) Authority — the asymmetry, and the trap. `host_redirect` SET makes
+    // the authority that host and DROPS the request's original port;
+    // `host_redirect` UNSET preserves the request's authority INCLUDING its
+    // port. `port_redirect` overrides the port in BOTH cases and is rendered
+    // verbatim with no range clamp (MEASURED: upstream accepts `70000` and
+    // emits `:70000`), and a scheme-only change does NOT normalise a now
+    // redundant `:443`.
+    let host_part = rd.host_redirect.as_deref().unwrap_or(authority);
+    let authority_out = match rd.port_redirect {
+        Some(port) => format!("{}:{}", strip_port(host_part), port),
+        None => host_part.to_string(),
+    };
+
+    // (c) Path. The two rewrites are mutually exclusive (rejected at load by
+    // the 76.1 oneof validator), and an EMPTY `path_redirect` performs NO
+    // rewrite — MEASURED: `path_redirect: ""` leaves the original path.
+    let mut rewritten_path = None;
+    let new_path = match (
+        rd.path_redirect.as_deref().filter(|p| !p.is_empty()),
+        rd.prefix_rewrite.as_deref(),
+    ) {
+        (Some(p), _) => p.to_string(),
+        (None, Some(pr)) => {
+            // `get(..).unwrap_or("")` keeps the function TOTAL: a matched span
+            // longer than the path, or one landing off a UTF-8 boundary, yields
+            // an empty tail instead of panicking.
+            let matched_len = matched_prefix.map_or(path.len(), str::len);
+            let rewritten = format!("{}{}", pr, path.get(matched_len..).unwrap_or(""));
+            // The request's own query rides along on the rewritten `:path`;
+            // `strip_query` is a location-side rule only.
+            rewritten_path = Some(match query {
+                Some(q) => format!("{rewritten}?{q}"),
+                None => rewritten.clone(),
+            });
+            rewritten
+        }
+        (None, None) => path.to_string(),
+    };
+
+    // (d) Query. Preserved by default even when `path_redirect` replaced the
+    // path wholesale; `strip_query: true` drops it.
+    let query_suffix = match (rd.strip_query, query) {
+        (false, Some(q)) => format!("?{q}"),
+        _ => String::new(),
+    };
+
+    RedirectPlan {
+        location: format!("{scheme}://{authority_out}{new_path}{query_suffix}"),
+        // (e) Status. Default 301; the five `response_code` values map through
+        // the 76.1 `RedirectResponseCode::status()` table.
+        status: rd.response_code.status(),
+        rewritten_path,
+    }
+}
+
 /// 12.2 (parent-12 D6.2 per ADR-0037): no-healthy-upstream synth-503 response.
 /// Mirrors `synth_status`'s 5-header shape but emits the 19-byte body
 /// `no healthy upstream` (hex `6e 6f 20 68 65 61 6c 74 68 79 20 75 70 73 74
@@ -10193,6 +10295,349 @@ static_resources:
                 &Default::default()
             ),
             "an EMPTY header value is PRESENT, so present_match:false DROPs"
+        );
+    }
+
+    /// 76.2 T3-1: the MEASURED `location` table. One row per upstream cell
+    /// measured against `envoyproxy/envoy:v1.33.0` (SPEC 2.3 — R1-R16, Q1-Q4,
+    /// E1-E2). Table-driven ON PURPOSE: `plan_redirect` is a pure total
+    /// function, so a newly measured cell must cost ONE line. Each row carries
+    /// its own `label`, so a failure names the exact cell.
+    #[test]
+    fn plan_redirect_matches_every_measured_location_cell() {
+        struct Cell {
+            label: &'static str,
+            host: &'static str,
+            prefix: Option<&'static str>,
+            target: &'static str,
+            rd: RedirectAction,
+            status: u16,
+            location: &'static str,
+        }
+        fn rd(f: impl FnOnce(&mut RedirectAction)) -> RedirectAction {
+            let mut r = RedirectAction::default();
+            f(&mut r);
+            r
+        }
+        fn cell(
+            label: &'static str,
+            host: &'static str,
+            prefix: &'static str,
+            target: &'static str,
+            rd: RedirectAction,
+            status: u16,
+            location: &'static str,
+        ) -> Cell {
+            Cell {
+                label,
+                host,
+                prefix: Some(prefix),
+                target,
+                rd,
+                status,
+                location,
+            }
+        }
+        use envoy_config::RedirectResponseCode as RC;
+        let cells = vec![
+            cell(
+                "R1 host_redirect replaces the authority",
+                "envoy-rust.test",
+                "/a-host",
+                "/a-host",
+                rd(|r| r.host_redirect = Some("example.com".into())),
+                301,
+                "http://example.com/a-host",
+            ),
+            cell(
+                "R2 the query is preserved by default",
+                "envoy-rust.test",
+                "/b-query",
+                "/b-query/deep?a=b",
+                rd(|r| r.host_redirect = Some("example.com".into())),
+                301,
+                "http://example.com/b-query/deep?a=b",
+            ),
+            cell(
+                "R3 path_redirect replaces the path wholesale",
+                "envoy-rust.test",
+                "/c-pathr",
+                "/c-pathr/sub",
+                rd(|r| r.path_redirect = Some("/newpath".into())),
+                301,
+                "http://envoy-rust.test/newpath",
+            ),
+            cell(
+                "R4 path_redirect STILL keeps the query",
+                "envoy-rust.test",
+                "/d-pathq",
+                "/d-pathq/x?k=v",
+                rd(|r| r.path_redirect = Some("/newpath".into())),
+                301,
+                "http://envoy-rust.test/newpath?k=v",
+            ),
+            cell(
+                "R5 prefix_rewrite replaces only the matched span",
+                "envoy-rust.test",
+                "/e-pfx",
+                "/e-pfx/sub",
+                rd(|r| r.prefix_rewrite = Some("/replaced".into())),
+                301,
+                "http://envoy-rust.test/replaced/sub",
+            ),
+            cell(
+                "R6 https_redirect forces the scheme",
+                "envoy-rust.test",
+                "/f-https",
+                "/f-https/x",
+                rd(|r| r.https_redirect = Some(true)),
+                301,
+                "https://envoy-rust.test/f-https/x",
+            ),
+            cell(
+                "R7 response_code TEMPORARY_REDIRECT",
+                "envoy-rust.test",
+                "/g-c307",
+                "/g-c307",
+                rd(|r| {
+                    r.host_redirect = Some("example.com".into());
+                    r.response_code = RC::TemporaryRedirect;
+                }),
+                307,
+                "http://example.com/g-c307",
+            ),
+            cell(
+                "R8 strip_query drops the query",
+                "envoy-rust.test",
+                "/h-strip",
+                "/h-strip/a?q=1&z=2",
+                rd(|r| {
+                    r.host_redirect = Some("example.com".into());
+                    r.strip_query = true;
+                }),
+                301,
+                "http://example.com/h-strip/a",
+            ),
+            cell(
+                "R9 port_redirect alongside host_redirect",
+                "envoy-rust.test",
+                "/i-port",
+                "/i-port",
+                rd(|r| {
+                    r.host_redirect = Some("example.com".into());
+                    r.port_redirect = Some(8443);
+                }),
+                301,
+                "http://example.com:8443/i-port",
+            ),
+            cell(
+                "R10 a bare redirect{} echoes the request",
+                "envoy-rust.test",
+                "/j-bare",
+                "/j-bare/deep",
+                RedirectAction::default(),
+                301,
+                "http://envoy-rust.test/j-bare/deep",
+            ),
+            cell(
+                "R11 scheme_redirect is NOT allow-listed — `ftp` is emitted verbatim",
+                "envoy-rust.test",
+                "/k-scheme",
+                "/k-scheme/x",
+                rd(|r| r.scheme_redirect = Some("ftp".into())),
+                301,
+                "ftp://envoy-rust.test/k-scheme/x",
+            ),
+            cell(
+                "R12 scheme_redirect + host_redirect together",
+                "envoy-rust.test",
+                "/l-both",
+                "/l-both/y",
+                rd(|r| {
+                    r.scheme_redirect = Some("https".into());
+                    r.host_redirect = Some("e.com".into());
+                }),
+                301,
+                "https://e.com/l-both/y",
+            ),
+            cell(
+                "R13 response_code SEE_OTHER + strip_query",
+                "envoy-rust.test",
+                "/m-see",
+                "/m-see/y?q=1",
+                rd(|r| {
+                    r.host_redirect = Some("e.com".into());
+                    r.strip_query = true;
+                    r.response_code = RC::SeeOther;
+                }),
+                303,
+                "http://e.com/m-see/y",
+            ),
+            cell(
+                "R14 a scheme change does NOT normalise a redundant :443",
+                "envoy-rust.test",
+                "/n-hport",
+                "/n-hport/y",
+                rd(|r| {
+                    r.https_redirect = Some(true);
+                    r.port_redirect = Some(443);
+                }),
+                301,
+                "https://envoy-rust.test:443/n-hport/y",
+            ),
+            cell(
+                "R15 response_code FOUND",
+                "envoy-rust.test",
+                "/o-found",
+                "/o-found",
+                rd(|r| {
+                    r.host_redirect = Some("example.com".into());
+                    r.response_code = RC::Found;
+                }),
+                302,
+                "http://example.com/o-found",
+            ),
+            cell(
+                "R16 response_code PERMANENT_REDIRECT",
+                "envoy-rust.test",
+                "/p-perm",
+                "/p-perm",
+                rd(|r| {
+                    r.host_redirect = Some("example.com".into());
+                    r.response_code = RC::PermanentRedirect;
+                }),
+                308,
+                "http://example.com/p-perm",
+            ),
+            cell(
+                "Q1 host_redirect UNSET preserves the request's port",
+                "envoy-rust.test:1234",
+                "/q1-hostport",
+                "/q1-hostport/x",
+                rd(|r| r.https_redirect = Some(true)),
+                301,
+                "https://envoy-rust.test:1234/q1-hostport/x",
+            ),
+            cell(
+                "Q2 host_redirect SET DROPS the request's port — the asymmetry",
+                "envoy-rust.test:1234",
+                "/a-host",
+                "/a-host",
+                rd(|r| r.host_redirect = Some("example.com".into())),
+                301,
+                "http://example.com/a-host",
+            ),
+            cell(
+                "Q3 a bare redirect{} preserves the request's port",
+                "envoy-rust.test:1234",
+                "/q3-hostport",
+                "/q3-hostport/d",
+                RedirectAction::default(),
+                301,
+                "http://envoy-rust.test:1234/q3-hostport/d",
+            ),
+            cell(
+                "Q4 port_redirect OVERRIDES the request's port",
+                "envoy-rust.test:1234",
+                "/n-hport",
+                "/n-hport/y",
+                rd(|r| {
+                    r.https_redirect = Some(true);
+                    r.port_redirect = Some(443);
+                }),
+                301,
+                "https://envoy-rust.test:443/n-hport/y",
+            ),
+            cell(
+                "E1 an explicit https_redirect:false is the DEFAULT scheme",
+                "envoy-rust.test",
+                "/y-hfalse",
+                "/y-hfalse/z",
+                rd(|r| r.https_redirect = Some(false)),
+                301,
+                "http://envoy-rust.test/y-hfalse/z",
+            ),
+            cell(
+                "E2 an EMPTY path_redirect performs NO rewrite",
+                "envoy-rust.test",
+                "/x-emptypath",
+                "/x-emptypath/z",
+                rd(|r| r.path_redirect = Some(String::new())),
+                301,
+                "http://envoy-rust.test/x-emptypath/z",
+            ),
+        ];
+        assert_eq!(cells.len(), 22, "all 22 MEASURED cells must be present");
+        for c in &cells {
+            let plan = plan_redirect(c.host, c.target, c.prefix, &c.rd);
+            assert_eq!(plan.location, c.location, "cell {}: location", c.label);
+            assert_eq!(plan.status, c.status, "cell {}: status", c.label);
+        }
+    }
+
+    /// 76.2 T3-2: `prefix_rewrite` is the ONLY arm that reports a rewritten
+    /// `:path`. MEASURED: `prefix_rewrite` MUTATES the logged `:path` while
+    /// `path_redirect` does NOT.
+    #[test]
+    fn plan_redirect_reports_a_rewritten_path_only_for_prefix_rewrite() {
+        let pfx = RedirectAction {
+            prefix_rewrite: Some("/replaced".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_redirect("h.test", "/e-pfx/sub", Some("/e-pfx"), &pfx).rewritten_path,
+            Some("/replaced/sub".to_string()),
+        );
+
+        let pathr = RedirectAction {
+            path_redirect: Some("/newpath".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_redirect("h.test", "/c-pathr/sub", Some("/c-pathr"), &pathr).rewritten_path,
+            None,
+            "path_redirect must NOT rewrite the request's own :path"
+        );
+
+        assert_eq!(
+            plan_redirect(
+                "h.test",
+                "/j-bare/x",
+                Some("/j-bare"),
+                &RedirectAction::default()
+            )
+            .rewritten_path,
+            None,
+            "a bare redirect{{}} rewrites nothing"
+        );
+    }
+
+    /// 76.2 T3-3: `plan_redirect` is TOTAL — it must not panic on a matched
+    /// span longer than the path, nor on one landing off a UTF-8 boundary.
+    ///
+    /// DEVIATION D-2 from `PLAN.md`: the plan's literal for the second case was
+    /// `Some("/é"[..2].into())`, which panics IN THE TEST ITSELF — `"/é"` is
+    /// three bytes (`/` = 1, `é` = 2) so byte index 2 is not a char boundary and
+    /// slicing there aborts before `plan_redirect` is ever called. A two-byte
+    /// ASCII prefix witnesses the same cell honestly: `matched_len` is 2, and
+    /// `"/é".get(2..)` lands mid-`é`, returns `None`, and the `unwrap_or("")`
+    /// inside `plan_redirect` is what keeps the function total.
+    #[test]
+    fn plan_redirect_is_total_on_degenerate_spans() {
+        let rd = RedirectAction {
+            prefix_rewrite: Some("/r".into()),
+            ..Default::default()
+        };
+        // Matched span longer than the path.
+        assert_eq!(
+            plan_redirect("h.test", "/ab", Some("/abcdefgh"), &rd).location,
+            "http://h.test/r"
+        );
+        // Matched span landing mid-codepoint: `"/é"` is 3 bytes, so a 2-byte
+        // span ends inside `é` and `str::get` returns None.
+        assert_eq!(
+            plan_redirect("h.test", "/\u{e9}", Some("ab"), &rd).location,
+            "http://h.test/r"
         );
     }
 }
