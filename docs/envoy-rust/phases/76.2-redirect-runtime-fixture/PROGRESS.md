@@ -1189,3 +1189,601 @@ re-measured and all three legs came back FALSE.
 D-1..D-6** table at the top of this file. Three of the six are defects in `PLAN.md`'s own
 *pre-flighted* literal Rust, so a reviewer diffing the plan's text against the landed code will
 find intentional differences, each with its measurement.
+
+---
+
+# §5 state-4 — the §7.5 phase-done gate, RUN AND ADJUDICATED
+
+> **What this section is.** The §5 **state-4** VERIFICATION of sub-phase `76.2-redirect-runtime-fixture`,
+> run by a session separate from the state-3 implementation (§5.1; ADR-0127 — the context that wrote
+> an artifact must not grade it). Every command below was **actually run in this session** and its
+> **real output is quoted**. Written for a reader with zero prior context (D-3.4).
+>
+> **This session does NOT review.** State 5 is a separate session, and `REVIEW.md` does not exist yet,
+> so gate (f) is legitimately **OPEN** — see the adjudication table.
+>
+> **Cold start (disk-authoritative).** `git status --porcelain` clean; branch `main`; `HEAD` at
+> `a2ebc8a2a791012504ef13140d9c90a826388b6c`, equal to `origin/main` after `git fetch origin --prune`.
+> Directory holds `SPEC.md` + `PLAN.md` + `PROGRESS.md` and **no** `REVIEW.md` — §5 state 4's
+> unambiguous detection rule. ROADMAP row `76.2` `planned`, `76.1` `done`, parent `76` `in-progress`
+> (re-measured by splitting each row on `' | '` and reading **field 4**, not field 5).
+
+## S4.0 — censuses RE-DERIVED on disk, never inherited
+
+Every figure this session used was re-measured. `git ls-files` was used throughout so the four live
+sibling `.claude/worktrees/agent-*` worktrees cannot inflate a count.
+
+| census | inherited | **MEASURED here** | verdict |
+|---|---|---|---|
+| ROADMAP rows / `done` / `in-progress` / `planned` | 107 / 105 / 1 / 1 | **107 / 105 / 1 / 1** | reproduces |
+| fixture dirs (`tests/fixtures/`) | 86 | **86** | reproduces |
+| differential test files | 86 | **86** | reproduces |
+| `HEADER_ALLOW_LIST` entries | 3 | **3**, at `tests/differential/src/lib.rs:1177-1181` | reproduces (line range refined from the inherited `:1173-1181`) |
+| `location` in `HEADER_ALLOW_LIST` | must be 0 | **0** | the `0086` witness is intact |
+| `known-failures.txt` | 21 lines | **21**, byte-unchanged by the phase | reproduces |
+| fuzz targets | 5 across 5 crates | **5** across 5 crates | reproduces |
+| ADR ledger head | ADR-0170 | **ADR-0170**, next free **ADR-0171** | reproduces |
+| `synth_501` still live | not dead code | **defined `hcm.rs:2501`, consumed `hcm.rs:915`** | correctly NOT deleted |
+
+## S4.1 — gate (e): build, clippy, fmt, deny
+
+Run in CI's order. **Each was gated on its `Compiling`/`Checking` LINE COUNT, not on its exit code
+or duration** — a clippy exit 0 with zero `Checking` lines is a fully-cached no-op, not evidence.
+
+```
+$ cargo build --workspace --all-targets
+exit=0     # 14 `Compiling` lines — real work, not a cached no-op
+   Compiling envoy-config v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-config)
+   Compiling differential v0.0.0 (/home/esa/git/envoy-rust/tests/differential)
+   Compiling envoy-listener v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-listener)
+   ... (14 total)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.17s
+```
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+exit=0     # 14 `Checking` lines
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.69s
+```
+
+**Zero warnings, zero errors.** This also CLOSES deviation **D-1** from the top of this file: the
+plan's "clippy clean at every task boundary" was unachievable under its own task split and
+self-closed at Task 5 — confirmed here at the phase level.
+
+```
+$ cargo fmt --all -- --check
+exit=0     # ZERO bytes of output
+```
+
+```
+$ cargo deny check
+exit=0
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+`cargo deny` emitted **5** `warning[license-not-encountered]` lines (`0BSD`, `BSD-2-Clause`,
+`MPL-2.0`, `Unicode-DFS-2016`, `Zlib`). These are **unmatched ALLOWANCES in `deny.toml`, not
+violations** — the four verdict words above are all `ok`.
+
+**ADR-0150 seam re-verified as a side-effect.** `envoy-accesslog`'s `[dependencies]` are exactly
+`tokio`, `bytes`, `tracing`, `thiserror` — `grep -c envoy-config crates/envoy-accesslog/Cargo.toml`
+returns **0** — and `envoy-accesslog` is **ABSENT** from the clippy `Checking` list even though this
+phase changed `envoy-config`. Touching `envoy-config` did not force an `envoy-accesslog` re-check:
+**the seam holds.**
+
+**D-3.8 re-verified** on all three crates this phase touched: `crates/envoy-http1/src/lib.rs`,
+`crates/envoy-http2/src/lib.rs` and `crates/envoy-config/src/lib.rs` each begin
+`#![forbid(unsafe_code)]`.
+
+## S4.2 — gate (b): THREE full workspace sweeps, with the failing SET diffed
+
+`--no-fail-fast` placed **before** the `--` (it is a `cargo test` flag, not a harness flag), full
+output redirected to a file, **never piped through `tail`**. Three sweeps, because ADR-0164 leg (iii)
+cannot be satisfied by a single run.
+
+Censused with `grep -oE 'test result: (ok|FAILED)\. …'` and **awk fields `$4`/`$6`**. The `ok`-only
+form would discard `FAILED` lines and make `failed=0` true *by construction*; `$5`/`$7` returns a
+vacuous `passed=0` — **verified here**: the same log under `$5`/`$7` yields
+`binaries=163 passed=0 failed=0`.
+
+| sweep | wall clock | binaries | passed | failed | **sum** |
+|---|---|---|---|---|---|
+| 1 | 5m18s | **163** | 2143 | 5 | **2148** |
+| 2 | 5m21s | **163** | 2142 | 6 | **2148** |
+| 3 | 5m34s | **163** | 2141 | 7 | **2148** |
+
+**The sum is invariant at 2148 across all three sweeps.** The binary count is invariant at 163.
+
+**A NOTE ON THE `xds_rds_hot_reload` STALL.** The state-3 session recorded that a full local
+`-p differential` sweep **stalls on `xds_rds_hot_reload`** on this host and killed it after ~11 min.
+**That did not reproduce here.** All three whole-workspace sweeps ran to completion in ~5½ minutes
+each and reported all 163 binaries. The stall was an environmental artifact of that session, not a
+property of the tree — recorded so a later session does not budget for a stall that is not there.
+
+### The failing SET, diffed across the three sweeps
+
+```
+INTERSECTION (present in ALL THREE)      UNION (present in ANY)
+access_log_h2_rcd_upstream_reset         access_log_command_operators
+access_log_h2_uc_upstream_reset          access_log_h2_rcd_upstream_reset
+access_log_rcd_upstream_reset            access_log_h2_uc_upstream_reset
+access_log_rf_upstream_reset             access_log_h2_urx_retry_exhausted
+admin_config_dump_server_info            access_log_rcd_upstream_reset
+                                         access_log_rf_upstream_reset
+TAIL = union − intersection              admin_config_dump_server_info
+access_log_command_operators             xds_rds_hot_reload_fixture
+access_log_h2_urx_retry_exhausted
+xds_rds_hot_reload_fixture
+```
+
+Failing test names were extracted from the `---- <name> stdout ----` markers, **never by
+indentation** — an indentation census also matches lines inside the failure BODY and invents phantom
+test names. Failing binaries were derived from the preceding `Running` line.
+
+The intersection is **exactly** the documented 5-member stable core. The tail has membership
+**0 / 1 / 2** across the three sweeps — an open-ended tail whose SIZE carries no signal (ADR-0164).
+
+### ADR-0164's four-part test, applied to every one of the 8 REDs
+
+**CORE (5) — fail DETERMINISTICALLY in isolation; that determinism IS the environmental signature.**
+
+```
+$ cargo test -p differential --test <each>
+access_log_h2_rcd_upstream_reset  exit=101
+access_log_h2_uc_upstream_reset   exit=101
+access_log_rcd_upstream_reset     exit=101
+access_log_rf_upstream_reset      exit=101
+admin_config_dump_server_info     exit=101
+```
+
+Each isolation run **reached its assertion** (it is not a bookkeeping failure) and reproduced the
+documented signature verbatim:
+
+```
+---- access_log_rcd_upstream_reset stdout ----
+fixture green: access log byte-exact mismatch: line 0 not byte-identical:
+ envoy="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{remote_connection_failure|
+   immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:43387}\",\"rf\":\"UF\"}"
+ envoy-rust="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}"
+```
+
+```
+---- admin_config_dump_server_info stdout ----
+text_lines diverged after allow-lists:
+  envoy-only:      ["backend::192.168.65.2:42525::canary::false", … 18 entries …]
+  envoy-rust-only: []
+```
+
+That is the `TcpCloseBackend` IPv6-unreachable family (`[fdc4:f303:9324::254]`, upstream `rf: UF`
+where envoy-rust correctly reports `rf: UC`) and the `192.168.65.2` bridge-IP family — both
+host-environmental, both pre-existing, both CI-authoritative.
+
+**TAIL (3) — each PASSES in isolation; the OPPOSITE signature.**
+
+```
+$ cargo test -p differential --test access_log_command_operators
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.60s
+$ cargo test -p differential --test access_log_h2_urx_retry_exhausted
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+$ cargo test -p differential --test xds_rds_hot_reload
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s
+```
+
+**These greens were asserted on the `1 passed` COUNT, never on the exit code** — `0 passed; N
+filtered out` also exits 0, and `error: no test target named …` exits 101 exactly like a real RED.
+
+All three failed in-sweep for the **identical startup-race reason, with the assertion NEVER
+REACHED**:
+
+```
+---- xds_rds_hot_reload_fixture stdout ----
+fixture passes: upstream Envoy never became accept-ready
+Caused by:
+    127.0.0.1:57226 not accept-ready within 10s: Connection refused (os error 111)
+```
+```
+---- access_log_command_operators stdout ----
+fixture green: upstream Envoy never became accept-ready
+Caused by:
+    127.0.0.1:57228 not accept-ready within 10s: Connection refused (os error 111)
+```
+```
+---- access_log_h2_urx_retry_exhausted stdout ----
+fixture green: upstream Envoy never became accept-ready
+Caused by:
+    127.0.0.1:57236 not accept-ready within 10s: Connection refused (os error 111)
+```
+
+The harness gave up waiting for the upstream container before the fixture's comparison logic ran a
+single byte. **A RED that never reached an assertion carries no information about matching
+semantics.**
+
+**`xds_rds_hot_reload_fixture` deserved — and got — extra scrutiny, because it is the ONE RED that
+sits on a surface `76.2` actually changed** (Task 8 rewrote `crates/envoy-config/src/rds.rs`'s
+`if let` into an exhaustive `match`). Its RED is nonetheless **not** a `76.2` signal: the failure is
+`upstream Envoy never became accept-ready`, i.e. the test aborted before any RDS reload was
+performed or compared, and it **passes in isolation on this exact tree** (`1 passed`, 1.98s, with the
+envoy-rust listener visibly bound in the log). Had Task 8's change been wrong, the RED would have
+been a validation verdict, not a container-startup timeout.
+
+**Leg (iv) — untouched by the phase's surface.** Mechanically checked: for each of the 8 RED
+binaries, the fixture directories were derived FROM THE TREE (`grep -oE 'tests/fixtures/[0-9]{4}-…'`
+on the test file, never guessed from the binary name) and each fixture's configs grepped for a
+`redirect:` key:
+
+```
+access_log_h2_rcd_upstream_reset   [0070-accesslog-h2-rcd-upstream-reset]   redirect-using-configs=0
+access_log_h2_uc_upstream_reset    [0069-accesslog-h2-uc-upstream-reset]    redirect-using-configs=0
+access_log_rcd_upstream_reset      [0062-accesslog-rcd-upstream-reset]      redirect-using-configs=0
+access_log_rf_upstream_reset       [0061-accesslog-rf-upstream-reset]       redirect-using-configs=0
+admin_config_dump_server_info      [0014-admin-config-dump-server-info]     redirect-using-configs=0
+access_log_command_operators       [0040-accesslog-command-operators]       redirect-using-configs=0
+access_log_h2_urx_retry_exhausted  [0067-accesslog-h2-urx-retry-exhausted]  redirect-using-configs=0
+xds_rds_hot_reload                 [0034-xds-rds-hot-reload]                redirect-using-configs=0
+```
+
+**Not one of the 8 configures a `redirect:` route.** A regression in the `location` builder, in
+`synth_redirect`, in the dispatch arm or in the `prefix_rewrite` `:path` mutation could not express
+itself through any of them.
+
+**All four legs hold for all 8 REDs. Gate (b) is GREEN.**
+
+### The arithmetic identities — both close EXACTLY
+
+**Identity 1: `local passed + local failed == CI passed`.** CI totals for the base commit
+`a2ebc8a2a791012504ef13140d9c90a826388b6c` were re-derived from the run log rather than inherited
+(run `30639873487`, `gh` invoked **from the repo root** so it could resolve the base repo; the log
+measured **402 314 bytes**, i.e. hundreds of KB, so it is a real log and not the ~120-byte
+`failed to determine base repo` stub):
+
+```
+$ gh api repos/pgdad/envoy-rust/actions/jobs/91186772168/logs | grep -oE 'test result: (ok|FAILED)\. …' | awk '{b++;p+=$4;f+=$6}'
+binaries=163 passed=2148 failed=0
+```
+
+```
+sweep 1:  2143 + 5 = 2148 == 2148   ✓
+sweep 2:  2142 + 6 = 2148 == 2148   ✓
+sweep 3:  2141 + 7 = 2148 == 2148   ✓
+```
+
+**Identity 2: CI totals GREW, and the growth is fully accounted for.** The net
+`#[test]`/`#[tokio::test]` attribute delta was measured directly from the diff:
+
+```
+$ git diff 0ea2de1 HEAD -- . ':(exclude)docs/' | grep -cE '^\+\s*#\[(tokio::)?test\]'   → 11
+$ git diff 0ea2de1 HEAD -- . ':(exclude)docs/' | grep -cE '^-\s*#\[(tokio::)?test\]'    → 0
+```
+
+**+11, −0** = 10 new in-process tests + 1 new differential binary. Both figures close exactly:
+
+```
+binaries:  162 + 1  = 163   ✓
+passed:   2137 + 11 = 2148  ✓
+```
+
+> **`PLAN.md` §6's prediction of `passed≈2168` is WRONG and is SUPERSEDED BY MEASUREMENT.** It
+> assumed ~30 new tests. The real figure is **11**, and the gap is **by deliberate design, not lost
+> coverage**: the 22 MEASURED `location` cells are **ONE table-driven test**
+> (`plan_redirect_matches_every_measured_location_cell`), which `PLAN.md` §4 itself argued for
+> because expanding them into 22 `#[test]` fns would have eaten the entire §6.1 size headroom.
+> **Do not read `2148` against `2168` as "tests were lost."**
+
+All 11 new tests were confirmed individually present and `ok` in sweep 1:
+
+```
+rds_reload_rejects_a_conflicting_redirect_oneof            ok
+rds_reload_accepts_a_valid_redirect_route                  ok
+build_response_prefix_rewrite_mutates_the_request_path     ok
+build_response_path_redirect_leaves_the_request_path_alone ok
+plan_redirect_matches_every_measured_location_cell         ok
+plan_redirect_reports_a_rewritten_path_only_for_prefix_rewrite ok
+plan_redirect_is_total_on_degenerate_spans                 ok
+synth_redirect_emits_five_names_and_no_content_type        ok
+canonical_reason_covers_the_three_redirect_codes           ok
+h2_shared_seam_serves_the_redirect_arm                     ok
+route_redirect_action_fixture                              ok
+```
+
+## S4.3 — gate (a): fixture `0086`, and WHY its 1-second green is trusted
+
+```
+$ cargo test -p differential --test route_redirect_action -- --nocapture
+exit=0
+test route_redirect_action_fixture ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+```
+
+`route_redirect_action_fixture ... ok` **in all three full parallel sweeps as well as in isolation**,
+which also clears the "passes alone, fails under parallel load" differential flake family for it.
+
+**A ~1 s green on a backend-free fixture is normal — but it is also exactly what a silent skip looks
+like.** It was therefore audited two independent ways, neither of which reuses the state-3 session's
+audit.
+
+**Audit 1 — poll `docker ps` during the run.** Three containers were observed:
+
+```
+12073e255eda  envoyproxy/envoy:v1.33.0     ← THIS fixture's upstream
+eebd9281dc70  testcontainers/ryuk:0.6.0    ← the testcontainers reaper
+057ffbd5bc03  envoyproxy/envoy:contrib-v1.37.2  ← a SIBLING workstream's container, not ours
+```
+
+The pin was checked rather than assumed: the harness declares
+`IMAGE_TAG: &str = "v1.33.0"` (`tests/differential/src/upstream.rs:56`), and
+`envoyproxy/envoy:v1.33.0` resolves to image ID **`56da5afd7df3`**, matching `ENVOY_TARGET.md`'s
+digest `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`. **D-3.7 pin
+honoured.**
+
+> A trap worth recording: the first `docker ps` line returned was the SIBLING's
+> `contrib-v1.37.2` container, which momentarily looked like the harness running against the wrong
+> image. It is not — it belongs to the parallel workstream. **With a concurrent workstream live, a
+> `docker ps` census must be resolved to a container ID and image ID, not read off the first line.**
+
+**Audit 2 — an independent NEGATIVE CONTROL, on a different probe than state 3 used.** In a scratch
+`git worktree` created `--detach` at `a2ebc8a` (the main tree was clean and was never mutated), `r16`'s
+`expected_status` was falsified from `308` to `307`:
+
+```
+NEGATIVE-CONTROL exit=101
+thread 'route_redirect_action_fixture' panicked at tests/differential/tests/route_redirect_action.rs:37:10:
+fixture passes: probe r16-response-code-308: upstream status 308 != expected 307
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+```
+
+**Read the words `upstream status 308`.** They can only have come from the pinned upstream Envoy
+container actually running and answering — and they independently re-confirm the phase's own
+MEASURED row R16 (`response_code: PERMANENT_REDIRECT` → 308). The fixture is genuinely driving both
+proxies and comparing them. **The green is real.**
+
+Full mutation hygiene was observed:
+- the worktree was built with **`cargo build --workspace --all-targets`** (190 `Compiling` lines), not
+  `-p envoy-bin` — the latter omits the `tcp-echo-server`/`http1-echo-server`/`http2-echo-server`
+  helper backends and produces FALSE REDs that never reach an assertion;
+- the mutation was **re-grepped as still present after the run** (a parallel agent's `git checkout`
+  can silently revert an in-place mutation) — still there;
+- an **UNMUTATED CONTROL was run from the SAME worktree** after reverting:
+  `test result: ok. 1 passed; 0 failed; … finished in 1.01s`. A RED that never reached an assertion
+  is not evidence; this one did, and its control passes;
+- the worktree was removed and the removal **re-verified from the repo root**
+  (`git worktree list` now shows only the main tree and the four sibling `agent-*` worktrees, which
+  were left alone). Main tree clean at `a2ebc8a`, `r16` back to `expected_status: 308`.
+
+### `0086`'s four authoring constraints, RE-VERIFIED mechanically
+
+Not taken on the state-3 session's word — a subagent or prior-session finding is a claim, not a
+result.
+
+| constraint | **MEASURED** |
+|---|---|
+| 18 probes / 18 distinct paths | **18 / 18** |
+| 18 routes / 18 distinct prefixes | **18 / 18** |
+| no prefix shadows another | **shadowing pairs: NONE** |
+| each probe selects a DIFFERENT route | **distinct routes selected: 18**; routes selected by >1 probe: NONE |
+| no unprobed route, no unmatched probe | **unprobed routes: NONE; unmatched probes: NONE** |
+| `{{ADMIN_PORT}}` must NOT appear | **0** occurrences in all three fixture files |
+| `location` NOT allow-listed | **0** occurrences of `"location"` in `tests/differential/src/lib.rs` |
+
+The route-selection check was computed by first-match-wins prefix semantics over the parsed
+`expectations.yaml`, i.e. the same rule the router uses — not by eye.
+
+**`envoy-rust.yaml` is still mechanically derivable from `envoy.yaml` by exactly three hunks**, so the
+two configs cannot silently drift:
+
+```
+$ diff envoy.yaml envoy-rust.yaml   → exactly 3 hunks
+  +node: {id: x, cluster: y}
+  -socket_address: { address: 0.0.0.0,   port_value: {{PORT}} }
+  +socket_address: { address: 127.0.0.1, port_value: {{PORT}} }
+  -admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+```
+
+**The entire route table is byte-identical between the two configs.** That property is what makes the
+fixture a real differential rather than two independently-authored configs, and it is preserved.
+
+## S4.4 — gate (c): conformance suites
+
+```
+$ cargo test -p h2spec-conformance --test h2spec_runner -- --nocapture
+exit=0
+h2spec_runner: h2spec not found — skipping locally
+test h2spec_pass_rate_gate ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+**The local `ok` is NOT conformance evidence.** The gate self-skips silently on this host, and the
+`h2spec not found — skipping locally` line is visible **only under `--nocapture`** — which is exactly
+why a bare `h2spec_pass_rate_gate ... ok` inside a workspace sweep must never be read as conformance.
+It is quoted here so the honest local state is on the record.
+
+**CI is authoritative, and CI ran it for real.** In run `30639873487` the workflow installed h2spec
+`2.6.0` (`ci.yml:43-49`, `h2spec --version`) and then:
+
+```
+2026-07-31T14:52:39.6834560Z test h2spec_pass_rate_gate ... ok
+2026-07-31T14:52:39.6835079Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Per **ADR-0163** the CI gate is **NOT vacuous** — that was measured and SETTLED at the 75.2 review and
+is not re-raised here. `tests/conformance/h2spec/known-failures.txt` is **byte-unchanged at 21 lines**;
+**no line was trimmed**, and no fixture was weakened. Gate (c) **GREEN (CI-authoritative)**.
+
+## S4.5 — gate (d): fuzzers
+
+**`76.2` adds NO fuzz target, so gate (d) requires no new `cargo fuzz` run and no `ci.yml` edit.**
+Measured rather than asserted:
+
+```
+$ git diff --name-only 0ea2de1 HEAD | grep -E 'fuzz|ci\.yml'
+  (no output — no fuzz file and no ci.yml file changed)
+$ git diff --stat 0ea2de1 HEAD -- .github/workflows/ci.yml
+  (empty — byte-unchanged)
+$ git ls-files '*/fuzz/fuzz_targets/*.rs'   → 5 targets across 5 crates
+```
+
+The five pre-existing targets (`parse_bootstrap`, `jwt_parse`, `cdn_loop_parse`,
+`accesslog_format_parse`, `grpc_health_decode`) are unchanged and all five ran clean in CI's `fuzz`
+job on the base commit — **conclusion `success`, 13 steps**. Gate (d) **GREEN (not applicable, and
+verified as not applicable)**.
+
+## S4.6 — the six-gate adjudication
+
+| gate | verdict | evidence |
+|---|---|---|
+| **(a)** all new/changed differential fixtures green | **GREEN** | `0086` `ok` in isolation (1.02s) and in **all three** parallel sweeps; audited by a Docker poll resolving a real `envoyproxy/envoy:v1.33.0` container matching the `ENVOY_TARGET.md` digest, and by an **independent** negative control on probe `r16` (`upstream status 308 != expected 307`) under full mutation hygiene with a same-worktree unmutated control |
+| **(b)** all pre-existing differential fixtures still green | **GREEN** | 3 sweeps × 163 binaries; sum invariant **2148**; intersection = the documented 5-member deterministic core; the 3-member tail each **passes in isolation**, was **absent from ≥2 sweeps**, **never reached an assertion**, and touches **no** `redirect:` route. ADR-0164's four-part test satisfied on all 8 |
+| **(c)** conformance suites at the declared threshold | **GREEN (CI-authoritative)** | local run self-skips (quoted honestly); CI installed h2spec 2.6.0 and passed `3 passed; 0 failed`; `known-failures.txt` byte-unchanged at 21 lines (ADR-0163) |
+| **(d)** any new fuzzer clean on its short-budget CI run | **GREEN (n/a, verified)** | no fuzz target added; `ci.yml` byte-unchanged; the 5 existing targets unchanged and the CI `fuzz` job `success` at 13 steps |
+| **(e)** build / clippy / fmt / test / deny all clean | **GREEN** | build exit 0 (14 `Compiling`); clippy exit 0 (14 `Checking`, `-D warnings`); fmt exit 0, **zero bytes**; test = gate (b); deny `advisories ok, bans ok, licenses ok, sources ok` |
+| **(f)** `REVIEW.md` approved | **OPEN — legitimately, BY DESIGN** | `REVIEW.md` does **not** exist. State 5 is a **separate session** (§5.1; ADR-0127 — a verifier must not review what it verified). This session does **not** claim gate (f); it is the next session's to close |
+
+**Five of six gates are GREEN. Gate (f) is OPEN by construction at state 4.** No gate REDded, so
+**there is no §5.2 re-entry to state 3.**
+
+## S4.7 — spot-verification of the implementation itself
+
+The gate is about commands, but a verifier that only reads exit codes verifies nothing. These were
+re-checked directly on disk.
+
+- **T-C9 was deliberately FLIPPED and RENAMED.** `build_response_redirect_is_not_implemented_placeholder`
+  no longer exists as a test; the name survives **only inside the new test's doc comment**, which
+  explains the flip. The replacement,
+  `build_response_redirect_emits_301_and_location` (`crates/envoy-http1/src/hcm.rs`), asserts the 301,
+  the exact `location`, the **absence of `content-type`**, and the `direct_response` detail string.
+- **`synth_501` was correctly NOT deleted** — defined at `hcm.rs:2501`, still consumed by the chunked
+  `Transfer-Encoding` path at `hcm.rs:915`.
+- **CF-76-2 is genuinely CLOSED.** `crates/envoy-config/src/rds.rs` no longer contains
+  `if let crate::RouteAction` (grep: 0 hits); it is an **exhaustive `match`** with a `Redirect` arm
+  calling the shared `crate::bootstrap::validate_redirect_oneofs` (`rds.rs:159`), the same function
+  the boot path calls (`bootstrap.rs:4111`, defined `bootstrap.rs:2674`). The `DirectResponse` arm is
+  an explicit `=> {}` whose comment names the OPEN **ADR-0028** deferral. **ADR-0028 is NOT lifted** —
+  no `validate_hcm`, no `InvalidStatusCode`, no `validate_data_source` was added to the RDS path.
+- **M-1 + M-2 are genuinely CLOSED.** `pub enum RouteAction` (`bootstrap.rs:2253`) now carries its own
+  doc block, and that block is **corrected** — it describes the THREE-way oneof
+  (`direct_response:` / `route:` / `redirect:`), not the stale two-way text, and it carries a standing
+  warning that a FOURTH variant will **not** fail the build everywhere it must. `RedirectResponseCode`
+  (`:2178`) retains its own separate, correct doc block. **Nothing is orphaned and nothing is stale.**
+- **`BEHAVIOR_CONTRACT.md` Phase 76** (`:2957`) is present and structurally complete: §A (16 `R` rows
+  + 4 `Q` authority rows + 2 `E` edge rows + the derived rules (a)-(e)), §B (the header set, the
+  no-`content-type` finding), §C (the five reason phrases and why they are not differentially
+  witnessed), §D (access-log observables), §E (the `HEADER_ALLOW_LIST` standing prohibition),
+  §F (**eight** not-measured items, of which **7 and 8 were CREATED by this implementation** and are
+  **unwitnessed by construction**).
+
+**A standing caution restated, because it is the phase's most dangerous failure mode:** `location` is
+**not** allow-listed, so `diff_headers` compares it **value-exact**, and that comparison **is** `0086`'s
+entire witness. Adding `location` to `HEADER_ALLOW_LIST` would silently vacate every `location`
+assertion in the corpus **while leaving the fixture green** — success-shaped failure. It was verified
+absent (0 hits) and must stay absent.
+
+## S4.8 — findings from this verification session
+
+**(1) A DOCUMENTED HOST STALL DID NOT REPRODUCE, AND THAT IS ITSELF A MEASUREMENT.** The state-3
+session recorded — and the handoff instructed this session to budget for — a hard stall on
+`xds_rds_hot_reload` that forced its sweep to be killed after ~11 minutes and left gate (b)
+unadjudicated. Three consecutive whole-workspace sweeps here completed in ~5½ minutes each with all
+163 binaries reporting. **An environmental stall is not a property of the tree; do not inherit a
+budget for one without re-measuring, and do not read its absence as a different tree.**
+
+**(2) THE ONE RED SITTING ON THE PHASE'S OWN SURFACE WAS THE ONE WORTH CHASING.** Seven of the eight
+REDs were trivially off-surface. `xds_rds_hot_reload_fixture` was not — Task 8 rewrote exactly that
+file's validation path. Adjudicating it required reading the failure TEXT (a container-startup
+timeout, assertion never reached) rather than its NAME. **When a RED's name overlaps the phase's
+surface, the failure text is the only thing that separates a coincidence from a regression.**
+
+**(3) A `docker ps` CENSUS IS UNSAFE TO READ OFF THE FIRST LINE WHILE A PARALLEL WORKSTREAM IS
+LIVE.** The first container returned during the `0086` audit was a sibling's
+`envoyproxy/envoy:contrib-v1.37.2` — a plausible-looking "the harness is running against the wrong
+image" alarm. Resolving container ID → image ID → tag → `ENVOY_TARGET.md` digest showed our own
+container was the correctly pinned `v1.33.0` (`56da5afd7df3`). **Adjudicate by ID, never by the first
+matching line.**
+
+**(4) THE `$5`/`$7` VACUOUS-CENSUS TRAP WAS RE-CONFIRMED LIVE, NOT MERELY CITED.** The same CI log
+that yields `binaries=163 passed=2148 failed=0` under awk fields `$4`/`$6` yields a clean-looking,
+entirely false `binaries=163 passed=0 failed=0` under `$5`/`$7`. **The wrong recipe does not error —
+it returns a believable zero. Disbelieve a zero.**
+
+**(5) THE PLAN'S OWN TEST-COUNT PREDICTION WAS WRONG BY ~3×, AND THE MEASUREMENT IS THE ANSWER.**
+`PLAN.md` §6 predicted `passed≈2168` from "~30 new tests"; the measured attribute delta is **+11**.
+Both arithmetic identities close exactly on 11 (`162+1=163`, `2137+11=2148`). The gap is the
+table-driven 22-cell design the plan itself chose. **A prediction inside a landed artifact is not a
+baseline; the diff is.**
+
+## S4.9 — what this session did NOT do
+
+- **No review.** `REVIEW.md` was not created. State 5 is a separate session (ADR-0127).
+- **No code fix.** No gate REDded, so there was no §5.2 re-entry. Nothing was "fixed while I was in
+  there."
+- **No ROADMAP status cell flipped.** A state-4 commit flips none. Row `76.2` stays `planned`, `76`
+  stays `in-progress`, `76.1` stays `done`.
+- **No edit to `76.2/SPEC.md`, `76.2/PLAN.md`, `76/SPEC.md`, or any of `76.1`'s four artifacts**
+  (D-3.5). Verified byte-unchanged.
+- **No new ADR.** Head **ADR-0170**, next free **ADR-0171**, re-derived on disk. Nothing here is a new
+  decision: the gate is §7.5, the flake adjudication is ADR-0164, the h2spec question is ADR-0163, and
+  the state separation is ADR-0127.
+- **No banked carry-forward fixed** (§6.3). CF-76-1, CF-75-6, CF-75-5, CF-75-4, CF-75-3, CF-75-2 and
+  the `76.1` review's remaining Minors/Nits all remain open and untouched.
+- **No `known-failures.txt` trim, no `ci.yml` edit, no `HEADER_ALLOW_LIST` change, no fixture
+  weakened.**
+- **No `stop` file.** The stop condition was RE-MEASURED (not inherited) and **all three legs came
+  back FALSE**: (i) 107 rows with **two** still non-`done` (`76`, `76.2`); (ii) `76.2` is implemented
+  but **not `done`** — it has no `REVIEW.md`, and states 5 and 6 both remain; (iii) **four** of the 11
+  family headings still carry **zero** rows (`### HTTP/3 + QUIC family` `ROADMAP.md:122`,
+  `### gRPC family` `:126`, `### Runtime + hot restart family` `:183`, `### WASM host family` `:185`),
+  re-derived by slicing each `### ` heading to the next — the naive `awk` for this under-reports 4 as 1.
+
+## S4.10 — hand-off to §5 state 5
+
+**State 4 is COMPLETE.** Five of the six §7.5 gates are GREEN on measured, quoted evidence; gate (f)
+is OPEN by design. `STATE.md` advances to **§5 state 5** with
+`## Next expected skill` = **`superpowers:requesting-code-review`**.
+
+The state-5 session should read, in this order: the **Deviations D-1..D-6** table at the top of this
+file (three of the six are defects in `PLAN.md`'s own *pre-flighted* literal Rust, so a reviewer
+diffing plan text against landed code will find intentional differences); then **S4.7** above, which
+records what this verification checked directly on disk so the review need not re-derive it; then
+**§F items 7 and 8** of `BEHAVIOR_CONTRACT.md`'s Phase 76 section, which are this phase's two
+**unwitnessed-by-construction** choices and are the most likely place for a reviewer to find
+something worth saying.
+
+**The reviewer must not fix what it grades** (ADR-0127; ADR-0165), and **must not** flip a ROADMAP
+status cell — row `76.2` stays `planned` until its own state-6 close-out, at which point parent row
+`76` closes with it.
+
+## S4.11 — the ADR-0035 relocation, checked mechanically
+
+The state advance relocated the standing **14**-line set (Active-phase `**id:**` / `**slug:**` /
+`**directory:**` / `**status:**` + its `_Historical_` pointer; the next-skill pointer + scope block +
+the Standing-traps line + its `_Historical_` pointer; last-commit + pointer; last-updated + pointer;
+and the §5.1 doctrine bullet). Both files were backed up first, and **the superseded lines were
+captured from the pre-edit backup BEFORE anything was mutated** — capturing afterwards archives the
+NEW text and silently passes. Each captured line was asserted to start with its expected prefix
+(14/14) before a single byte was written.
+
+| check | result |
+|---|---|
+| **PER-FILE** delta on each of the 14 (a COMBINED count is invariant by construction and false-passes) | **14/14**: `STATE.md` 1→**0**, `STATE_HISTORY.md` **+1** each |
+| §4.1(9)(d) decomposition of `(old STATE.md) − (new STATE.md)` | **22** non-blank removed = **14** relocated + **8** superseded IN PLACE |
+| the 8 in-place lines | the ACTIVE-phase `### Sub-phase 76.2 …` Notes subsection, which §4.1(9)(b) **keeps** in `STATE.md` and retires only at close-out |
+| history lines lost | **0** |
+| `STATE.md` headings | **9 → 9**, with exactly **one** intended change (the Notes rename `state-3 implementation` → `state-4 verification`) |
+| duplicated non-blank lines in `STATE.md` | **0** |
+| duplicated non-blank lines in `STATE_HISTORY.md` | 204 → 205, **exactly +1** — the per-section `_Relocated at …_` marker appears 4× BY DESIGN |
+| `STATE_HISTORY.md` headings | **628 → 628**, unchanged |
+| archive headers matched | by **EXACT whole-line equality**, each resolving to exactly one line; all four resolved **before** any write, so a miss aborts before mutating |
+| new lines byte-identical to superseded? | **none** — a byte-identical rewrite fails the per-file check BY DESIGN |
+
+**ADR-0160 token sweep** (retention verified mechanically, never by eye). The Standing-traps line
+grew **47 154 → 49 917** characters, 472 → 490 distinct backticked tokens. Three tokens showed a
+count drop and each was adjudicated rather than waved through:
+
+- **`PLAN.md` in the traps line, 10× → 9×.** Still present nine times; the count fell only because the
+  new head paragraph replaced the old one. **No enduring trap lost.**
+- **`superpowers:executing-plans` and `superpowers:subagent-driven-development` in the doctrine
+  bullet, 1× → 0×.** These named the NEXT skill while state 3 was next. The bullet's function is to
+  name the next skill, and state 5's is `superpowers:requesting-code-review`, which the new bullet
+  names. **This is the intended supersession that ADR-0160 exists to permit** — the old wording is
+  preserved verbatim in `STATE_HISTORY.md` (+1 there, 0 in `STATE.md`), which is the whole point of
+  relocating before rewriting.
+
+No other backticked token was dropped from either line.
