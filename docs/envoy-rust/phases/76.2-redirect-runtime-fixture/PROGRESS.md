@@ -316,3 +316,71 @@ Same root cause as Task 2's: the only **non-test** consumer of `plan_redirect` i
 dispatch arm. `cargo build` and `cargo fmt --check` are green; the lint gate is transiently red
 across Tasks 2-4 and **closes at Task 5**. See deviation **D-1** for why this is accepted rather
 than suppressed.
+
+---
+
+## Task 4 — `synth_redirect`, the dedicated response builder
+
+**Status: COMPLETE.** Commit message: `phase 76.2 task 4: synth_redirect — five headers, no content-type`.
+
+**Why a dedicated builder exists at all.** MEASURED under the harness's exact request shape (a raw
+`GET <target> HTTP/1.1` with `Host:` and `Connection: close`), a **redirect** carries
+`location`, `date`, `server`, `connection`, `content-length` — and **no `content-type`** — whereas
+a `direct_response` **does** carry one. The shared `synth_with` always emits `content-type`. Had
+the redirect arm reused it, `diff_headers` would bail on its **first** check, the lowercased
+name-set equality, with `only-in-envoy-rust=["content-type"]`, and fixture `0086` would be red for
+a reason having nothing to do with `location`. `synth_overflow` is the established in-repo
+precedent for a synth path owning its own header list.
+
+### Anchors re-verified on disk
+
+The three helpers the literal consumes all exist in `hcm.rs`: `DEFAULT_SERVER_NAME` (`:21`),
+`now_imf_fixdate` (`:2176`), `connection_value` (`:2180`). `headers::LOCATION` came from Task 1.
+
+### Step 2 — RUN RED
+
+```
+$ cargo test -p envoy-http1 --lib -- synth_redirect_emits_five_names
+exit=101
+      1 error[E0425]: cannot find function `synth_redirect` in this scope
+      1 error: could not compile `envoy-http1` (lib test) due to 1 previous error
+```
+
+Single, unambiguous error — the function does not exist.
+
+### Step 4 — GREEN
+
+```
+$ cargo test -p envoy-http1 --lib -- synth_redirect
+exit=0
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+test hcm::tests::synth_redirect_emits_five_names_and_no_content_type ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 191 filtered out; finished in 0.00s
+
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+```
+
+The test asserts the header names as an **ordered `Vec`**, not a set, so it pins the measured
+upstream wire order as well as the absence of `content-type`; it also pins `content-length: 0`
+value-exact, because `diff_headers` compares that value byte-exact too.
+
+### Doc-comment orphan check — the M-1 hazard, checked MECHANICALLY
+
+Tasks 3 and 4 both inserted immediately above an item that **has** a doc block
+(`synth_no_healthy_upstream`'s `/// 12.2 (parent-12 D6.2 per ADR-0037): …`). `76.1`'s M-1 was
+caused by exactly this move done blind. Verified after both insertions that the block's last line
+still sits directly above its own function:
+
+```
+$ grep -n -B1 '^pub(crate) fn synth_no_healthy_upstream' crates/envoy-http1/src/hcm.rs
+2362-/// paths keep `synth_status`'s empty body.
+2363:pub(crate) fn synth_no_healthy_upstream(close: bool) -> Response {
+```
+
+Nothing orphaned. Note **no gate catches this** — `envoy-config`/`envoy-http1` enable no
+`missing_docs` lint and `cargo fmt` does not reflow doc comments — so the check has to be run
+deliberately, by grep, every time.
+
+**Lint gate:** still transiently red per deviation **D-1** (`synth_redirect` now also has no
+non-test consumer until Task 5). Closes at Task 5.

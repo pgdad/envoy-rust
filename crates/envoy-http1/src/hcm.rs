@@ -2326,6 +2326,32 @@ fn plan_redirect(
     }
 }
 
+/// 76.2: the redirect response builder. MEASURED against
+/// `envoyproxy/envoy:v1.33.0`: a redirect carries EXACTLY `location`, `date`,
+/// `server`, `connection`, `content-length` — and NO `content-type`, which a
+/// `direct_response` DOES carry. It therefore must NOT reuse [`synth_with`],
+/// whose fixed 5-header list always emits `content-type`; doing so fails the
+/// harness's `diff_headers` name-set check with
+/// `only-in-envoy-rust=["content-type"]`. Header ORDER matches the measured
+/// upstream wire order. Body is empty, `content-length: 0`.
+fn synth_redirect(status: u16, location: String, close: bool) -> Response {
+    Response {
+        status,
+        reason: None,
+        headers: vec![
+            (headers::LOCATION.to_string(), location),
+            (headers::DATE.to_string(), now_imf_fixdate()),
+            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
+            (
+                headers::CONNECTION.to_string(),
+                connection_value(close).to_string(),
+            ),
+            (headers::CONTENT_LENGTH.to_string(), "0".to_string()),
+        ],
+        body: Bytes::new(),
+    }
+}
+
 /// 12.2 (parent-12 D6.2 per ADR-0037): no-healthy-upstream synth-503 response.
 /// Mirrors `synth_status`'s 5-header shape but emits the 19-byte body
 /// `no healthy upstream` (hex `6e 6f 20 68 65 61 6c 74 68 79 20 75 70 73 74
@@ -10639,5 +10665,42 @@ static_resources:
             plan_redirect("h.test", "/\u{e9}", Some("ab"), &rd).location,
             "http://h.test/r"
         );
+    }
+
+    /// 76.2 T4-1: a redirect carries EXACTLY five header names and NO
+    /// `content-type` — the MEASURED finding that forces a dedicated builder.
+    /// Reusing the shared `synth_with` would emit a sixth header upstream does
+    /// not, and `diff_headers` would bail on its name-set check with
+    /// `only-in-envoy-rust=["content-type"]`.
+    #[test]
+    fn synth_redirect_emits_five_names_and_no_content_type() {
+        let resp = synth_redirect(301, "http://example.com/a".to_string(), true);
+        let names: Vec<&str> = resp.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["location", "date", "server", "connection", "content-length"],
+            "measured upstream wire order for a redirect response"
+        );
+        assert!(
+            !names.contains(&"content-type"),
+            "a redirect MUST NOT carry content-type"
+        );
+        assert!(resp.body.is_empty(), "redirect body is empty");
+        assert_eq!(
+            resp.headers
+                .iter()
+                .find(|(n, _)| n == "content-length")
+                .map(|(_, v)| v.as_str()),
+            Some("0"),
+            "content-length is compared value-exact by diff_headers"
+        );
+        assert_eq!(
+            resp.headers
+                .iter()
+                .find(|(n, _)| n == "location")
+                .map(|(_, v)| v.as_str()),
+            Some("http://example.com/a"),
+        );
+        assert_eq!(resp.status, 301);
     }
 }
