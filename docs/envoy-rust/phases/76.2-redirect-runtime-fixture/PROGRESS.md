@@ -39,6 +39,7 @@ that forced it. Running list:
 | D-2 | 3 | `PLAN.md` T3-3's literal `Some("/é"[..2].into())` **panics in the test itself** and never reaches `plan_redirect`. Replaced with a 2-byte ASCII prefix, `Some("ab")`. | `"/é"` is **3 bytes** (`/`=1, `é`=2), so byte index 2 is **not a char boundary** and `str` slicing there aborts. The replacement witnesses the identical cell honestly: `matched_len` is 2, `"/é".get(2..)` lands mid-`é` and returns `None`, so the `unwrap_or("")` inside `plan_redirect` — the very thing being tested — is what keeps the function total. The plan's §2 pre-flight **ran only two representative tests**, so a runtime panic in a third was invisible to it (`fmt`/`clippy` do not execute tests). |
 | D-4 | 5 | `PLAN.md` Task 5 Step 2's prediction *"the compile fails first on `&mut req` (the signature is still `&Request`)"* is **REFUTED** — it compiles, and the RED is the assertion `left: 501, right: 301`. No code change; the plan's expected-output text is simply wrong. | Rust **coerces `&mut T` to `&T`** at a call site, so passing `&mut req` to a fn still declared `&Request` is legal. The observed RED is strictly *better* evidence than the plan expected: a pure behavioural flip of the placeholder, mirroring the pre-flight's `left: 301, right: 501` from the other side. Recorded so a reviewer comparing the plan's expected text against `PROGRESS.md` does not read the difference as a skipped step. |
 | D-5 | 7 | `PLAN.md` T7-1's literal `version: envoy_http1::codec::HttpVersion::Http2` **does not exist**. Uses `envoy_http1::HttpVersion::Http11`. | MEASURED: `HttpVersion` (`crates/envoy-http1/src/codec.rs:14-17`) has **exactly two** variants, `Http10` and `Http11` — there is no `Http2`. The sibling H2 test `h2_resolve_route_reachable_and_returns_cors_route` likewise builds its `envoy_http1::Request` with `Http11`; the field does not participate in route dispatch. Also corrected: the re-export path is `envoy_http1::HttpVersion` (`lib.rs:28`), not `envoy_http1::codec::…`. This is the ONE task the plan flagged as **not pre-flighted end-to-end**, and this is exactly the class of error that predicts. The plan's trailing `let _ = (…)` scaffolding line was deleted as it instructs, the imports being genuinely consumed. |
+| D-6 | 10 | `PLAN.md` Task 10 Step 5's validation command `./target/debug/envoy-bin --mode validate -c <path>` **does not exist**. Replaced with a real boot-validate: substitute `{{PORT}}`, run `envoy-bin -c <file>` under `timeout`, and require zero errors. | MEASURED: `envoy-bin` exits **2** with `unknown argument: --mode`. Confirmed by reading the parser — `crates/envoy-bin/src/argv.rs:27-29` says *"Phase 01 accepts exactly one flag: `-c <path>` or `--config-path <path>`"* (clap is deliberately avoided as not on the D-3.2 permitted-foundations list). The project's own standing-traps ledger already records "envoy-bin takes only `-c <path>`", so `PLAN.md` contradicts a banked fact. The replacement is strictly stronger: it proves the config parses **and** the listener binds. |
 | D-3 | 3 | `PLAN.md` T3-2's assert message `"a bare redirect{} rewrites nothing"` **does not compile**. Escaped to `redirect{{}}`. | `assert_eq!`'s third argument is a **format string**, so the bare `{}` is parsed as a positional placeholder: `error: 1 positional argument in format string, but no arguments were given`. Rendered output is unchanged. Note this contradicts `PLAN.md` §2's claim that the Task-3 block passed `clippy -D warnings` — a block that does not compile cannot have. Recorded as a measured fact about the plan, not repaired in `PLAN.md` (D-3.5: it is this state's input). |
 
 ---
@@ -868,3 +869,121 @@ possible place to fix. The other banked findings (M-3, M-4, M-6, N-1, N-2, N-4�
 and unfixed**: they are polish on `76.1`'s config surface with no `76.2` witness, and fixing them
 would widen scope against §6.3. **N-10/N-11 are defects in the landed `76.1/PROGRESS.md` and are
 NOT EDITABLE by any session** (D-3.5).
+
+---
+
+## Task 10 — differential fixture `0086-route-redirect-action`
+
+**Status: COMPLETE.** Commit message:
+`phase 76.2 task 10: differential fixture 0086 — 18 probes over the redirect location rules`.
+
+### Census RE-DERIVED, not inherited
+
+```
+fixture dirs:      85
+differential .rs:  85
+0086 free? -> 0    (expect 0)
+highest:           0085-headermatcher-absence-accesslog-present-polarity
+[[test]] sections: 0
+```
+
+`0086` is the next free id. Derived with `git ls-files`, deliberately — a bare `find` would also
+walk the four live sibling `.claude/worktrees/agent-*` worktrees and inflate every count.
+
+### The four files
+
+`envoy.yaml` (18 `prefix:`-matched redirect routes, `clusters: []`, trailing `admin:` on
+`port_value: 0`), `envoy-rust.yaml`, `expectations.yaml` (18 probes), `README.md`.
+
+**`envoy-rust.yaml` was DERIVED MECHANICALLY from `envoy.yaml`, not hand-copied** — a script
+applies exactly the three permitted hunks and asserts each one matched, so the two configs cannot
+silently drift apart. The resulting diff is exactly:
+
+```
+0a1,3   > node: / id: x / cluster: y
+5c8     < address: 0.0.0.0 …  →  > address: 127.0.0.1 …
+67,69d69  < admin: / address: / socket_address: { address: 0.0.0.0, port_value: 0 }
+```
+
+The YAML 1.1 trap is left alone as instructed: an unquoted `cluster: y` parses as boolean `true`,
+every existing fixture writes it exactly that way, and it is fine there — **not "improved".**
+
+### The four binding authoring constraints — verified MECHANICALLY, not by eye
+
+Each of these can silently vacate a probe, so none was eyeballed:
+
+```
+routes=18  probes=18  names=18
+PREFIX-SHADOWING pairs: NONE  <-- required
+distinct probe paths:   True (18/18)
+distinct probe names:   True
+distinct routes selected: True (18/18)
+routes with no probe:   NONE
+{{ADMIN_PORT}} present: False <-- must be False
+{{PORT}} count in envoy.yaml: 1
+expected_headers is a BARE SCALAR everywhere: True
+```
+
+- **No prefix is a prefix of another.** Prefix overlap *silently shadows* a probe — a parent-recon
+  cell was lost exactly this way when `/scheme` preceded `/schemehost`. Zero shadowing pairs, and
+  the check simulates the match to confirm **each probe selects a DIFFERENT route** (18 distinct
+  routes for 18 probes, none left unprobed).
+- **This is why `q01`/`q03` get their OWN routes** (`/q1-hostport`, `/q3-hostport`) instead of
+  re-probing `/f-https` and `/j-bare` with a different `Host:` — that would violate the
+  distinct-`path:` rule.
+- **Every route is `prefix:`-matched**, keeping the fixture clean of the open **CF-76-1** (upstream
+  strips the query before route matching; envoy-rust matches the raw target). A live design
+  constraint, not a footnote — `r02`, `r04`, `r08` and `r13` all carry queries.
+- **`{{PORT}}` is the only token substituted** — `{{ADMIN_PORT}}` absent, confirmed.
+- **`expected_headers` is a BARE SCALAR** in all 18 probes, not a map.
+
+### Step 5 — validation, and a REFUTED plan command (deviation **D-6**)
+
+`PLAN.md` says to run `./target/debug/envoy-bin --mode validate -c …`. MEASURED:
+
+```
+envoy-bin: unknown argument: --mode
+validate-exit=2
+```
+
+`crates/envoy-bin/src/argv.rs:27-29` is explicit: *"Phase 01 accepts exactly one flag: `-c <path>`
+or `--config-path <path>`"*. There is no `--mode`. Validated the way that actually works —
+substitute `{{PORT}}` into a scratch copy and boot it under `timeout`:
+
+```
+$ cargo build -p envoy-bin          # MANDATORY; 11 Compiling lines, exit 0
+$ timeout 6 ./target/debug/envoy-bin -c <scratch>/0086-validate-r1.yaml
+exit=124  (124 = still running at timeout => config ACCEPTED and listener bound)
+INFO node registered node.id=x node.cluster=y
+INFO listener bound with SO_REUSEPORT … addr=127.0.0.1:18086 sockets=32
+INFO envoy-rust listening (http_connection_manager) … stat_prefix=ingress_http codec_type=HTTP1
+INFO envoy-rust exited cleanly
+--- ConfigError present? (expect 0) --- 0
+```
+
+All 18 redirect routes parsed and the listener bound. This is **strictly stronger** than the
+plan's intended check.
+
+### Bonus: a local smoke probe of six representative cells, on the real wire
+
+Backend-free means fully local, so the fixture's cells were driven directly before spending a
+Docker run — this isolates an envoy-rust-side bug from harness noise:
+
+```
+r01 /a-host              HTTP/1.1 301 Moved Permanently  | location: http://example.com/a-host                 | content-type: absent(ok)
+r05 /e-pfx/sub           HTTP/1.1 301 Moved Permanently  | location: http://envoy-rust.test/replaced/sub       | content-type: absent(ok)
+r13 /m-see/y?q=1         HTTP/1.1 303 See Other          | location: http://e.com/m-see/y                      | content-type: absent(ok)
+r16 /p-perm              HTTP/1.1 308 Permanent Redirect | location: http://example.com/p-perm                 | content-type: absent(ok)
+q01 /q1-hostport/x :1234 HTTP/1.1 301 Moved Permanently  | location: https://envoy-rust.test:1234/q1-hostport/x| content-type: absent(ok)
+q03 /q3-hostport/d :1234 HTTP/1.1 301 Moved Permanently  | location: http://envoy-rust.test:1234/q3-hostport/d | content-type: absent(ok)
+```
+
+Three things worth naming:
+
+1. **`303 See Other` and `308 Permanent Redirect` appear on the WIRE** — before Task 1 these read
+   `303 OK` / `308 OK`. This is the silent-wrong-answer hazard closed, observed end-to-end. Note
+   the differential fixture still cannot see it (the harness parses the status **code** only) —
+   which is exactly why Task 1's in-process pin exists.
+2. **`q01`/`q03` keep `:1234`** while `r01` drops the port — the authority asymmetry, live.
+3. **No `content-type` on any redirect**, confirming Task 4's dedicated builder is what the wire
+   actually gets.

@@ -1,0 +1,133 @@
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: r01-host-redirect-replaces-authority
+      method: get
+      path: "/a-host"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r02-query-preserved-by-default
+      method: get
+      path: "/b-query/deep?a=b"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r03-path-redirect-replaces-path
+      method: get
+      path: "/c-pathr/sub"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r04-path-redirect-still-keeps-query
+      method: get
+      path: "/d-pathq/x?k=v"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r05-prefix-rewrite-replaces-matched-span
+      method: get
+      path: "/e-pfx/sub"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r06-https-redirect-forces-scheme
+      method: get
+      path: "/f-https/x"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r07-response-code-307
+      method: get
+      path: "/g-c307"
+      host: "envoy-rust.test"
+      expected_status: 307
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r08-strip-query-drops-query
+      method: get
+      path: "/h-strip/a?q=1&z=2"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r09-port-redirect-with-host-redirect
+      method: get
+      path: "/i-port"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r10-bare-redirect-echoes-request
+      method: get
+      path: "/j-bare/deep"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r11-scheme-redirect-ftp-verbatim
+      method: get
+      path: "/k-scheme/x"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r12-scheme-and-host-together
+      method: get
+      path: "/l-both/y"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r13-response-code-303-with-strip-query
+      method: get
+      path: "/m-see/y?q=1"
+      host: "envoy-rust.test"
+      expected_status: 303
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r14-scheme-change-keeps-redundant-443
+      method: get
+      path: "/n-hport/y"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r15-response-code-302
+      method: get
+      path: "/o-found"
+      host: "envoy-rust.test"
+      expected_status: 302
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r16-response-code-308
+      method: get
+      path: "/p-perm"
+      host: "envoy-rust.test"
+      expected_status: 308
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: q01-host-unset-preserves-request-port
+      method: get
+      path: "/q1-hostport/x"
+      host: "envoy-rust.test:1234"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: q03-bare-redirect-preserves-request-port
+      method: get
+      path: "/q3-hostport/d"
+      host: "envoy-rust.test:1234"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact
