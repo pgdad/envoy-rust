@@ -2167,13 +2167,6 @@ pub struct Route {
     pub typed_per_filter_config: std::collections::BTreeMap<String, PerFilterConfig>,
 }
 
-/// 04.3 NEW (under SPEC §3 D2): the action variant a route's HCM router
-/// invocation dispatches into. Discrimination is by field-name oneof at the
-/// route map level — the route's peer keys are `direct_response: { ... }` OR
-/// `route: { ... }`, not nested under a single `action:` key. The hand-rolled
-/// `impl<'de> Deserialize` for `Route` (below) detects which peer key is
-/// present and constructs the matching variant; both-present and
-/// neither-present are errors.
 /// 76.1 (§4.1): `RedirectAction.RedirectResponseCode` — the five wire values of
 /// Envoy v1.33's `envoy.config.route.v3.RedirectAction.RedirectResponseCode`.
 /// Deserialized as a plain unit enum so that an unknown NAME (`BOGUS`) and a
@@ -2242,6 +2235,20 @@ pub struct RedirectAction {
     pub response_code: RedirectResponseCode,
 }
 
+/// 04.3 NEW (under SPEC §3 D2), widened at 76.1: the action variant a route's
+/// HCM router invocation dispatches into. Discrimination is by field-name
+/// oneof at the route map level — the route's peer keys are
+/// `direct_response: { ... }` OR `route: { ... }` OR `redirect: { ... }`, not
+/// nested under a single `action:` key. The hand-rolled
+/// `impl<'de> Deserialize` for `Route` (below) detects which peer key is
+/// present and constructs the matching variant; neither-present and
+/// more-than-one-present are both errors.
+///
+/// **Adding a FOURTH variant does not fail the build everywhere it must.**
+/// The `Route` visitor's cardinality check ends in a `_ =>` catch-all and
+/// `envoy-config`'s RDS re-validation historically used an `if let`, so a new
+/// variant can slip through silently. Audit every site BY GREP, never by
+/// trusting the compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {
     /// Direct-response action — write a static body downstream. Phase 04.1 carryover.

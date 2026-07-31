@@ -793,3 +793,78 @@ It holds only at genuine exhaustive `match` sites. It did **not** hold at `rds.r
 fall into *"more than one is present"* rather than failing to build. **Add any future
 `RouteAction` variant by AUDITING EVERY SITE BY GREP, never by trusting the build.** Task 9 records
 this in the code itself.
+
+---
+
+## Task 9 — M-1 + M-2: restore and correct `RouteAction`'s doc comment
+
+**Status: COMPLETE. Banked findings M-1 and M-2 are both CLOSED.** Commit message:
+`phase 76.2 task 9: restore and correct RouteAction's doc comment [M-1, M-2]`.
+
+**Documentation only** — no behaviour change, no test change, so there is no TDD RED step here and
+`PLAN.md` specifies none. The verification is mechanical (below), because **nothing in §7.5 gate
+(e) reads prose**: `envoy-config` enables no `missing_docs` lint and `cargo fmt` does not reflow
+doc comments.
+
+### The defect, RE-CONFIRMED on disk before touching anything
+
+`76.1` inserted `RedirectResponseCode` **between** `RouteAction`'s 04.3 doc block and
+`RouteAction`'s `#[derive]`. Measured at `0d08c48`, `bootstrap.rs:2170-2182` was a **single
+contiguous doc block** — the 04.3 text (`:2170-2176`) glued directly onto `76.1`'s
+`RedirectResponseCode` text (`:2177-2182`) with no blank line — all of it attaching to
+`pub enum RedirectResponseCode` (`:2185`). And `:2245` was a bare
+`#[derive(Debug, Clone, PartialEq)]` with `pub enum RouteAction` (`:2246`) **undocumented**.
+
+**M-2** confirmed in the same read: the orphaned text was also **stale**. It said the route's peer
+keys are ``direct_response: { ... }` OR `route: { ... }`` — a **two**-way oneof — and that
+"both-present and neither-present are errors", which `76.1` had widened to three. **M-1 and M-2
+had to be fixed together**: a verbatim restore would have re-attached stale text.
+
+### The fix
+
+1. Deleted the seven orphaned lines, leaving `RedirectResponseCode` with its own correct
+   `76.1 (§4.1): …` doc block.
+2. Inserted the corrected block above `#[derive] / pub enum RouteAction`, naming all **three**
+   peer keys and correcting the cardinality wording to "neither-present and more-than-one-present
+   are both errors".
+3. Added the paragraph `PLAN.md` specifies, recording **in the code itself** the generalised lesson
+   CF-76-2 came from: adding a fourth variant does **not** fail the build everywhere it must,
+   because the `Route` visitor's cardinality check ends in a `_ =>` catch-all and the RDS
+   re-validation historically used an `if let`. **Audit every site by grep, never by trusting the
+   compiler.**
+
+### Step 3 — verified MECHANICALLY, not by eye
+
+```
+$ grep -n -B3 '^pub enum RouteAction {' crates/envoy-config/src/bootstrap.rs
+2250-/// variant can slip through silently. Audit every site BY GREP, never by
+2251-/// trusting the compiler.
+2252-#[derive(Debug, Clone, PartialEq)]
+2253:pub enum RouteAction {
+
+new text  (expect 1): 1
+old text  (expect 0): 0
+```
+
+The block now sits directly above `pub enum RouteAction`, appears exactly once, and the stale
+wording is gone from the file entirely. Cross-checked from the other side that
+`RedirectResponseCode` retains its own, correct doc block starting at the `76.1 (§4.1):` line.
+
+```
+$ cargo build -p envoy-config --all-targets
+build-exit=0
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+$ cargo clippy -p envoy-config --all-targets --all-features -- -D warnings
+clippy-exit=0 Checking=1
+```
+
+### Why this was in scope at all
+
+`76.1`'s review graded the orphaning **Minor** and **put on the record that two of three reviewers
+argued Issue**. It is scheduled here — and only here — because `76.2` edits this exact region
+(Task 8 inserts `validate_redirect_oneofs` a few hundred lines below), which makes it the cheapest
+possible place to fix. The other banked findings (M-3, M-4, M-6, N-1, N-2, N-4…N-9) stay **banked
+and unfixed**: they are polish on `76.1`'s config surface with no `76.2` witness, and fixing them
+would widen scope against §6.3. **N-10/N-11 are defects in the landed `76.1/PROGRESS.md` and are
+NOT EDITABLE by any session** (D-3.5).
