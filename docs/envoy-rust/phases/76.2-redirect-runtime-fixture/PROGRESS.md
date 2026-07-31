@@ -680,3 +680,116 @@ the known benign symptom, not a failed removal — re-verified from the repo roo
 It pins envoy-rust's **own** seam, not upstream parity. Upstream's H2 `:scheme`/`:authority`
 handling was never probed (`SPEC.md` §8 item 2), and an H2 differential fixture is an explicit
 non-goal (`SPEC.md` §7 item 4) — the disposition phases 68 and 69 took.
+
+---
+
+## Task 8 — CF-76-2: the RDS warm path re-validates the redirect oneofs
+
+**Status: COMPLETE. CF-76-2 is CLOSED by this task.** Commit message:
+`phase 76.2 task 8: close CF-76-2 — RDS warm path re-validates the redirect oneofs [CF-76-2]`.
+
+### The carry-forward, RE-CONFIRMED verbatim on disk
+
+`crates/envoy-config/src/rds.rs:135` re-validated a hot-reloaded route table with an **`if let`,
+not an exhaustive `match`**:
+
+```rust
+            if let crate::RouteAction::Route(ar) = &route.action
+                && !known_cluster(&ar.cluster)
+            {
+```
+
+so `76.1` adding the `Redirect` variant tripped **no compile error here**. `76.1` joined an
+ADR-0028-sanctioned hole rather than creating one, and its blast radius was **NIL** because the
+runtime arm was the inert 501 either way. **Task 5 removed that inertness** — those routes now
+serve a real 3xx built from fields never checked for mutual exclusivity — so the condition that
+made it tolerable is gone.
+
+### Step 2 — RUN RED: this IS CF-76-2, reproduced
+
+```
+$ cargo test -p envoy-config --lib -- rds_reload_rejects_a_conflicting_redirect_oneof
+exit=101
+test rds::tests::rds_reload_rejects_a_conflicting_redirect_oneof ... FAILED
+thread '...' panicked at crates/envoy-config/src/rds.rs:397:14:
+a conflicting redirect oneof must be warm-rejected: RouteConfiguration { name: "local_route",
+  virtual_hosts: [VirtualHost { ... routes: [Route { ... action: Redirect(RedirectAction {
+  host_redirect: None, port_redirect: None, path_redirect: Some("/p"), prefix_rewrite: Some("/q"),
+  https_redirect: None, scheme_redirect: None, strip_query: false,
+  response_code: MovedPermanently }), ... }] }] }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 681 filtered out
+```
+
+**Read the dump, not just the FAILED.** `reparse_and_select_route_config` returned **`Ok(...)`**
+carrying `path_redirect: Some("/p")` **and** `prefix_rewrite: Some("/q")` simultaneously — a
+mutually-exclusive pair, accepted warm and ready to install LIVE, while the byte-identical config
+at boot is boot-fatal. That is CF-76-2 in one line of output, not a proxy for it.
+
+### Steps 3-4 — the fix, minimal and precise
+
+1. **Lifted** `76.1`'s two inline checks (`bootstrap.rs:4076`/`:4082`) into
+   `pub(crate) fn validate_redirect_oneofs(rd, context, route)`, so boot and warm paths are the
+   same code **by construction rather than by discipline**. The boot arm collapses to a single
+   `validate_redirect_oneofs(rd, listener_name, &r.name)?;`.
+2. **Converted** `rds.rs`'s `if let` to an **exhaustive `match`**, restoring the compile-time
+   forcing function: a future fourth `RouteAction` variant must now fail to build until handled
+   here.
+3. **Left `DirectResponse` an explicit `=> {}` arm naming ADR-0028**, so the pre-existing
+   sanctioned deferral is *documented* rather than silently re-joined.
+
+The function's doc block (step 4 of the documented walk) was updated to describe all three arms.
+
+**Doc-comment hazard checked, not assumed.** The new function is inserted immediately above a
+`#[derive]` — the exact move that caused `76.1`'s M-1. MEASURED first: `bootstrap.rs:2657` is a
+**bare `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]` for `RouteMatch` with no doc
+comment above it** (`:2656` blank, `:2655` a closing brace), so inserting there orphans nothing.
+
+**Scope boundary held. ADR-0028 is NOT lifted.** No `validate_hcm`, no `InvalidStatusCode`, no
+`validate_data_source` was added to the RDS path. Exactly the hole `76.1` opened is closed, in the
+sub-phase where that hole goes live.
+
+**On the `ConfigError` field name.** Both variants carry `{ listener, route }`; on the RDS path
+there is no listener, so `context` is passed as `rds:<path>`, giving a mildly loose message
+(``redirect action on listener `rds:/tmp/…/rds.yaml` route ``). Accepted deliberately rather than
+minting a 126th `ConfigError` variant for a context string — **error TEXT is not part of the
+equivalence contract**, only the verdict is, so this costs nothing differentially.
+
+### Step 5 — GREEN
+
+```
+$ cargo test -p envoy-config --lib --no-fail-fast -- rds::
+exit=0
+test rds::tests::rds_reload_accepts_a_valid_redirect_route ... ok
+test rds::tests::rds_reload_rejects_a_conflicting_redirect_oneof ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 668 filtered out
+```
+
+**`14 passed`** — exactly the plan's prediction: the **12** pre-existing RDS tests (so the rewrite
+breaks none) plus the **2** new ones. Both directions are pinned: T8-1 rejects the conflicting
+pair, and T8-2 proves a *valid* redirect route still reloads warm — without T8-2, T8-1 would pass
+just as well if the path had started rejecting every redirect.
+
+```
+$ cargo test -p envoy-config --lib --no-fail-fast
+test result: ok. 682 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+$ cargo clippy -p envoy-config --all-targets --all-features -- -D warnings
+clippy-exit=0 Checking=1
+```
+
+**Test-module helper note.** `PLAN.md` transcribes `tempfile::tempdir()` inline but instructs the
+executor to prefer an existing helper. The module has one — `write_temp(contents) -> (TempDir,
+PathBuf)` at `rds.rs:280` — so both tests use it. No new dev-dependency (`tempfile = "3"` was
+already there).
+
+### The generalised lesson, carried forward
+
+`76.1/SPEC.md` §2.3's claim that *"the compiler enforces the seam"* is **weaker than it sounds**.
+It holds only at genuine exhaustive `match` sites. It did **not** hold at `rds.rs:135`'s `if let`
+(which is exactly how CF-76-2 happened) and it still does **not** hold at the `Route` visitor's own
+`_` catch-all (`bootstrap.rs:2591`), where a future fourth `RouteAction` variant would silently
+fall into *"more than one is present"* rather than failing to build. **Add any future
+`RouteAction` variant by AUDITING EVERY SITE BY GREP, never by trusting the build.** Task 9 records
+this in the code itself.

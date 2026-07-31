@@ -2654,6 +2654,36 @@ impl serde::Serialize for RouteAction {
     }
 }
 
+/// 76.1 (§4.3), lifted to a shared helper at 76.2 (CF-76-2): the two
+/// intra-`RedirectAction` oneofs are exclusive on FIELD PRESENCE, not on value
+/// (MEASURED: `https_redirect: false` PLUS `scheme_redirect: "ftp"` REJECTS
+/// while `https_redirect: false` ALONE ACCEPTS).
+///
+/// 76.1 inlined these two checks at the bootstrap route walk only, so the RDS
+/// warm-reload path accepted a config the byte-identical BOOT config rejects
+/// (CF-76-2). 76.2 makes the redirect arm SERVE a real 3xx, so both callers
+/// now share this one function. `context` names the offending HCM listener at
+/// boot, or `rds:<path>` on a reload.
+pub(crate) fn validate_redirect_oneofs(
+    rd: &RedirectAction,
+    context: &str,
+    route: &str,
+) -> Result<(), crate::ConfigError> {
+    if rd.path_redirect.is_some() && rd.prefix_rewrite.is_some() {
+        return Err(crate::ConfigError::RedirectPathRewriteConflict {
+            listener: context.to_string(),
+            route: route.to_string(),
+        });
+    }
+    if rd.https_redirect.is_some() && rd.scheme_redirect.is_some() {
+        return Err(crate::ConfigError::RedirectSchemeRewriteConflict {
+            listener: context.to_string(),
+            route: route.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
@@ -4071,20 +4101,7 @@ fn validate_hcm(
                     validate_data_source(&dr.body, "direct_response.body", Required::InlineString)?;
                 }
                 RouteAction::Redirect(rd) => {
-                    // 76.1 (§4.3): the two intra-RedirectAction oneofs are
-                    // exclusive on FIELD PRESENCE, not on value (MEASURED).
-                    if rd.path_redirect.is_some() && rd.prefix_rewrite.is_some() {
-                        return Err(crate::ConfigError::RedirectPathRewriteConflict {
-                            listener: listener_name.to_string(),
-                            route: r.name.clone(),
-                        });
-                    }
-                    if rd.https_redirect.is_some() && rd.scheme_redirect.is_some() {
-                        return Err(crate::ConfigError::RedirectSchemeRewriteConflict {
-                            listener: listener_name.to_string(),
-                            route: r.name.clone(),
-                        });
-                    }
+                    validate_redirect_oneofs(rd, listener_name, &r.name)?;
                 }
                 RouteAction::Route(ar) => {
                     // 04.3 NEW: check the cluster reference against declared clusters.

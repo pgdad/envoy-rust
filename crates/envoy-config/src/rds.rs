@@ -77,12 +77,22 @@ pub fn parse_rds_file(
 ///     (update_failure).
 ///  3. **select** the `RouteConfiguration` whose `.name == route_config_name` —
 ///     absent → [`ConfigError::RdsRouteConfigNotFound`] (update_rejected).
-///  4. **revalidate** every `RouteAction::Route` reference against the live
-///     cluster set via `known_cluster` — a reference to a cluster NOT present →
-///     [`ConfigError::UnknownCluster`] (update_rejected). This is the recorded
-///     warm-reject divergence vs Envoy (ADR-0066): envoy-rust's request path
-///     `.expect()`s cluster existence, so installing an unknown-cluster route
-///     would panic — we reject the reload and keep the last-good table instead.
+///  4. **revalidate** every route action, via an EXHAUSTIVE `match`:
+///     * `RouteAction::Route` — its cluster reference is checked against the
+///       live cluster set via `known_cluster`; a reference to a cluster NOT
+///       present → [`ConfigError::UnknownCluster`] (update_rejected). This is
+///       the recorded warm-reject divergence vs Envoy (ADR-0066): envoy-rust's
+///       request path `.expect()`s cluster existence, so installing an
+///       unknown-cluster route would panic — we reject the reload and keep the
+///       last-good table instead.
+///     * `RouteAction::Redirect` — its two oneofs are re-checked through the
+///       shared [`crate::bootstrap::validate_redirect_oneofs`], the SAME
+///       function the boot path calls (76.2, closing CF-76-2). Before 76.2 this
+///       step was an `if let` over the `Route` arm alone, so a hot reload could
+///       install a `redirect:` config that the byte-identical BOOT config
+///       rejects as fatal.
+///     * `RouteAction::DirectResponse` — no re-validation; deferred under the
+///       OPEN ADR-0028 deferral, unchanged by 76.2.
 ///
 /// `known_cluster` is a predicate over cluster names rather than a
 /// `&ClusterManager` deliberately: `envoy-cluster` depends on `envoy-config`, so
@@ -130,12 +140,32 @@ pub fn reparse_and_select_route_config(
     // re-validation is deferred with ADR-0028.
     //
     // DirectResponse routes reference no cluster.
+    // 76.2 (CF-76-2): an EXHAUSTIVE `match`, deliberately — 76.1's `if let`
+    // meant adding the third `RouteAction` variant tripped NO compile error
+    // here, so an RDS reload carrying a mutually-exclusive `redirect:` oneof
+    // pair was accepted WARM while the byte-identical config was boot-fatal.
+    // A fourth variant must fail to build until it is handled here.
     for vh in &selected.virtual_hosts {
         for route in &vh.routes {
-            if let crate::RouteAction::Route(ar) = &route.action
-                && !known_cluster(&ar.cluster)
-            {
-                return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
+            match &route.action {
+                crate::RouteAction::Route(ar) => {
+                    if !known_cluster(&ar.cluster) {
+                        return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
+                    }
+                }
+                // 76.2 closes CF-76-2: the redirect arm now SERVES a real 3xx,
+                // so its oneof exclusivity must hold on the warm path too.
+                crate::RouteAction::Redirect(rd) => {
+                    crate::bootstrap::validate_redirect_oneofs(
+                        rd,
+                        &format!("rds:{path_str}"),
+                        &route.name,
+                    )?;
+                }
+                // `direct_response` re-validation (status range, body shape)
+                // stays deferred under the OPEN ADR-0028 deferral — unchanged
+                // by 76.2 and NOT widened into here.
+                crate::RouteAction::DirectResponse(_) => {}
             }
         }
     }
@@ -364,5 +394,66 @@ resources:
         let rc = reparse_and_select_route_config(&path, "local_route", &|_| false)
             .expect("direct_response needs no cluster");
         assert_eq!(rc.name, "local_route");
+    }
+
+    // --- 76.2 Task 8 (CF-76-2): the RDS warm path re-validates the redirect
+    // oneofs, so a hot reload cannot install a config the byte-identical BOOT
+    // config rejects. ---
+
+    /// 76.2 (CF-76-2) T8-1: an RDS HOT RELOAD carrying a mutually-exclusive
+    /// `redirect:` oneof pair must be WARM-REJECTED, exactly as the
+    /// byte-identical config is BOOT-fatal.
+    ///
+    /// 76.1 landed the `Redirect` variant while this path still used an
+    /// `if let RouteAction::Route(..)`, so the new variant tripped no compile
+    /// error and the pair was accepted warm and installed LIVE. That was
+    /// adjudicated MINOR at 76.1 only because the runtime arm was an inert 501;
+    /// 76.2 makes it serve a real 3xx, so the hole closes here.
+    #[test]
+    fn rds_reload_rejects_a_conflicting_redirect_oneof() {
+        let (_dir, path) = write_temp(
+            r#"resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: default
+    domains: ["*"]
+    routes:
+    - match: { prefix: "/r" }
+      redirect: { path_redirect: "/p", prefix_rewrite: "/q" }
+"#,
+        );
+        let err = reparse_and_select_route_config(&path, "local_route", &|_| true)
+            .expect_err("a conflicting redirect oneof must be warm-rejected");
+        assert!(
+            matches!(err, crate::ConfigError::RedirectPathRewriteConflict { .. }),
+            "expected RedirectPathRewriteConflict, got {err:?}"
+        );
+    }
+
+    /// 76.2 (CF-76-2) T8-2: the ACCEPT direction — a VALID `redirect:` route
+    /// still reloads warm. Without this, T8-1 would pass just as well if the
+    /// path rejected every redirect.
+    #[test]
+    fn rds_reload_accepts_a_valid_redirect_route() {
+        let (_dir, path) = write_temp(
+            r#"resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: default
+    domains: ["*"]
+    routes:
+    - match: { prefix: "/r" }
+      redirect: { host_redirect: "example.com" }
+"#,
+        );
+        let rc = reparse_and_select_route_config(&path, "local_route", &|_| true)
+            .expect("a valid redirect route must reload warm");
+        assert_eq!(rc.virtual_hosts.len(), 1);
+        assert!(matches!(
+            rc.virtual_hosts[0].routes[0].action,
+            crate::RouteAction::Redirect(_)
+        ));
     }
 }
