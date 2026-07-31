@@ -2954,6 +2954,175 @@ host. Corpus-wide, the maximum number of `envoy.access_loggers.file` sinks in an
 single fixture config is **1**. One sink per fixture is therefore the only
 available shape (ADR-0158), mirroring the existing sibling pair `0081`/`0082`.
 
+### Phase 76 (ADR-0168/0169): `Route.redirect` — the `location` construction rules, the redirect response header set, and the reason-phrase gap
+
+> **All rows below were MEASURED against the pinned reference image
+> `envoyproxy/envoy:v1.33.0`** (`docs/envoy-rust/ENVOY_TARGET.md`), at the phase-76 §5 state-0/1
+> recon and at the `76.2` state-2 session. Nothing here is read from documentation.
+> Sub-phase `76.1` landed the CONFIG surface; sub-phase `76.2` landed the RUNTIME.
+> Differential witness: fixture `0086-route-redirect-action` (18 HTTP/1.1 probes, backend-free).
+
+#### §A — the `location` construction rules
+
+Request authority is whatever the client sent in `Host:`. Every route below is `prefix:`-matched
+with a **non-overlapping** prefix; the listener is plaintext HTTP/1.1.
+
+| # | route `redirect:` config | request target | status | measured `location` |
+|---|---|---|---|---|
+| R1 | `host_redirect: "example.com"` | `/a-host` | 301 | `http://example.com/a-host` |
+| R2 | `host_redirect: "example.com"` | `/b-query/deep?a=b` | 301 | `http://example.com/b-query/deep?a=b` |
+| R3 | `path_redirect: "/newpath"` | `/c-pathr/sub` | 301 | `http://envoy-rust.test/newpath` |
+| R4 | `path_redirect: "/newpath"` | `/d-pathq/x?k=v` | 301 | `http://envoy-rust.test/newpath?k=v` |
+| R5 | `prefix_rewrite: "/replaced"` | `/e-pfx/sub` | 301 | `http://envoy-rust.test/replaced/sub` |
+| R6 | `https_redirect: true` | `/f-https/x` | 301 | `https://envoy-rust.test/f-https/x` |
+| R7 | `host_redirect` + `response_code: TEMPORARY_REDIRECT` | `/g-c307` | **307** | `http://example.com/g-c307` |
+| R8 | `host_redirect` + `strip_query: true` | `/h-strip/a?q=1&z=2` | 301 | `http://example.com/h-strip/a` |
+| R9 | `host_redirect` + `port_redirect: 8443` | `/i-port` | 301 | `http://example.com:8443/i-port` |
+| R10 | `{}` (bare, all defaults) | `/j-bare/deep` | 301 | `http://envoy-rust.test/j-bare/deep` |
+| R11 | `scheme_redirect: "ftp"` | `/k-scheme/x` | 301 | `ftp://envoy-rust.test/k-scheme/x` |
+| R12 | `scheme_redirect: "https"` + `host_redirect: "e.com"` | `/l-both/y` | 301 | `https://e.com/l-both/y` |
+| R13 | `host_redirect: "e.com"`, `strip_query: true`, `response_code: SEE_OTHER` | `/m-see/y?q=1` | **303** | `http://e.com/m-see/y` |
+| R14 | `https_redirect: true` + `port_redirect: 443` | `/n-hport/y` | 301 | `https://envoy-rust.test:443/n-hport/y` |
+| R15 | `host_redirect` + `response_code: FOUND` | `/o-found` | **302** | `http://example.com/o-found` |
+| R16 | `host_redirect` + `response_code: PERMANENT_REDIRECT` | `/p-perm` | **308** | `http://example.com/p-perm` |
+
+**Authority rows — `Host:` carries an explicit port that matches NEITHER proxy's listen port.**
+These prove the rule is driven by the `Host` header rather than by the socket, and they are what
+make a cross-proxy `location` comparison possible at all:
+
+| # | `Host:` sent | route config | target | measured `location` |
+|---|---|---|---|---|
+| Q1 | `envoy-rust.test:1234` | `https_redirect: true` | `/q1-hostport/x` | `https://envoy-rust.test:1234/q1-hostport/x` |
+| Q2 | `envoy-rust.test:1234` | `host_redirect: "example.com"` | `/a-host` | `http://example.com/a-host` |
+| Q3 | `envoy-rust.test:1234` | `{}` (bare) | `/q3-hostport/d` | `http://envoy-rust.test:1234/q3-hostport/d` |
+| Q4 | `envoy-rust.test:1234` | `https_redirect: true` + `port_redirect: 443` | `/n-hport/y` | `https://envoy-rust.test:443/n-hport/y` |
+
+| # | route config | target | measured `location` | reading |
+|---|---|---|---|---|
+| E1 | `https_redirect: false` (alone) | `/y-hfalse/z` | `http://envoy-rust.test/y-hfalse/z` | an explicit `false` behaves as the default scheme |
+| E2 | `path_redirect: ""` | `/x-emptypath/z` | `http://envoy-rust.test/x-emptypath/z` | an EMPTY `path_redirect` performs **no** rewrite |
+
+Body on every redirect row: **empty**, `content-length: 0`.
+
+**The derived rules, read off the tables above — this is what an implementation must encode:**
+
+**(a) Scheme.** Default = the scheme the request arrived on (`http` on a plaintext listener).
+`https_redirect: true` forces `https`; an explicit `https_redirect: false` is the default (E1).
+`scheme_redirect: "<s>"` forces the literal `<s>` and is **NOT validated against any scheme
+allow-list** — the literal `ftp` was accepted and emitted verbatim (R11).
+
+**(b) Authority — THE ASYMMETRY, and the headline rule of this phase.** The one rule a
+from-scratch implementation is most likely to get wrong:
+
+- `host_redirect` **set** → the authority becomes that host and **the request's original port is
+  DROPPED** (R1, and decisively Q2: `Host: envoy-rust.test:1234` → `http://example.com/a-host`,
+  no port).
+- `host_redirect` **unset** → the request's original authority is preserved **including its port**
+  (Q1/Q3 keep `:1234`).
+- `port_redirect` overrides the port in **both** cases and renders as `:<n>`.
+- A scheme-only change does **NOT** normalise or drop a now-redundant port: R14/Q4 produce the
+  literal `https://…:443/…`, and Q1 keeps `:1234` on an `https` URL.
+- `port_redirect` is rendered **verbatim with no range clamp** — `70000` renders as `:70000`, and
+  `0` is accepted. There is **no PGV bound**; do not add `1..=65535`.
+
+**(c) Path.** Exactly one of three, or none: none → the request path is used as-is;
+`path_redirect: "/p"` → the path becomes the literal `/p` **unless it is empty**, which performs no
+rewrite (E2); `prefix_rewrite: "/p"` → the span matched by the route's `prefix:` matcher is
+replaced by `/p` and the remainder appended (R5). `regex_rewrite` inside `redirect` is a
+**non-goal** and is boot-fatal here via `deny_unknown_fields`.
+
+**(d) Query.** **Preserved and re-appended by default**, and this holds even when the path is
+replaced wholesale — R4 shows `path_redirect: "/newpath"` against `/d-pathq/x?k=v` yielding
+`/newpath?k=v`. `strip_query: true` drops it (R8/R13).
+
+**(e) Status.** Default 301; the five `response_code` values map per §C.
+
+#### §B — the redirect response header set
+
+MEASURED under the harness's exact request shape (a raw `GET <target> HTTP/1.1` with `Host:` and
+`Connection: close`):
+
+| response | headers, in wire order |
+|---|---|
+| **redirect** | `location`, `date`, `server`, `connection`, `content-length` |
+| `direct_response` (control) | `content-length`, `content-type`, `date`, `server`, `connection` |
+
+**A redirect carries NO `content-type`. A `direct_response` DOES.** This is a load-bearing
+difference, not a cosmetic one: envoy-rust's shared `synth_with` skeleton always emits
+`content-type`, so the redirect arm **must not reuse it** and instead has a dedicated
+`synth_redirect` builder. Reusing `synth_with` fails the harness's `diff_headers` **name-set**
+check with `only-in-envoy-rust=["content-type"]`.
+
+#### §C — the reason phrases, and why they are NOT differentially witnessed
+
+| `response_code` | wire status line |
+|---|---|
+| `MOVED_PERMANENTLY` (default) | `HTTP/1.1 301 Moved Permanently` |
+| `FOUND` | `HTTP/1.1 302 Found` |
+| `SEE_OTHER` | `HTTP/1.1 303 See Other` |
+| `TEMPORARY_REDIRECT` | `HTTP/1.1 307 Temporary Redirect` |
+| `PERMANENT_REDIRECT` | `HTTP/1.1 308 Permanent Redirect` |
+
+**The reason phrase is NOT part of the equivalence matrix.** `response_status: exact` compares the
+status **code** only, and the harness's `drive_http1` parses only the code. Before `76.2`,
+envoy-rust's `canonical_reason` table was missing 303/307/308 — they fell through to `_ => "OK"`,
+so a `SEE_OTHER` redirect emitted `HTTP/1.1 303 OK`. **A differential fixture CANNOT catch this
+class of defect**, so the three phrases are pinned by an **in-process** unit test instead. Any
+future status code added to a synth path needs the same treatment.
+
+#### §D — access-log observables
+
+- **`%RESPONSE_CODE_DETAILS%` for a redirect is `direct_response`** — the *same* string upstream
+  uses for a `direct_response:` route. envoy-rust already emits exactly that literal, so the
+  redirect arm **reuses it verbatim**: no new detail string, no new `Op`, no new `AccessLogRecord`
+  field exists or is needed.
+- **`%RESPONSE_FLAGS%` is `-`** on every redirect row.
+- **`prefix_rewrite` MUTATES the logged `:path`; `path_redirect` does NOT.** Request `/e-pfx/sub`
+  on a `prefix_rewrite: "/replaced"` route logs as `path=/replaced/sub`, while `/c-pathr/sub` on a
+  `path_redirect` route logs unchanged. This is a real discriminating observable and a parity trap:
+  the rewrite is applied to the request's `:path` **in place**, which is why `build_response`
+  takes `&mut Request`. It is invisible to fixture `0086` (which compares responses, not logs) and
+  is pinned in-process.
+
+#### §E — the harness rule, stated as a STANDING PROHIBITION
+
+**`location` is NOT on the 3-entry `HEADER_ALLOW_LIST`** (`server`, `date`,
+`x-envoy-upstream-service-time`, in `tests/differential/src/lib.rs`), so `diff_headers` compares it
+**value-exact**, as it does every non-allow-listed name. **That comparison IS fixture `0086`'s
+entire witness.**
+
+> **NEVER add `location` to `HEADER_ALLOW_LIST`.** Doing so would silently vacate every `location`
+> assertion in the corpus while leaving the fixture green — the most dangerous possible failure
+> mode, because it looks like success.
+
+The same reasoning makes `content-length` value-exact for free, which is what pins the empty body.
+
+#### §F — NOT MEASURED — do not treat these as settled
+
+1. Redirect behaviour on a **TLS** listener — whether the default scheme becomes `https` when the
+   request arrived over TLS. Every probe used a plaintext listener. Rule (a) says "the scheme the
+   request arrived on", which is the natural reading, but the `https` case was **not** measured.
+2. Redirect behaviour over **HTTP/2 upstream-side**. All probes were HTTP/1.1. envoy-rust shares
+   H1's resolver and dispatch arm (pinned in-process), but upstream's H2 `:scheme`/`:authority`
+   handling was never probed.
+3. A request with **no `Host` header** — whether it reaches a redirect route at all, and what
+   authority `location` would then carry.
+4. `port_redirect` boundary behaviour above 65535 beyond the single `70000` probe.
+5. The interaction of `redirect` with `typed_per_filter_config` on the same `Route`.
+6. Whether `strip_port`'s `rfind(':')` handles a **bracketed IPv6 literal** authority correctly.
+   Pre-existing and used for vhost matching; a redirect echoing the authority may surface it.
+7. **[introduced by the `76.2` implementation, not by the recon]** Whether `prefix_rewrite` on a
+   **`path:`-matched** route replaces the whole path. envoy-rust implements "the matched span is
+   the whole path when `match.prefix` is `None`", which is a *choice*, not a measurement.
+   **Unwitnessed by construction:** every route in `0086` is `prefix:`-matched.
+8. **[introduced by the `76.2` implementation]** Whether the query rides along on the **rewritten
+   `:path`** when `prefix_rewrite` and a query combine. envoy-rust preserves it. **Unwitnessed by
+   construction:** `0086`'s `r05` probe is deliberately query-free.
+
+> Items 7 and 8 are the two cells this phase *created* rather than measured. A later session must
+> not mistake them for settled behaviour: they are envoy-rust's current choice, pinned by
+> in-process tests, and never compared against upstream.
+
 ---
 
 ## xDS wire state machine

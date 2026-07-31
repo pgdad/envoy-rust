@@ -987,3 +987,91 @@ Three things worth naming:
 2. **`q01`/`q03` keep `:1234`** while `r01` drops the port — the authority asymmetry, live.
 3. **No `content-type` on any redirect**, confirming Task 4's dedicated builder is what the wire
    actually gets.
+
+---
+
+## Task 12 — `BEHAVIOR_CONTRACT.md` Phase 76 section
+
+**Status: COMPLETE.** Commit message:
+`phase 76.2 task 12: BEHAVIOR_CONTRACT Phase 76 — the redirect location + header-set rules`.
+
+Documentation, but a **§7.5 obligation**: the contract is the canonical definition of equivalence
+(doctrine D-3.3), and MEASURED behaviour that lives only in a phase SPEC is not durable — a phase
+SPEC is a landed historical artifact nobody re-reads, whereas `BEHAVIOR_CONTRACT.md` is a
+cold-start read.
+
+**MEASURED absent before this task:** `grep -c 'Phase 76' docs/envoy-rust/BEHAVIOR_CONTRACT.md`
+→ **0**.
+
+### Placement
+
+Inserted after the Phase 75 section (which ends at the ADR-0158 one-sink paragraph) and **before**
+`## xDS wire state machine`, exactly as `PLAN.md` specifies. Six subsections, modelled on Phase 75's
+structure:
+
+- **§A** — the `location` construction rules (a)-(e) with the full R1-R16 / Q1-Q4 / E1-E2 tables.
+  The **authority asymmetry** is called out as the headline rule.
+- **§B** — the redirect response header set, and the explicit contrast with `direct_response`:
+  **a redirect carries NO `content-type`.**
+- **§C** — all five status lines, plus the statement that the reason phrase is **not** part of the
+  equivalence matrix, which is *why* 303/307/308 are pinned in-process rather than differentially.
+- **§D** — the access-log observables: `%RESPONSE_CODE_DETAILS%` = `direct_response` (so no new
+  detail string/`Op`/field exists), `%RESPONSE_FLAGS%` = `-`, and the `prefix_rewrite`-mutates /
+  `path_redirect`-does-not asymmetry.
+- **§E** — the harness rule as a **standing prohibition**: `location` is not allow-listed, is
+  compared value-exact, and **must never be added to the allow-list** — with the reason named
+  (doing so vacates the witness *while leaving the fixture green*, which looks like success).
+- **§F** — the NOT-MEASURED list, **eight items**.
+
+### §F items 7 and 8 — the two cells this phase CREATED rather than measured
+
+`PLAN.md` §6 finding (6) is explicit that the implementation introduced two behaviours that are
+**unwitnessed by construction**, and requires both to be banked so a later session does not mistake
+them for settled:
+
+7. Whether `prefix_rewrite` on a **`path:`-matched** route replaces the whole path. envoy-rust
+   implements *"the matched span is the whole path when `match.prefix` is `None`"* — a **choice**,
+   not a measurement. Every route in `0086` is `prefix:`-matched, so nothing exercises it.
+8. Whether the query rides along on the **rewritten `:path`** when `prefix_rewrite` and a query
+   combine. envoy-rust preserves it. `0086`'s `r05` probe is **deliberately query-free**, so
+   nothing exercises it.
+
+Both are recorded with an explicit closing note that they are envoy-rust's current choice, pinned
+only by in-process tests, and **never compared against upstream**.
+
+### Verification — structural, and delta-based
+
+```
+$ grep -c '^### Phase 76' docs/envoy-rust/BEHAVIOR_CONTRACT.md
+1
+$ grep -n '^### Phase 76\|^## xDS wire state machine' docs/envoy-rust/BEHAVIOR_CONTRACT.md
+2957:### Phase 76 (ADR-0168/0169): …
+3128:## xDS wire state machine
+
+$ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
+169     0       docs/envoy-rust/BEHAVIOR_CONTRACT.md
+```
+
+The heading appears **exactly once**, sits **before** the xDS heading, and the numstat shows
+**169 added / 0 deleted** — no pre-existing line was touched, so no content was lost and Phase 75
+is intact (`grep -c '^### Phase 75'` → 1).
+
+**Duplication check run on the DELTA, not the whole file.** `PLAN.md` suggests
+`sort <file> | uniq -d`, but over a 3700-line document that returns dozens of legitimate repeats
+(markdown table separators, `>` blockquote markers) and would drown a real signal. Checking only
+the added lines:
+
+```
+$ git diff -U0 … | grep '^+' | sed 's/^+//' | grep -v '^$' | sort | uniq -d
+|---|---|
+|---|---|---|---|---|
+```
+
+Both are markdown table separator rows, legitimately repeated across the section's five tables.
+No duplicated prose.
+
+**One defect caught and fixed by that structural check:** the first insertion left a **doubled
+`---` separator** (the section's own separator plus the pre-existing one). Detected with an
+explicit scan for a `---` / blank / `---` run, and removed; the file now has a single separator
+between the Phase 76 section and `## xDS wire state machine`. This is exactly why the structural
+check is run rather than eyeballing the diff.
