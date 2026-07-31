@@ -38,6 +38,7 @@ that forced it. Running list:
 | D-1 | 2, 3, 4 | `PLAN.md`'s Global Constraint *"`clippy -D warnings` must be clean at every task boundary"* is **NOT ACHIEVABLE under the plan's own task split**, and Task 2 Step 3's *"no `unused_imports` warning"* is **REFUTED**. Measured: Task 2 leaves `RedirectAction` unused (`clippy` exit **101**); Task 3 leaves `RedirectPlan`/`plan_redirect` dead (`never constructed` / `never used`, exit **101**); Task 4 will leave `synth_redirect` dead. | Structural, one root cause: Tasks 2-4 each add a **non-test** item whose only **non-test** consumer is Task 5's dispatch arm. The plan's §2 pre-flight applied Tasks 1-5 as **one patch**, so the unbundled intermediate states never existed there. Accepted, not papered over — `#[allow(dead_code)]` would be cruft deleted at Task 5, and folding 2-4 into 5 would destroy the TDD granularity and the unambiguous REDs. **Self-closes at Task 5**, verified there. `cargo build` and `cargo fmt --check` stay green throughout; only the lint gate is transiently red. |
 | D-2 | 3 | `PLAN.md` T3-3's literal `Some("/é"[..2].into())` **panics in the test itself** and never reaches `plan_redirect`. Replaced with a 2-byte ASCII prefix, `Some("ab")`. | `"/é"` is **3 bytes** (`/`=1, `é`=2), so byte index 2 is **not a char boundary** and `str` slicing there aborts. The replacement witnesses the identical cell honestly: `matched_len` is 2, `"/é".get(2..)` lands mid-`é` and returns `None`, so the `unwrap_or("")` inside `plan_redirect` — the very thing being tested — is what keeps the function total. The plan's §2 pre-flight **ran only two representative tests**, so a runtime panic in a third was invisible to it (`fmt`/`clippy` do not execute tests). |
 | D-4 | 5 | `PLAN.md` Task 5 Step 2's prediction *"the compile fails first on `&mut req` (the signature is still `&Request`)"* is **REFUTED** — it compiles, and the RED is the assertion `left: 501, right: 301`. No code change; the plan's expected-output text is simply wrong. | Rust **coerces `&mut T` to `&T`** at a call site, so passing `&mut req` to a fn still declared `&Request` is legal. The observed RED is strictly *better* evidence than the plan expected: a pure behavioural flip of the placeholder, mirroring the pre-flight's `left: 301, right: 501` from the other side. Recorded so a reviewer comparing the plan's expected text against `PROGRESS.md` does not read the difference as a skipped step. |
+| D-5 | 7 | `PLAN.md` T7-1's literal `version: envoy_http1::codec::HttpVersion::Http2` **does not exist**. Uses `envoy_http1::HttpVersion::Http11`. | MEASURED: `HttpVersion` (`crates/envoy-http1/src/codec.rs:14-17`) has **exactly two** variants, `Http10` and `Http11` — there is no `Http2`. The sibling H2 test `h2_resolve_route_reachable_and_returns_cors_route` likewise builds its `envoy_http1::Request` with `Http11`; the field does not participate in route dispatch. Also corrected: the re-export path is `envoy_http1::HttpVersion` (`lib.rs:28`), not `envoy_http1::codec::…`. This is the ONE task the plan flagged as **not pre-flighted end-to-end**, and this is exactly the class of error that predicts. The plan's trailing `let _ = (…)` scaffolding line was deleted as it instructs, the imports being genuinely consumed. |
 | D-3 | 3 | `PLAN.md` T3-2's assert message `"a bare redirect{} rewrites nothing"` **does not compile**. Escaped to `redirect{{}}`. | `assert_eq!`'s third argument is a **format string**, so the bare `{}` is parsed as a positional placeholder: `error: 1 positional argument in format string, but no arguments were given`. Rendered output is unchanged. Note this contradicts `PLAN.md` §2's claim that the Task-3 block passed `clippy -D warnings` — a block that does not compile cannot have. Recorded as a measured fact about the plan, not repaired in `PLAN.md` (D-3.5: it is this state's input). |
 
 ---
@@ -585,3 +586,97 @@ clippy-exit=0 Checking=1
 (`RedirectAction { <field>: …, ..Default::default() }`) instead, which is the same construction
 without the `clippy::field_reassign_with_default` exposure — a cosmetic transcription choice, not
 a behavioural deviation, and `cargo fmt --check` is byte-clean either way.
+
+---
+
+## Task 7 — the HTTP/2 shared-seam in-process test
+
+**Status: COMPLETE.** Commit message: `phase 76.2 task 7: pin that the shared dispatch seam serves HTTP/2`.
+
+**The claim being pinned.** HTTP/2 has **no route-action dispatch of its own** — it calls H1's
+resolver and H1's `build_response` (`crates/envoy-http2/src/hcm.rs:18` imports them, `:518` calls
+`build_response`). So the ONE arm Task 5 added serves **both codecs**, and a bug there hits both.
+
+**This is the one task `PLAN.md` flagged as NOT pre-flighted end-to-end** (it depended on a helper
+that did not yet exist), with an explicit instruction to read the existing
+`h2_resolve_route_reachable_and_returns_cors_route` first and copy its shape. Done — and that
+reading is what caught deviation **D-5**.
+
+### D-5 — the plan's literal names a variant that does not exist
+
+`PLAN.md` T7-1 builds its request with `version: envoy_http1::codec::HttpVersion::Http2`.
+MEASURED: `HttpVersion` (`crates/envoy-http1/src/codec.rs:14-17`) has **exactly two** variants:
+
+```rust
+pub enum HttpVersion {
+    Http10,
+    Http11,
+}
+```
+
+There is **no `Http2`**. The sibling H2 test builds its `envoy_http1::Request` with `Http11` too —
+the version field plays no part in route dispatch — so `Http11` is used here, with an in-code
+comment saying why. The re-export path is also `envoy_http1::HttpVersion` (`lib.rs:28`), not
+`envoy_http1::codec::…`. The plan's trailing `let _ = (…)` scaffolding line was deleted as
+instructed, its imports being genuinely consumed by the helper.
+
+The helper `h2_redirect_h1_config` was modelled on the CORS test's `Http1HCMConfig::from_config(
+&cfg, cluster_mgr, registry, None)` shape rather than invented.
+
+### GREEN
+
+```
+$ cargo test -p envoy-http2 --lib -- h2_shared_seam
+exit=0
+test hcm::tests::h2_shared_seam_serves_the_redirect_arm ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out
+
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+$ cargo clippy -p envoy-http2 --all-targets --all-features -- -D warnings
+clippy-exit=0 Checking=9
+```
+
+### The RED, by mutation — and it is the STRONGEST evidence in this phase
+
+Task 5 was already committed, so the test passes on arrival. `PLAN.md` Task 7 Step 2 anticipates
+exactly this and directs that TDD's RED be honoured by **Task 3's `host_part = authority`
+mutation** in a scratch worktree. Run at `cbfcaf1`:
+
+```
+MUTATED exit=101
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+   Compiling envoy-http2 v0.0.0 (<scratch>/crates/envoy-http2)
+test hcm::tests::h2_shared_seam_serves_the_redirect_arm ... FAILED
+thread '...' panicked at crates/envoy-http2/src/hcm.rs:6932:17:
+  left: Some("http://envoy-rust.test/a-host")
+ right: Some("http://example.com/a-host")
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 111 filtered out
+```
+
+**Read what this actually proves.** The mutation was applied to `crates/envoy-http1/src/hcm.rs`,
+and the test that went RED lives in `crates/envoy-http2/src/hcm.rs`. A one-line change to H1's
+`plan_redirect` reddens an H2 test. That is a **direct demonstration** of the shared seam — not an
+assertion that H2 reaches the arm, but proof that H2's answer is *computed by* the H1 arm. Both
+crates appear in the `Compiling` list, so neither used a stale binary.
+
+Control and integrity, from the same worktree:
+
+```
+mutation still present after run? -> 1 (expect 1)
+CONTROL exit=0
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out
+```
+
+**Housekeeping note.** `git worktree remove` was run while the shell's cwd was still *inside* the
+worktree, so the next command died with `fatal: Unable to read current working directory`. That is
+the known benign symptom, not a failed removal — re-verified from the repo root that
+`git worktree list` shows exactly **5** entries: the main tree plus the **four pre-existing sibling
+`agent-*` worktrees**, all untouched. Main tree clean.
+
+### What this test does NOT prove
+
+It pins envoy-rust's **own** seam, not upstream parity. Upstream's H2 `:scheme`/`:authority`
+handling was never probed (`SPEC.md` §8 item 2), and an H2 differential fixture is an explicit
+non-goal (`SPEC.md` §7 item 4) — the disposition phases 68 and 69 took.

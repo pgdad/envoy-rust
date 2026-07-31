@@ -6853,4 +6853,93 @@ static_resources:
             "P1 parity preserved on the H2 path"
         );
     }
+
+    /// Config fixture for the 76.2 shared-seam test: an `Http1HCMConfig` with
+    /// ONE virtual host and ONE `prefix: "/a-host"` route whose action is
+    /// `RouteAction::Redirect(rd)`. Modelled on the sibling
+    /// `h2_resolve_route_reachable_and_returns_cors_route` helper, which is the
+    /// established shape for building an H1 config inside this crate's tests.
+    async fn h2_redirect_h1_config(rd: envoy_config::RedirectAction) -> Http1HCMConfig {
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test_h2_redirect".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/a-host".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Redirect(rd),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCMConfig")
+    }
+
+    /// 76.2 T7-1: the SHARED SEAM. HTTP/2 has no route-action dispatch of its
+    /// own — it calls `envoy_http1::hcm::build_response` at `:518` — so the
+    /// single redirect arm added at 76.2 serves BOTH codecs, and a bug there
+    /// hits both. This pins that the seam is reachable from the H2 crate and
+    /// returns a real 301 with a `location:` header.
+    ///
+    /// This is envoy-rust's OWN seam, not upstream parity: upstream's H2
+    /// `:scheme`/`:authority` handling was never probed (SPEC 8 item 2), and an
+    /// H2 differential fixture is an explicit non-goal (SPEC 7 item 4).
+    #[tokio::test]
+    async fn h2_shared_seam_serves_the_redirect_arm() {
+        let rd = envoy_config::RedirectAction {
+            host_redirect: Some("example.com".to_string()),
+            ..Default::default()
+        };
+
+        let h1cfg = h2_redirect_h1_config(rd).await;
+        // NOTE: `HttpVersion` has exactly two variants, `Http10` and `Http11` —
+        // there is NO `Http2`. The sibling H2 tests likewise build their
+        // `envoy_http1::Request` with `Http11`; the version field does not
+        // participate in route dispatch.
+        let mut req = Request {
+            method: "GET".to_string(),
+            path: "/a-host".to_string(),
+            version: envoy_http1::HttpVersion::Http11,
+            headers: vec![("host".to_string(), "envoy-rust.test".to_string())],
+            bytes_consumed: 0,
+            body: None,
+        };
+        match build_response(&h1cfg, &mut req, false) {
+            BuildOutcome::Synth(resp, detail) => {
+                assert_eq!(resp.status, 301);
+                assert_eq!(
+                    resp.headers
+                        .iter()
+                        .find(|(n, _)| n == "location")
+                        .map(|(_, v)| v.as_str()),
+                    Some("http://example.com/a-host"),
+                    "H2 must get the identical location H1 gets — one arm, both codecs"
+                );
+                assert_eq!(detail, Some("direct_response"));
+            }
+            _other => panic!("expected BuildOutcome::Synth(301) from the shared seam"),
+        }
+    }
 }
