@@ -9831,6 +9831,90 @@ static_resources:
         }
     }
 
+    /// Config fixture for the `:path`-mutation tests: ONE route, `prefix`- or
+    /// `path`-matched as the caller chooses, whose action is a redirect built
+    /// from `rd`.
+    async fn redirect_route_config(prefix: &str, rd: RedirectAction) -> HCMConfig {
+        HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some(prefix.to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Redirect(rd),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        }
+    }
+
+    /// 76.2 T6-1: `prefix_rewrite` MUTATES the request's `:path` in place, so
+    /// the access-log record — built from `req.path` AFTER `build_response`
+    /// returns — observes the rewrite. MEASURED upstream: request
+    /// `/e-pfx/sub` on a `prefix_rewrite: "/replaced"` route logs as
+    /// `path=/replaced/sub`.
+    #[tokio::test]
+    async fn build_response_prefix_rewrite_mutates_the_request_path() {
+        let rd = RedirectAction {
+            prefix_rewrite: Some("/replaced".into()),
+            ..Default::default()
+        };
+        let config = redirect_route_config("/e-pfx", rd).await;
+        let mut req = make_req("/e-pfx/sub", "envoy-rust.test");
+        let outcome = build_response(&config, &mut req, true);
+        assert!(matches!(outcome, BuildOutcome::Synth(ref r, _) if r.status == 301));
+        assert_eq!(
+            req.path, "/replaced/sub",
+            "prefix_rewrite must rewrite the request's own :path in place"
+        );
+    }
+
+    /// 76.2 T6-2: the OTHER HALF of the asymmetry — `path_redirect` changes the
+    /// `location` only and MUST NOT touch the request's `:path`. MEASURED
+    /// upstream: `/c-pathr/sub` is logged unchanged.
+    #[tokio::test]
+    async fn build_response_path_redirect_leaves_the_request_path_alone() {
+        let rd = RedirectAction {
+            path_redirect: Some("/newpath".into()),
+            ..Default::default()
+        };
+        let config = redirect_route_config("/c-pathr", rd).await;
+        let mut req = make_req("/c-pathr/sub", "envoy-rust.test");
+        match build_response(&config, &mut req, true) {
+            BuildOutcome::Synth(resp, _) => {
+                assert_eq!(
+                    resp.headers
+                        .iter()
+                        .find(|(n, _)| n == "location")
+                        .map(|(_, v)| v.as_str()),
+                    Some("http://envoy-rust.test/newpath"),
+                );
+            }
+            _other => panic!("expected BuildOutcome::Synth"),
+        }
+        assert_eq!(
+            req.path, "/c-pathr/sub",
+            "path_redirect must NOT touch the request's :path"
+        );
+    }
+
     /// Config fixture for the redirect dispatch tests: one `prefix: "/"` route
     /// whose action is `RouteAction::Redirect` with `https_redirect: true`.
     async fn redirect_placeholder_config() -> HCMConfig {

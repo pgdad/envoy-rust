@@ -496,3 +496,92 @@ fmt-exit=0 bytes=0
 
 Exit 0 with a **non-zero** `Checking` count — a clippy green with ZERO `Checking` lines would be a
 fully-cached no-op rather than evidence. **D-1 is closed exactly where it was predicted to close.**
+
+---
+
+## Task 6 — the `prefix_rewrite` in-place `:path` mutation pins
+
+**Status: COMPLETE.** Commit message: `phase 76.2 task 6: pin the prefix_rewrite :path mutation and the path_redirect non-mutation`.
+
+**The observable.** MEASURED upstream with
+`text_format: "PROBE path=%REQ(:PATH)% …"`: request `/e-pfx/sub` on a
+`prefix_rewrite: "/replaced"` route is logged as `path=/replaced/sub`, while `/c-pathr/sub` on a
+`path_redirect: "/newpath"` route is logged **unchanged**. That asymmetry is a real discriminating
+observable and a parity trap — and it is **invisible to fixture `0086`**, which compares responses,
+not logs. These two in-process pins are its only guard.
+
+**This task adds no implementation.** Task 5 already landed the write-back, so both tests pass on
+arrival:
+
+```
+$ cargo test -p envoy-http1 --lib -- build_response_prefix_rewrite build_response_path_redirect
+exit=0
+test hcm::tests::build_response_path_redirect_leaves_the_request_path_alone ... ok
+test hcm::tests::build_response_prefix_rewrite_mutates_the_request_path ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 192 filtered out
+```
+
+A test that passes on arrival is **not** TDD evidence. Per `PLAN.md` Step 2 and the standing
+project discipline for this situation, **the RED is produced by mutation instead**, and THAT is
+recorded as the evidence.
+
+### Step 2 — the RED, by mutation, under full hygiene
+
+Clean work committed FIRST (`b641c27`), then a scratch `git worktree --detach` **at that commit** —
+never the main tree, because four sibling `.claude/worktrees/agent-*` worktrees were live and a
+parallel `git checkout` can silently revert an in-place mutation. The two write-back lines in
+Task 5's arm were disabled:
+
+```
+MUTATED exit=101
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+test hcm::tests::build_response_path_redirect_leaves_the_request_path_alone ... ok
+test hcm::tests::build_response_prefix_rewrite_mutates_the_request_path ... FAILED
+thread '...' panicked at crates/envoy-http1/src/hcm.rs:9885:9:
+  left: "/e-pfx/sub"
+ right: "/replaced/sub"
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 192 filtered out
+```
+
+**`left: "/e-pfx/sub"  right: "/replaced/sub"`** — the exact RED text `PLAN.md` predicted.
+
+Two things make this stronger than a bare RED:
+
+1. **The mutation is CELL-ACCURATE.** T6-2 (`path_redirect` non-mutation) stayed **GREEN** under
+   the same mutation, which is what it must do — disabling the write-back cannot affect the arm
+   that never writes back. A mutation that reddened both tests would have indicated the pins were
+   measuring the same thing twice.
+2. **`Compiling envoy-http1` appears on the mutated run**, proving no stale binary. A mutation
+   check against a cached test binary is a FALSE PASS.
+
+Post-run integrity re-grep, then the **unmutated control from the SAME worktree** (a RED that never
+reached an assertion is not evidence, and a control from a different tree proves nothing):
+
+```
+mutation still present after the run? -> 1 (expect 1)
+reverted; mutation now -> 0 (expect 0)
+
+CONTROL exit=0
+   Compiling envoy-http1 v0.0.0 (<scratch>/crates/envoy-http1)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 192 filtered out
+```
+
+Worktree removed; `git worktree list` re-checked from the repo root shows the main tree plus the
+**four pre-existing sibling `agent-*` worktrees, untouched**. Main tree `git status --porcelain`
+clean.
+
+### Gates
+
+```
+$ cargo fmt --all -- --check
+fmt-exit=0 bytes=0
+
+$ cargo clippy -p envoy-http1 --all-targets --all-features -- -D warnings
+clippy-exit=0 Checking=1
+```
+
+**Transcription note.** The plan's literals for both tests use
+`let mut rd = RedirectAction::default(); rd.<field> = …`. Transcribed with struct-update syntax
+(`RedirectAction { <field>: …, ..Default::default() }`) instead, which is the same construction
+without the `clippy::field_reassign_with_default` exposure — a cosmetic transcription choice, not
+a behavioural deviation, and `cargo fmt --check` is byte-clean either way.
