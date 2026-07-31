@@ -1075,3 +1075,117 @@ No duplicated prose.
 explicit scan for a `---` / blank / `---` run, and removed; the file now has a single separator
 between the Phase 76 section and `## xDS wire state machine`. This is exactly why the structural
 check is run rather than eyeballing the diff.
+
+---
+
+## Task 11 (continued) — Step 2 the fixture run, its AUDIT, and Step 3 the full suite
+
+### Step 2 — `0086` green, and WHY that green is trusted
+
+```
+$ cargo build -p envoy-bin          # MANDATORY before any local differential
+$ cargo test -p differential --test route_redirect_action -- --nocapture
+exit=0
+   Compiling differential v0.0.0 (/home/esa/git/envoy-rust/tests/differential)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+```
+
+Docker daemon confirmed **up** and the pinned `envoyproxy/envoy:v1.33.0` image confirmed present
+before the run.
+
+**A 1.00 s green on a backend-free fixture is NORMAL — but it is also exactly what a silent skip
+looks like, so it was AUDITED with a deliberate NEGATIVE CONTROL** rather than trusted. In a
+scratch worktree at `81aee77`, `r13`'s `expected_status` was falsified from `303` to `302`:
+
+```
+NEGATIVE-CONTROL exit=101
+thread 'route_redirect_action_fixture' panicked at tests/differential/tests/route_redirect_action.rs:37:10:
+fixture passes: probe r13-response-code-303-with-strip-query: upstream status 303 != expected 302
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+```
+
+**Read the words `upstream status 303`.** They can only have come from the upstream Envoy container
+actually running and answering. The fixture is genuinely driving both proxies and comparing — the
+green is real. The control was re-grepped as still present afterwards, the worktree removed, and
+the main fixture re-verified unmutated (`r13` still `expected_status: 303`).
+
+### Step 3 — the full `-p differential` suite: PARTIAL, and honestly labelled
+
+```
+$ cargo test -p differential --no-fail-fast          # redirected to a file, never through `tail`
+binaries=88 passed=241 failed=6
+```
+
+Census taken with `grep -oE 'test result: (ok|FAILED)\. …'` and **awk fields `$4`/`$6`** — the
+`ok`-only form would discard `FAILED` lines and make `failed=0` true *by construction*, and
+`$5`/`$7` would return a vacuous `passed=0`.
+
+**`route_redirect_action_fixture ... ok` IN THE FULL PARALLEL SWEEP** (log line 995), not merely in
+isolation — which also clears the known "passes in isolation, fails under parallel load"
+differential flake family for this fixture.
+
+The **6** failures, censused from the `---- <name> stdout ----` markers (never by indentation,
+which invents phantom test names):
+
+| failing binary | family |
+|---|---|
+| `access_log_h2_rcd_upstream_reset` | the 4-member `TcpCloseBackend` IPv6-unreachable **deterministic core** |
+| `access_log_h2_uc_upstream_reset` | ″ |
+| `access_log_rcd_upstream_reset` | ″ |
+| `access_log_rf_upstream_reset` | ″ |
+| `admin_config_dump_server_info` | the `192.168.65.2` bridge-IP core member |
+| `access_log_upstream_host` | backend-routing family — RED locally on this host, CI-authoritative |
+
+That is **exactly** the documented 5-member stable core plus one backend-routing fixture. **None is
+on `76.2`'s surface, and no redirect-related test failed.**
+
+> **THIS RUN WAS CUT SHORT — the numbers above are PARTIAL, not a gate adjudication.** The sweep
+> **stalled on `xds_rds_hot_reload`** with no output for ~11 minutes (this host has virtiofs and no
+> inotify, so bind-mount watch/reload tests are native-CI-authoritative) and was killed by PID, so
+> a handful of trailing `xds_*` binaries never reported. **§7.5 gate (b) is state 4's to
+> adjudicate, on its own 2-3× sweep with a diffed failing SET** — this Task 11 evidence is
+> supplementary.
+
+**A trap worth carrying forward, hit concretely here.** The background waiter
+`until ! pgrep -f 'cargo test -p differential'` reported `STILL UP` indefinitely *after* cargo had
+exited, because **its own command line contains the pattern it greps for** — the documented
+`pkill -f` self-match hazard, in its `pgrep` form. Adjudicate "is it still running?" with
+`pgrep -x cargo`, never with `pgrep -f <a pattern your own shell contains>`.
+
+---
+
+## Session close — state 3 COMPLETE, handing off to state 4
+
+**All twelve tasks landed, one commit each**, in `PLAN.md` order:
+
+| task | commit | what |
+|---|---|---|
+| 1 | `6c0fcd2` | `canonical_reason` 303/307/308 + `headers::LOCATION` |
+| 2 | `c7d3735` | widen `hcm.rs`'s non-test `envoy_config` import |
+| 3 | `721e6da` | the pure `plan_redirect` + `RedirectPlan`; all 22 measured cells |
+| 4 | `9e8a225` | `synth_redirect` — five headers, no `content-type` |
+| 5 | `78aba4c` | the real dispatch arm + `&mut Request`; T-C9 flipped; N-3 closed |
+| 6 | `015d9e1` | the `prefix_rewrite` `:path` mutation pins |
+| 7 | `a42581d` | the HTTP/2 shared-seam test |
+| 8 | `0d08c48` | **CF-76-2 CLOSED** |
+| 9 | `5930158` | **M-1 + M-2 CLOSED** |
+| 10 | `b9afd81` | fixture `0086` (18 probes) |
+| 11 | `81aee77` | the fixture entrypoint |
+| 12 | `f351c3e` | `BEHAVIOR_CONTRACT.md` Phase 76 |
+
+**Size.** Net non-`docs/` change **+1334 / −69 = 1265** LoC against `PLAN.md`'s ≈1202 code-only
+projection — **+5%**, versus `76.1`'s **+50%** overshoot. The table-driven 22-cell design was
+preserved (not expanded into 22 `#[test]` fns, which `PLAN.md` §4 warned would eat the entire
+headroom), **§6.1's mid-execution split trigger never fired, and no split was needed.**
+
+**What was NOT done, deliberately.** No verification (state 4 is a separate session; ADR-0127 — a
+verifier must not grade what it ran). No ROADMAP status cell flipped (a state-3 commit flips none).
+No ADR (head **ADR-0170**, next free **ADR-0171**, re-derived on disk). No edit to `SPEC.md`,
+`PLAN.md`, any `76.1` artifact, `known-failures.txt`, `ci.yml`, or `HEADER_ALLOW_LIST`. No banked
+carry-forward fixed beyond the three `PLAN.md` names. **No `stop` file** — the stop condition was
+re-measured and all three legs came back FALSE.
+
+**The single most important thing for the state-4 session to read first:** the **Deviations
+D-1..D-6** table at the top of this file. Three of the six are defects in `PLAN.md`'s own
+*pre-flighted* literal Rust, so a reviewer diffing the plan's text against the landed code will
+find intentional differences, each with its measurement.
