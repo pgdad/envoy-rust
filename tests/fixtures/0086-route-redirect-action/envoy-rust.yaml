@@ -60,6 +60,8 @@ static_resources:
                             response_code: PERMANENT_REDIRECT
                         - match: { prefix: "/q1-hostport" }
                           redirect: { https_redirect: true }
+                        - match: { prefix: "/q2-hostport" }
+                          redirect: { host_redirect: "example.com" }
                         - match: { prefix: "/q3-hostport" }
                           redirect: {}
                 http_filters:

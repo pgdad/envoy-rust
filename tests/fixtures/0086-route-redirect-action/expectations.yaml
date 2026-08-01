@@ -120,6 +120,13 @@ driver:
       expected_status: 301
       expected_body: { kind: byte_exact, body: "" }
       expected_headers: set_equal_modulo_allow_list
+    - name: q02-host-redirect-set-drops-request-port
+      method: get
+      path: "/q2-hostport/x"
+      host: "envoy-rust.test:1234"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
     - name: q03-bare-redirect-preserves-request-port
       method: get
       path: "/q3-hostport/d"

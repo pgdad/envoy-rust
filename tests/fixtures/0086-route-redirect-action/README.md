@@ -2,7 +2,7 @@
 
 Sub-phase **76.2**. The **first differential witness of `Route.redirect`** in the corpus.
 
-18 HTTP/1.1 probes against a **backend-free** HCM listener whose every route is a `redirect:`
+19 HTTP/1.1 probes against a **backend-free** HCM listener whose every route is a `redirect:`
 action, requiring identical `(status, body, header-set-modulo-allow-list)` between upstream Envoy
 `v1.33.0` and envoy-rust.
 
@@ -13,7 +13,7 @@ The whole `location` construction rule set, MEASURED against `envoyproxy/envoy:v
 | rule | probes |
 |---|---|
 | **(a) scheme** — `scheme_redirect` wins and is NOT validated against any allow-list (literal `ftp` emitted verbatim); else `https_redirect: true` forces `https`; else the scheme the request arrived on | `r06`, `r11`, `r12` |
-| **(b) authority — THE ASYMMETRY** — `host_redirect` **set** ⇒ the request's original port is **DROPPED**; **unset** ⇒ authority preserved **including** its port; `port_redirect` overrides both, rendered verbatim with **no range clamp**; a scheme-only change does **not** normalise a now-redundant `:443` | `r01`, `r09`, `r14`, **`q01`**, **`q03`** |
+| **(b) authority — THE ASYMMETRY** — `host_redirect` **set** ⇒ the request's original port is **DROPPED**; **unset** ⇒ authority preserved **including** its port; `port_redirect` overrides both, rendered verbatim with **no range clamp**; a scheme-only change does **not** normalise a now-redundant `:443` | `r01`, `r09`, `r14`, **`q01`**, **`q02`**, **`q03`** |
 | **(c) path** — none ⇒ used as-is; `path_redirect` replaces it wholesale; `prefix_rewrite` replaces only the span matched by the route's `prefix:` and appends the remainder | `r03`, `r05`, `r10` |
 | **(d) query** — **preserved by default**, even when `path_redirect` replaced the path wholesale; `strip_query: true` drops it | `r02`, `r04`, `r08`, `r13` |
 | **(e) status** — default 301, plus all five `response_code` values on the wire | `r07` (307), `r13` (303), `r15` (302), `r16` (308), rest 301 |
@@ -26,8 +26,28 @@ Expected `location` per probe: `r01` `http://example.com/a-host` · `r02`
 `http://envoy-rust.test/j-bare/deep` · `r11` `ftp://envoy-rust.test/k-scheme/x` · `r12`
 `https://e.com/l-both/y` · `r13` `http://e.com/m-see/y` · `r14`
 `https://envoy-rust.test:443/n-hport/y` · `r15` `http://example.com/o-found` · `r16`
-`http://example.com/p-perm` · `q01` `https://envoy-rust.test:1234/q1-hostport/x` · `q03`
-`http://envoy-rust.test:1234/q3-hostport/d`.
+`http://example.com/p-perm` · `q01` `https://envoy-rust.test:1234/q1-hostport/x` · `q02`
+`http://example.com/q2-hostport/x` · `q03` `http://envoy-rust.test:1234/q3-hostport/d`.
+
+### `q02` is the ONLY probe that can witness the port-DROP — do not remove it
+
+The headline rule of this phase is that `host_redirect` **set** DROPS the request's original port.
+**`q02` is the only probe in this fixture that can witness it differentially.** Nine routes set
+`host_redirect` (`/a-host`, `/b-query`, `/g-c307`, `/h-strip`, `/i-port`, `/l-both`, `/m-see`,
+`/o-found`, `/p-perm`) but every one of them is probed with the *unported* `Host: envoy-rust.test`
+— they have **no port to drop**, so a mutation making that branch *append* the request's port
+instead of dropping it leaves all of them green.
+
+`q02` pairs `host_redirect: "example.com"` with `Host: envoy-rust.test:1234`. It is **not** a
+duplicate of `r01`: the two agree on the expected `location` but differ on the *input* `Host:`, and
+that differing input is the entire discriminator. Its own route `/q2-hostport` exists for the same
+no-shadowing reason as `q01`/`q03`.
+
+> This gap shipped once (`76.2` REVIEW.md M-2): the fixture had all nine `host_redirect` routes and
+> both ported probes, but **zero probes combining the two**, while this README and the test
+> entrypoint both claimed `q01` vs `r01` witnessed it. It was found by re-deriving first-match-wins
+> selection over the route table, not by reading the claim. **A probe pair named as a witness in a
+> doc comment must be re-derived, not read.**
 
 ## Why it needs zero new harness machinery
 
@@ -51,12 +71,12 @@ Expected `location` per probe: `r01` `http://example.com/a-host` · `r02`
 ## Authoring constraints — binding, and each one can silently vacate a probe
 
 - **Every probe carries a DISTINCT `path:` AND selects a DIFFERENT route.** Verified mechanically:
-  18 routes, 18 probes, 18 distinct paths, 18 distinct routes selected, no route left unprobed.
+  19 routes, 19 probes, 19 distinct paths, 19 distinct routes selected, no route left unprobed.
 - **No prefix may be a prefix of another** — prefix overlap **silently shadows** a probe (a
   parent-recon cell was lost exactly this way when `/scheme` preceded `/schemehost`). Verified
-  mechanically: zero shadowing pairs. This is why `q01`/`q03` get their **own** routes
-  (`/q1-hostport`, `/q3-hostport`) rather than re-probing `/f-https` and `/j-bare` with a different
-  `Host:`.
+  mechanically: zero shadowing pairs. This is why `q01`/`q02`/`q03` get their **own** routes
+  (`/q1-hostport`, `/q2-hostport`, `/q3-hostport`) rather than re-probing `/f-https`, `/a-host` and
+  `/j-bare` with a different `Host:`.
 - **Every route is `prefix:`-matched, never `path:`.** This keeps the fixture clean of the open
   carry-forward **CF-76-1** — upstream strips the query before route matching while envoy-rust
   matches the raw target, so an exact-`path:` route plus a query would diverge for reasons having

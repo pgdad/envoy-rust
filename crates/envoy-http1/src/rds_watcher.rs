@@ -203,16 +203,35 @@ fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
                 | envoy_config::ConfigError::RdsParseError { .. } => {
                     target.counters.update_failure.add(1);
                 }
-                // {route_config_name absent, route→unknown-cluster} → update_rejected.
+                // {route_config_name absent, route→unknown-cluster,
+                //  mutually-exclusive redirect oneof} → update_rejected.
+                //
+                // 76.2 §5.2 re-entry (REVIEW.md I-1): the two Redirect*Conflict
+                // variants were added to `reparse_and_select_route_config`'s
+                // returnable set by Task 8 (which closed CF-76-2 by having the
+                // warm path re-validate the redirect oneofs) but NOT to this
+                // classifier, so a hot reload of exactly the config CF-76-2 was
+                // filed about fell to `other =>` and PANICKED — `panic =
+                // "abort"` in release, i.e. the whole proxy process died on a
+                // routine config edit. They belong here: they are VALIDATION
+                // REJECTIONS, the same class as `UnknownCluster` — the config
+                // was read and parsed fine, it is the CONTENT that is refused.
                 envoy_config::ConfigError::RdsRouteConfigNotFound { .. }
-                | envoy_config::ConfigError::UnknownCluster(_) => {
+                | envoy_config::ConfigError::UnknownCluster(_)
+                | envoy_config::ConfigError::RedirectPathRewriteConflict { .. }
+                | envoy_config::ConfigError::RedirectSchemeRewriteConflict { .. } => {
                     target.counters.update_rejected.add(1);
                 }
-                // `reparse_and_select_route_config` can return ONLY the four
+                // `reparse_and_select_route_config` can return ONLY the six
                 // variants matched above. Any other `ConfigError` here means the
                 // producer grew a new returnable variant without updating this
                 // classifier — fail loud rather than silently misbucket it. If a
                 // new variant is added, this match must be extended explicitly.
+                // NOTE (I-1): "fail loud" here means ABORT in release. Widening
+                // the producer's returnable set is a CROSS-CRATE change — when
+                // you add an `Err` arm to `reparse_and_select_route_config`,
+                // grep its callers, because the compiler will NOT tell you:
+                // `unreachable!()` compiles clean.
                 other => {
                     unreachable!(
                         "reparse_and_select_route_config returned an unexpected \
@@ -477,6 +496,179 @@ static_resources:
         assert_eq!(counters.update_failure.value(), 0);
         assert_eq!(counters.update_success.value(), 1);
         assert_eq!(counters.config_reload.value(), 1);
+    }
+
+    // 76.2 §5.2 re-entry: an RDS file naming `local_route` whose single route
+    // is a `redirect:` carrying the given oneof body. Used by the two
+    // conflicting-oneof reload tests below; `body` is spliced verbatim so each
+    // test names the exact pair it exercises.
+    fn rds_redirect_file_body(redirect_body: &str) -> String {
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    routes:
+    - match: {{ prefix: "/" }}
+      redirect: {{ {redirect_body} }}
+"#
+        )
+    }
+
+    /// 76.2 §5.2 re-entry — `REVIEW.md` ISSUE I-1, the `path_redirect` +
+    /// `prefix_rewrite` half.
+    ///
+    /// Task 8 closed carry-forward CF-76-2 by making
+    /// `reparse_and_select_route_config` re-validate the `redirect:` oneofs on
+    /// the warm path, which WIDENED the set of `ConfigError` variants it can
+    /// return to include `RedirectPathRewriteConflict` and
+    /// `RedirectSchemeRewriteConflict`. Its sole production caller — the
+    /// classifier in [`reload`] — still matched only four variants and ended
+    /// `other => unreachable!(…)`, so the reload PANICKED on exactly the config
+    /// CF-76-2 was filed about. `Cargo.toml` sets `panic = "abort"` under
+    /// `[profile.release]`, so that panic kills the whole proxy process on a
+    /// routine config edit — converting CF-76-2's failure mode from "installs a
+    /// bad config" into "aborts the proxy", which is worse than the gap it
+    /// closed.
+    ///
+    /// The intended outcome is an ordinary WARM REJECT, in the same class as
+    /// `UnknownCluster`: last-good table retained, `update_rejected` ticked,
+    /// process alive. `unreachable!()` compiles cleanly, so gate (e) is
+    /// structurally blind to this whole class — only a `reload()`-LEVEL test
+    /// can catch it, which is precisely why the gap shipped: the four existing
+    /// `reload()` tests cover happy / malformed / name-not-found /
+    /// unknown-cluster only, and the two Task-8 tests
+    /// (`crates/envoy-config/src/rds.rs`) call the producer directly and never
+    /// reach `reload()`.
+    #[tokio::test]
+    async fn reload_conflicting_redirect_path_oneof_keeps_last_good_and_ticks_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(
+            &path,
+            &rds_redirect_file_body(r#"path_redirect: "/p", prefix_rewrite: "/q""#),
+        );
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        // Before the I-1 fix this line did not merely return Err — it PANICKED
+        // inside the classifier.
+        let err = reload(&target).expect_err("conflicting redirect oneof reload returns Err");
+        assert!(
+            matches!(
+                err,
+                envoy_config::ConfigError::RedirectPathRewriteConflict { .. }
+            ),
+            "expected RedirectPathRewriteConflict, got {err:?}"
+        );
+
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(
+            counters.update_rejected.value(),
+            1,
+            "classified as rejected"
+        );
+        assert_eq!(counters.update_failure.value(), 0, "not a failure");
+        assert_eq!(counters.update_success.value(), 1, "no success tick");
+        assert_eq!(counters.config_reload.value(), 1, "no reload tick");
+    }
+
+    /// 76.2 §5.2 re-entry — `REVIEW.md` ISSUE I-1, the `https_redirect` +
+    /// `scheme_redirect` half.
+    ///
+    /// The I-1 fix adds TWO variants to the `update_rejected` arm. Pinning only
+    /// one of them would leave the other arm unexercised — which is the exact
+    /// shape of the gap this re-entry exists to close. See the sibling test
+    /// above for the full chain.
+    #[tokio::test]
+    async fn reload_conflicting_redirect_scheme_oneof_keeps_last_good_and_ticks_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(
+            &path,
+            &rds_redirect_file_body(r#"https_redirect: true, scheme_redirect: "ftp""#),
+        );
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        let err = reload(&target).expect_err("conflicting redirect oneof reload returns Err");
+        assert!(
+            matches!(
+                err,
+                envoy_config::ConfigError::RedirectSchemeRewriteConflict { .. }
+            ),
+            "expected RedirectSchemeRewriteConflict, got {err:?}"
+        );
+
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(
+            counters.update_rejected.value(),
+            1,
+            "classified as rejected"
+        );
+        assert_eq!(counters.update_failure.value(), 0, "not a failure");
+        assert_eq!(counters.update_success.value(), 1, "no success tick");
+        assert_eq!(counters.config_reload.value(), 1, "no reload tick");
+    }
+
+    /// 76.2 §5.2 re-entry (I-1) — the ACCEPT-direction control. Without it the
+    /// two reject tests above would pass just as well if `reload` rejected
+    /// EVERY redirect route, and the warm path's redirect support would be
+    /// silently dead. A valid `redirect:` route must still swap the table and
+    /// tick success, exactly like the happy `route:` case.
+    #[tokio::test]
+    async fn reload_accepts_a_valid_redirect_route_and_swaps_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(
+            &path,
+            &rds_redirect_file_body(r#"host_redirect: "example.com""#),
+        );
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+
+        assert!(store.current_route_config().virtual_hosts.is_empty());
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        reload(&target).expect("a valid redirect route reloads warm");
+
+        let live = store.current_route_config();
+        assert_eq!(live.virtual_hosts.len(), 1, "table was swapped");
+        assert!(matches!(
+            live.virtual_hosts[0].routes[0].action,
+            envoy_config::RouteAction::Redirect(_)
+        ));
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_success.value(), 2);
+        assert_eq!(counters.config_reload.value(), 2);
+        assert_eq!(counters.update_failure.value(), 0);
+        assert_eq!(counters.update_rejected.value(), 0);
     }
 
     // A minimal `Arc<HCMConfig>` for the WatchTarget's `store` field. The

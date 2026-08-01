@@ -2258,9 +2258,12 @@ pub enum RouteAction {
     Route(RouteAction_Route),
 
     /// Redirect action — synthesize a 3xx reply carrying a `location:` header.
-    /// 76.1 NEW: the config surface only. The runtime dispatch arm is an honest
-    /// `synth_501` not-implemented placeholder until 76.2 lands the real
-    /// behaviour (ADR-0169 DECISION 4).
+    /// 76.1 landed the config surface; **76.2 landed the runtime**, replacing
+    /// the interim `synth_501` placeholder (ADR-0169 DECISION 4) with the real
+    /// behaviour: a pure `location` builder plus a dedicated `synth_redirect`
+    /// response builder at the `match &route.action` dispatch seam in
+    /// `crates/envoy-http1/src/hcm.rs`, shared by both the H1 and H2 codecs.
+    /// The measured rules are banked in `BEHAVIOR_CONTRACT.md` Phase 76.
     Redirect(RedirectAction),
 }
 

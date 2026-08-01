@@ -2993,7 +2993,7 @@ make a cross-proxy `location` comparison possible at all:
 | # | `Host:` sent | route config | target | measured `location` |
 |---|---|---|---|---|
 | Q1 | `envoy-rust.test:1234` | `https_redirect: true` | `/q1-hostport/x` | `https://envoy-rust.test:1234/q1-hostport/x` |
-| Q2 | `envoy-rust.test:1234` | `host_redirect: "example.com"` | `/a-host` | `http://example.com/a-host` |
+| Q2 | `envoy-rust.test:1234` | `host_redirect: "example.com"` | `/q2-hostport/x` | `http://example.com/q2-hostport/x` |
 | Q3 | `envoy-rust.test:1234` | `{}` (bare) | `/q3-hostport/d` | `http://envoy-rust.test:1234/q3-hostport/d` |
 | Q4 | `envoy-rust.test:1234` | `https_redirect: true` + `port_redirect: 443` | `/n-hport/y` | `https://envoy-rust.test:443/n-hport/y` |
 
@@ -3015,8 +3015,17 @@ allow-list** — the literal `ftp` was accepted and emitted verbatim (R11).
 from-scratch implementation is most likely to get wrong:
 
 - `host_redirect` **set** → the authority becomes that host and **the request's original port is
-  DROPPED** (R1, and decisively Q2: `Host: envoy-rust.test:1234` → `http://example.com/a-host`,
+  DROPPED** (R1, and decisively Q2: `Host: envoy-rust.test:1234` → `http://example.com/q2-hostport/x`,
   no port).
+
+  > **Only Q2 can witness this rule differentially, and it is the only cell that can.** R1 and the
+  > eight other `host_redirect` rows all send an *unported* `Host:`, so they have no port to drop —
+  > a mutation making the `host_redirect` branch *append* the request's port instead of dropping it
+  > leaves every one of them green. Q2 is therefore load-bearing, not a duplicate of R1: the two
+  > agree on the *output* but differ on the *input*, and the differing input is the whole point.
+  > It ships as fixture `0086` probe **`q02`** on its own `/q2-hostport` route (re-anchored off the
+  > recon's `/a-host` target for the same no-shadowing reason as Q1/Q3). Do not remove it, and do
+  > not "simplify" it back onto a shared route.
 - `host_redirect` **unset** → the request's original authority is preserved **including its port**
   (Q1/Q3 keep `:1234`).
 - `port_redirect` overrides the port in **both** cases and renders as `:<n>`.
@@ -3120,8 +3129,24 @@ The same reasoning makes `content-length` value-exact for free, which is what pi
    construction:** `0086`'s `r05` probe is deliberately query-free.
 
 > Items 7 and 8 are the two cells this phase *created* rather than measured. A later session must
-> not mistake them for settled behaviour: they are envoy-rust's current choice, pinned by
-> in-process tests, and never compared against upstream.
+> not mistake them for settled behaviour: they are envoy-rust's current choice, and they have
+> **never been compared against upstream**.
+>
+> They are pinned by exactly one in-process test —
+> `plan_redirect_pins_the_two_invented_cells_contract_f_items_7_and_8`
+> (`crates/envoy-http1/src/hcm.rs`). **Named deliberately, so this claim is checkable rather than
+> merely asserted.** It is the only thing standing behind either cell; if it is deleted or
+> weakened, both become unpinned *and* unwitnessed, and nothing in the §7.5 gate will say so.
+>
+> **How this note got it wrong once already (76.2 REVIEW.md M-1), because the failure mode
+> generalises.** The original wording claimed both items were "pinned by in-process tests" when
+> **neither was**. The 22-row measured `location` table *looked* like it covered item 7 — its
+> `Cell` struct even types `prefix` as `Option<&'static str>` — but its only constructor hard-wires
+> `prefix: Some(prefix)` and all 22 rows go through it, so `None` was unreachable from the table.
+> **An `Option` field on a test-table struct proves nothing if the constructor can only produce
+> `Some`: check the constructor, not the type.** Item 8 was missed a simpler way — no test combined
+> `prefix_rewrite` with a query-bearing target. A contract that disclaims a cell and then claims a
+> safety net that does not exist is worse than silence, because it stops the next reader looking.
 
 ---
 

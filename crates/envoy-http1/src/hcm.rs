@@ -10826,5 +10826,73 @@ static_resources:
             Some("http://example.com/a"),
         );
         assert_eq!(resp.status, 301);
+        // 76.2 §5.2 re-entry (REVIEW.md M-3): the reason phrase must be left
+        // UNSET, so the wire path falls through to `canonical_reason`
+        // (`response.rs`, consulted at the single `reason.unwrap_or_else(…)`
+        // site). 76.2 added 303/307/308 to that lookup because they previously
+        // fell to `_ => "OK"` and would have emitted `HTTP/1.1 303 OK`.
+        //
+        // That lookup was pinned only as a PURE FUNCTION — nothing asserted a
+        // redirect `Response` actually reaches it, so setting `reason:
+        // Some("OK")` here would restore the wrong reason phrase on the wire
+        // and survive the entire workspace. The differential fixture cannot
+        // catch it either: the harness parses the status CODE only, which SPEC
+        // §2.1 flagged as a silent-wrong-answer hazard. This assertion is the
+        // link that closes it.
+        assert_eq!(
+            resp.reason, None,
+            "reason must be unset so canonical_reason supplies the measured phrase"
+        );
+    }
+
+    /// 76.2 §5.2 re-entry — `REVIEW.md` M-1: the two cells this phase
+    /// **invented** rather than measured, which `BEHAVIOR_CONTRACT.md` §F items
+    /// 7 and 8 record as CHOICES and claim are "pinned by in-process tests".
+    /// Before this test that claim was MEASURED FALSE for both, and a refactor
+    /// could have silently flipped either cell with a fully green gate.
+    ///
+    /// They are pinned HERE rather than as rows in
+    /// `plan_redirect_matches_every_measured_location_cell`, deliberately: that
+    /// table is the 22 cells MEASURED against `envoyproxy/envoy:v1.33.0`, and
+    /// folding an invented cell into it would make the table claim upstream
+    /// authority it does not have. Keeping them separate also leaves the
+    /// table's `cells.len() == 22` guard intact.
+    ///
+    /// **Neither cell is witnessed by fixture `0086`**, by construction — every
+    /// route there is `prefix:`-matched, and the rewritten `:path` is an
+    /// access-log observable while `0086` compares responses only. These
+    /// assertions are the ONLY thing standing behind either behaviour.
+    #[test]
+    fn plan_redirect_pins_the_two_invented_cells_contract_f_items_7_and_8() {
+        let rd = RedirectAction {
+            prefix_rewrite: Some("/replaced".into()),
+            ..Default::default()
+        };
+
+        // §F item 7 — a `path:`-matched route supplies NO prefix, and
+        // envoy-rust's choice is "the matched span is the whole path", i.e. the
+        // rewrite replaces the path wholesale and leaves no tail. The 22-row
+        // measured table cannot express this: its `cell()` constructor
+        // hard-wires `prefix: Some(prefix)`.
+        assert_eq!(
+            plan_redirect("h.test", "/exact/path", None, &rd).location,
+            "http://h.test/replaced",
+            "matched_prefix == None means the WHOLE path is the matched span"
+        );
+
+        // §F item 8 — the request's query rides along on the REWRITTEN `:path`
+        // (an access-log observable), independently of the `location`'s own
+        // query suffix. Both are asserted here: nothing else in the tree
+        // combines `prefix_rewrite` with a query-bearing target.
+        let plan = plan_redirect("h.test", "/e-pfx/sub?k=v", Some("/e-pfx"), &rd);
+        assert_eq!(
+            plan.rewritten_path,
+            Some("/replaced/sub?k=v".to_string()),
+            "the query rides along on the rewritten :path"
+        );
+        assert_eq!(
+            plan.location, "http://h.test/replaced/sub?k=v",
+            "and the location keeps it too (strip_query defaults false)"
+        );
     }
 }
