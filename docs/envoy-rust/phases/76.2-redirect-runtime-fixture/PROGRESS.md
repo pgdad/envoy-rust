@@ -1787,3 +1787,268 @@ count drop and each was adjudicated rather than waved through:
   relocating before rewriting.
 
 No other backticked token was dropped from either line.
+
+---
+
+# §5.2 re-entry — state 3
+
+> **What this section is.** `REVIEW.md` (§5 state 5) returned **CHANGES-REQUESTED** — 0 Critical,
+> **1 Issue**, 9 Minor, 9 Nit. `BOOTSTRAP_PROMPT.md` §5.2 routes that verdict back to **state 3**,
+> not to state 4: a review with issues resumes IMPLEMENTATION under TDD rather than merely re-running
+> the gate. This section is that re-entry's log.
+>
+> **The two halves above are LANDED and were NOT edited** (D-3.5) — the state-3 implementation log
+> and the state-4 §7.5 gate adjudication (§S4.0-§S4.11) are byte-unchanged. Several review findings
+> name defects *in* those halves; they are recorded there, not repaired.
+>
+> **Scope executed:** the required Issue **I-1**, plus the four `REVIEW.md` §9 recommended items
+> **M-1..M-4**. **M-5..M-9 and N-1..N-9 remain BANKED, not fixed** (§6.3).
+>
+> **This session did NOT re-run the §7.5 gate.** The fix invalidates gates (b) and (e), and a fresh
+> **state-4 re-verification owns re-closing them** — every workspace-wide figure below is labelled a
+> PREDICTION where it is one. It also did NOT re-review its own fix (ADR-0127; ADR-0165).
+
+## R3.0 — the I-1 chain, RE-MEASURED on disk before touching anything
+
+Every link was re-derived here rather than inherited from `REVIEW.md` (a review's line numbers drift
+too — the state-5 session itself measured one dimension running ~12 lines high):
+
+| # | link | measured |
+|---|---|---|
+| 1 | `validate_redirect_oneofs` returns the two variants | `bootstrap.rs:2680` (`RedirectPathRewriteConflict`), `:2686` (`RedirectSchemeRewriteConflict`) — CONFIRMED |
+| 2 | Task 8 calls it on the warm path | `crates/envoy-config/src/rds.rs:159`, inside the exhaustive `match &route.action` — CONFIRMED |
+| 3 | sole PRODUCTION caller | `crates/envoy-http1/src/rds_watcher.rs:184`. Re-derived by `git ls-files '*.rs' \| xargs grep -n`: 16 hits total — 1 re-export (`lib.rs:45`), 1 definition, 8 in-crate `rds.rs` tests, 4 doc-comment mentions, **1 production call** |
+| 4 | classifier arms | four variants at `:202-206` / `:208-210`, then `other => unreachable!(…)` at `:216-222` — CONFIRMED |
+| 5 | the two variants named in that file | `grep -c` → **0** — CONFIRMED |
+| 6 | the comment stating the broken invariant | `:211-215`, verbatim: *"can return ONLY the four variants matched above… If a new variant is added, this match must be extended explicitly."* — CONFIRMED |
+| 7 | release panic strategy | `Cargo.toml:42` → `panic = "abort"` under `[profile.release]` — CONFIRMED |
+
+**The consequence, stated precisely.** An operator edits a file-based RDS route to add
+`redirect: { path_redirect: "/p", prefix_rewrite: "/q" }`. The producer correctly returns
+`RedirectPathRewriteConflict`; the classifier falls to `other =>` and panics. In release that
+**aborts the whole proxy process on a routine config edit**. CF-76-2's failure mode was converted
+from *"installs a bad config"* into *"aborts the proxy"* — worse than the gap it closed.
+
+## R3.1 — I-1, under TDD: the RED is a REAL PANIC, not an assertion failure
+
+Three tests added to `crates/envoy-http1/src/rds_watcher.rs` — one per widened variant, plus an
+accept-direction control so the two reject tests cannot pass by rejecting every redirect.
+
+**Step 1 — RED, before any production change** (`cargo test -p envoy-http1 --lib -- rds_watcher::tests::reload_ --nocapture`, exit **101**, **5** `Compiling` lines so no stale binary):
+
+```
+thread 'rds_watcher::tests::reload_conflicting_redirect_scheme_oneof_keeps_last_good_and_ticks_rejected' panicked at crates/envoy-http1/src/rds_watcher.rs:217:21:
+internal error: entered unreachable code: reparse_and_select_route_config returned an unexpected ConfigError variant not handled by the reload classifier: RedirectSchemeRewriteConflict { listener: "rds:/tmp/.tmp0QdXLN/rds.yaml", route: "" }
+thread 'rds_watcher::tests::reload_conflicting_redirect_path_oneof_keeps_last_good_and_ticks_rejected' panicked at crates/envoy-http1/src/rds_watcher.rs:217:21:
+internal error: entered unreachable code: reparse_and_select_route_config returned an unexpected ConfigError variant not handled by the reload classifier: RedirectPathRewriteConflict { listener: "rds:/tmp/.tmpyHnd3Z/rds.yaml", route: "" }
+test rds_watcher::tests::reload_accepts_a_valid_redirect_route_and_swaps_table ... ok
+test rds_watcher::tests::reload_conflicting_redirect_scheme_oneof_keeps_last_good_and_ticks_rejected ... FAILED
+test rds_watcher::tests::reload_conflicting_redirect_path_oneof_keeps_last_good_and_ticks_rejected ... FAILED
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 190 filtered out; finished in 0.00s
+```
+
+**This is the one finding in the whole review whose test genuinely REDs before the fix** — and it
+REDs by *panicking at the exact `unreachable!()` line*, which is the defect itself rather than a
+proxy for it. The accept-direction control passed already, correctly: it takes the `Ok` path and
+never reaches the classifier.
+
+**Step 2 — the fix.** Both variants added to the **`update_rejected`** arm at `rds_watcher.rs:208`.
+They are validation rejections — the config was read and parsed fine, it is the CONTENT that is
+refused — which is exactly the class `UnknownCluster` already occupies. The `other =>` arm is
+**kept**: it is still the right forcing function for a *future* seventh variant, and the comment
+above it was corrected from "four" to "six" and extended with the cross-crate warning this bug is
+the case study for.
+
+**Step 3 — GREEN** (`cargo test -p envoy-http1 --lib -- rds_watcher::tests::`, exit **0**):
+
+```
+test rds_watcher::tests::reload_accepts_a_valid_redirect_route_and_swaps_table ... ok
+test rds_watcher::tests::reload_conflicting_redirect_scheme_oneof_keeps_last_good_and_ticks_rejected ... ok
+test rds_watcher::tests::reload_conflicting_redirect_path_oneof_keeps_last_good_and_ticks_rejected ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.00s
+```
+
+The `reload()` test count goes **4 → 7**. Each reject test asserts all five counters *and*
+`Arc::ptr_eq` on the last-good table, so it pins the warm-reject semantics, not merely "no panic".
+
+## R3.2 — M-1: the contract claimed a safety net that did not exist
+
+`BEHAVIOR_CONTRACT.md` §F items 7 and 8 are this phase's two **invented** cells. §F labels them
+honestly as choices, then its closing note claimed they were *"pinned by in-process tests"* —
+**measured FALSE for both**.
+
+Pinned by one new test, `plan_redirect_pins_the_two_invented_cells_contract_f_items_7_and_8`.
+**Deliberately NOT added as rows in the 22-cell table** — that table is the cells MEASURED against
+`envoyproxy/envoy:v1.33.0`, and folding an invented cell into it would make it claim upstream
+authority it does not have. It also keeps the `assert_eq!(cells.len(), 22)` guard intact, which
+`REVIEW.md` §9 forbids collapsing. The contract note now **names the test**, so the claim is
+checkable rather than merely asserted.
+
+This is a characterization pin — it passes immediately — so **the RED evidence is a mutation check**
+(scratch worktree, detached at the clean commit `32a4c52`; unmutated control run first from the same
+worktree: **12 passed**, **81** `Compiling` lines).
+
+**MUT-A — item 7**, `matched_prefix.map_or(path.len(), str::len)` → `map_or(0, str::len)` (the exact
+mutation `REVIEW.md` measured as surviving the entire suite):
+
+```
+assertion `left == right` failed: matched_prefix == None means the WHOLE path is the matched span
+  left: "http://h.test/replaced/exact/path"
+ right: "http://h.test/replaced"
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out
+```
+
+**MUT-B — item 8**, deleting the query from the rewritten `:path`:
+
+```
+assertion `left == right` failed: the query rides along on the rewritten :path
+  left: Some("/replaced/sub")
+ right: Some("/replaced/sub?k=v")
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out
+```
+
+In both, **only the new test fails and the other three `plan_redirect` tests pass** — which
+reproduces the review's claim that these mutations previously survived the whole suite, and shows
+precisely what the new test adds.
+
+## R3.3 — M-3: one line, and a FALSE RED caught on the way
+
+`assert_eq!(resp.reason, None)` added to the `synth_redirect` test. `reason` must stay unset so the
+wire path falls through to `canonical_reason` — the lookup 76.2 extended with 303/307/308. The
+differential fixture cannot catch a regression here (the harness parses the status **code** only),
+which SPEC §2.1 itself flagged as a silent-wrong-answer hazard.
+
+**MUT-C, first attempt — NOT evidence.** Mutating to `reason: Some("OK".to_string())` gave exit
+**101** with *no test result line*: `error[E0308]: mismatched types … expected &str, found String`.
+`reason` is `Option<&str>`. **A compile error is a RED that never reached an assertion** — it would
+have "confirmed" the pin for entirely the wrong reason. Re-run with the correct type:
+
+```
+assertion `left == right` failed: reason must be unset so canonical_reason supplies the measured phrase
+  left: Some("OK")
+ right: None
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out
+```
+
+Mutation re-grepped as still present *before* reverting, per mutation hygiene.
+
+## R3.4 — M-2: the fixture's headline rule had NO witness. Added the 19th probe.
+
+**Re-derived independently here, not read off the review.** Parsing `envoy.yaml`'s route table and
+`expectations.yaml`'s probe list:
+
+- **9** routes set `host_redirect` — `/a-host`, `/b-query`, `/g-c307`, `/h-strip`, `/i-port`,
+  `/l-both`, `/m-see`, `/o-found`, `/p-perm`.
+- **All nine** were probed with the *unported* `host: "envoy-rust.test"` — **no port to drop**.
+- The only two ported probes were `q01` (`https_redirect: true`) and `q03` (`{}`) — **neither sets
+  `host_redirect`**.
+- **Probes combining `host_redirect` with a ported `Host:` — 0.**
+
+So the phase's headline rule, the one SPEC §2.4(b) calls *"the one rule a from-scratch
+implementation is most likely to get wrong"*, had **zero** differential witnesses — while the test
+entrypoint and the fixture README both claimed `q01` vs `r01` witnessed it.
+
+**Fixed by adding the witness, not by softening the claim.** New route `/q2-hostport` with
+`redirect: { host_redirect: "example.com" }`, new probe `q02` sending `host: "envoy-rust.test:1234"`.
+
+Fixture invariants RE-VERIFIED mechanically after the edit:
+
+| constraint | measured |
+|---|---|
+| prefixes / distinct | **19 / 19** |
+| probes | **19** |
+| shadowing pairs (any prefix a prefix of another) | **0** |
+| route table byte-identical across the paired configs | **yes** — md5 `e65dd3bbe3c36e7456d123807846dd60` both sides |
+| logical edits between `envoy.yaml` and `envoy-rust.yaml` | **3** (still **2** `-U3` hunks — N-6's coalescing, expected) |
+| every route `prefix:`-matched (keeps clear of open CF-76-1) | **yes** |
+| `location` still absent from `HEADER_ALLOW_LIST` | **yes**, still exactly 3 entries |
+
+**MUT-D — the decisive one.** Mutated the `host_redirect` branch to *append* the request's port
+instead of dropping it, rebuilt (`cargo build --workspace --all-targets`, exit 0), re-ran the
+fixture:
+
+```
+fixture passes: probe q02-host-redirect-set-drops-request-port: diff_headers
+    header `location`: envoy=`http://example.com/q2-hostport/x` envoy-rust=`http://example.com:1234/q2-hostport/x`
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+```
+
+Three things follow, and the third is the one that matters:
+
+1. **`q02` discriminates the rule** — it is the probe that fires.
+2. **Upstream Envoy `v1.33.0` independently confirms the DROP**: `envoy=http://example.com/q2-hostport/x`,
+   no port. The cell is now MEASURED at the shipped target, not merely transcribed from recon.
+3. **`Http1ProbeList` ABORTS AT THE FIRST FAILING PROBE.** It named `q02` — the **18th** probe in
+   list order — so `r01`-`r16` and `q01` all **passed** under the mutation. That mechanically
+   reproduces `REVIEW.md` M-2's claim that this mutation left all 18 original probes green, and
+   proves `q02` is not a duplicate of `r01` but the *only* witness.
+
+**Unmutated fixture control from the same worktree: `ok`, 0.99 s** — so the RED is the mutation, not
+a broken worktree.
+
+Both doc claims corrected, and the reasoning banked so it cannot be re-lost: the fixture README gains
+a dedicated *"`q02` is the ONLY probe that can witness the port-DROP"* section, the entrypoint doc
+now says `q02` (not `q01` vs `r01`), and `BEHAVIOR_CONTRACT.md` §A(b) gains a blockquote explaining
+why R1 and the eight other `host_redirect` rows *cannot* witness it.
+
+`BEHAVIOR_CONTRACT.md` row **Q2** was re-anchored from the recon's `/a-host` onto the shipped
+`/q2-hostport/x`, matching the pattern Q1/Q3 already use — legitimate because the fixture green
+above *is* an upstream measurement of that exact string.
+
+## R3.5 — M-4: the stale variant doc
+
+`crates/envoy-config/src/bootstrap.rs` still described `RouteAction::Redirect`'s runtime as *"an
+honest `synth_501` not-implemented placeholder until 76.2 lands the real behaviour"*. 76.2 landed it,
+and that file **was** edited by this phase (`validate_redirect_oneofs` was lifted into it), so the doc
+was in scope. Rewritten to describe the landed runtime and point at the contract bank.
+
+## R3.6 — hygiene run at this state (NOT the §7.5 gate)
+
+| check | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit **0**, **ZERO** bytes (after one `cargo fmt --all` — rustfmt reflowed two `assert_eq!` calls in the new tests) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0**, **14** `Checking` lines |
+| `cargo test -p envoy-http1 -p envoy-config -p envoy-http2 --lib --no-fail-fast` | exit **0** — **682 / 198 / 111** passed, 0 failed |
+| `cargo test -p differential --test route_redirect_action` (main tree) | **ok**, 1 passed, **1.09 s** |
+
+**The ADR-0150 seam still holds**: **14** `Checking` lines with `envoy-accesslog` ABSENT from the
+list even though this session changed `envoy-config` — the seam's real witness, unchanged from state 4.
+
+**Test-count delta, measured not guessed.** `git diff -U0 HEAD -- '*.rs'` on the
+`#[test]`/`#[tokio::test]` attributes: **+4 / −0**. No new test binary (all four land in existing
+files).
+
+> **PREDICTIONS for the state-4 re-verification — these are NOT results.** State 4 owns re-closing
+> the CI arithmetic identity. Baseline at `ac21df2` was **163 binaries / passed=2148 / failed=0**.
+> With +4 tests and no new binary, the identity should close at **163 binaries / passed=2152**. If it
+> does not, that is a real signal, not a rounding difference. Gates (b) and (e) are invalidated by
+> this commit and MUST be re-run; (a) must re-run with the 19-probe fixture; (c) stays
+> CI-authoritative (ADR-0163 — the h2spec gate self-skips locally and is NOT vacuous in CI, settled,
+> do not re-raise); (d) stays n/a (no fuzz target added, `ci.yml` byte-unchanged).
+
+## R3.7 — findings from this re-entry
+
+1. **A COMPILE ERROR IS NOT A MUTATION RED.** MUT-C's first attempt exited 101 with no test-result
+   line at all — `Option<&str>` vs `String`. It looked exactly like a pass of the discipline while
+   proving nothing. **Always read the failure TEXT; a mutation that does not reach an assertion is
+   not evidence** — the same rule that governs a control worktree built without `--all-targets`.
+2. **THE ABORT-AT-FIRST-FAILURE DRIVER TURNED INTO A MEASUREMENT INSTRUMENT.** `Http1ProbeList`
+   stopping at the first red probe is normally a limitation (one run names one probe). Here it was
+   the *proof*: because it named the 18th probe, every earlier probe must have passed under the
+   mutation — which is precisely the claim that needed establishing. **A tool's limitation can be
+   the evidence, if you reason about the order.**
+3. **"MAKE THE CLAIM TRUE" BEAT "DELETE THE CLAIM" ON BOTH DOC FINDINGS, AND CHEAPLY.** M-1 and M-2
+   each offered a soften-the-doc option. Taking the real fix cost ~4 lines and one fixture probe, and
+   converted two *false* documents into two *working* safety nets. **Prefer closing the gap the
+   document lied about to correcting the document — when the gap is closeable at this price.**
+4. **THE REVIEW'S OWN FIX SHAPE NEEDED ONE DEVIATION, RECORDED NOT PAPERED OVER.** `REVIEW.md` M-1
+   suggested "one `Cell` with `prefix: None`" inside the 22-row table. That would have forced the
+   `cells.len() == 22` guard up to 23 and mixed an INVENTED cell into a table whose entire meaning is
+   "MEASURED against v1.33.0". Pinned in a dedicated test instead — same coverage, guard intact,
+   table's authority uncompromised. **A review recommends a fix's INTENT; the implementer still owns
+   its SHAPE.**
+5. **THE FIX PRESERVED THE FORCING FUNCTION RATHER THAN REMOVING IT.** The tempting reading of I-1 is
+   "`unreachable!()` was the bug — delete it". It was not: the bug was a widened producer with an
+   unextended consumer. The arm stays, its comment now says **six** and carries the cross-crate
+   warning. **When a guard fires correctly on a real defect, extend what it guards — do not remove
+   the guard.**
