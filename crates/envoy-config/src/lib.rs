@@ -1008,6 +1008,53 @@ pub enum ConfigError {
         "redirect action on listener `{listener}` route `{route}` sets both `https_redirect` and `scheme_redirect`; they are members of one oneof and are mutually exclusive"
     )]
     RedirectSchemeRewriteConflict { listener: String, route: String },
+
+    /// 108.1 D2: a `layered_runtime` layer has an empty or absent `name`.
+    /// Upstream enforces PGV `min_len 1` (MEASURED). `position` is the layer's
+    /// index within `layers` — the layer cannot be named, because its name is
+    /// the thing that is missing.
+    #[error(
+        "layered_runtime layer at position {position} has an empty name; a layer name is required and must be non-empty"
+    )]
+    EmptyRuntimeLayerName { position: usize },
+
+    /// 108.1 D2: two `layered_runtime` layers share a `name`. Upstream rejects
+    /// this at a POST-PGV stage with the bare string `Duplicate layer name: <n>`
+    /// (MEASURED). Error TEXT is not part of the equivalence contract (§7.2);
+    /// only the reject VERDICT is.
+    #[error("layered_runtime contains duplicate layer name `{layer}`; layer names must be unique")]
+    DuplicateRuntimeLayerName { layer: String },
+
+    /// 108.1 D2: a `layered_runtime` layer sets NO `layer_specifier` oneof arm.
+    /// Upstream rejects with `field: "layer_specifier", reason: is required`
+    /// (MEASURED).
+    #[error(
+        "layered_runtime layer `{layer}` sets no layer_specifier; exactly one of static_layer/disk_layer/rtds_layer/admin_layer is required"
+    )]
+    RuntimeLayerMissingSpecifier { layer: String },
+
+    /// 108.1 D2: a `layered_runtime` layer sets MORE THAN ONE `layer_specifier`
+    /// oneof arm. Upstream rejects with `'<arm>' has already been set … as part
+    /// of a oneof` (MEASURED). Detecting this is why the three unimplemented
+    /// arms are DECLARED rather than left to `deny_unknown_fields` — an
+    /// undeclared arm would fail as an opaque serde error and could not be
+    /// counted.
+    #[error(
+        "layered_runtime layer `{layer}` sets more than one layer_specifier; they are members of one oneof and are mutually exclusive"
+    )]
+    RuntimeLayerMultipleSpecifiers { layer: String },
+
+    /// 108.1 D2 (CF-108-1): a `layered_runtime` layer uses `disk_layer`,
+    /// `rtds_layer` or `admin_layer`. Upstream ACCEPTS all three; envoy-rust
+    /// rejects them loudly under the ADR-0049 all-fatal posture. A RECORDED
+    /// reject-direction divergence, differentially unobservable — a rejected
+    /// config never reaches the wire. `disk_layer` needs a filesystem watch,
+    /// `rtds_layer` an xDS cluster, `admin_layer` the state-mutating
+    /// `POST /runtime_modify` (CF-108-2). Each belongs to its own later phase.
+    #[error(
+        "layered_runtime layer `{layer}` uses `{arm}`, which envoy-rust does not implement; only static_layer is supported"
+    )]
+    UnsupportedRuntimeLayerType { layer: String, arm: &'static str },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
