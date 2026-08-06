@@ -2250,6 +2250,10 @@ filter_chains:
                 clusters: vec![],
             },
             dynamic_resources,
+            // 108.1: `Bootstrap` gained `layered_runtime`; this helper builds no
+            // runtime layer stack, and `None` (absent) is NOT the same as an
+            // empty block upstream — see `envoy_config::LayeredRuntime`.
+            layered_runtime: None,
             dynamic_clusters: None,
             dynamic_listeners,
         }
@@ -2447,6 +2451,9 @@ filter_chains:
                 clusters: vec![],
             },
             dynamic_resources: None,
+            // 108.1: `Bootstrap` gained `layered_runtime`; absent is NOT the
+            // same as an empty block — see `envoy_config::LayeredRuntime`.
+            layered_runtime: None,
             dynamic_clusters: None,
             dynamic_listeners: None,
         };
@@ -2501,6 +2508,9 @@ filter_chains:
                 clusters: vec![],
             },
             dynamic_resources: None,
+            // 108.1: `Bootstrap` gained `layered_runtime`; absent is NOT the
+            // same as an empty block — see `envoy_config::LayeredRuntime`.
+            layered_runtime: None,
             dynamic_clusters: None,
             dynamic_listeners: None,
         };

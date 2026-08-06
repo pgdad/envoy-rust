@@ -3993,6 +3993,10 @@ admin:
                 clusters: static_clusters,
             },
             dynamic_resources,
+            // 108.1: `Bootstrap` gained `layered_runtime`; this helper builds no
+            // runtime layer stack, and `None` (absent) is NOT the same as an
+            // empty block upstream — see `envoy_config::LayeredRuntime`.
+            layered_runtime: None,
             dynamic_clusters,
             dynamic_listeners: None,
         }
