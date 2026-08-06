@@ -25,7 +25,7 @@ pub use bootstrap::{
     HeaderValue, HeaderValueOption, HealthCheck, HealthCheckPayload, Http1ProtocolOptions,
     Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig,
     HttpHealthCheck, HttpProtocolOptions, HttpStatus, Int64Range, JsonFormatValue, JwtAuthnConfig,
-    JwtProvider, JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig,
+    JwtProvider, JwtRequirement, LayeredRuntime, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig,
     LbSubsetFallbackPolicy, LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig,
     LocalityLbEndpoints, MetadataEntry, MetadataFilter, MetadataMatcher, MetadataPathSegment,
     Mutations, NetworkFilter, NetworkRbacConfig, Node, OrFilter, OutlierDetection,
@@ -33,10 +33,10 @@ pub use bootstrap::{
     PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RedirectAction,
     RedirectResponseCode, RequirementRule, ResponseFlagFilter, RetryConfig, RetryOn, RetryPolicy,
     Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
-    RoutingPriority, Rules, RuntimeFractionalPercent, RuntimeUInt32, SafeRegex, SetMetadataConfig,
-    SocketAddress, StaticResources, StatusCodeFilter, StringMatcher, StringMatcherMode,
-    SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    RoutingPriority, Rules, RuntimeFractionalPercent, RuntimeLayer, RuntimeUInt32, RuntimeValue,
+    SafeRegex, SetMetadataConfig, SocketAddress, StaticResources, StatusCodeFilter, StringMatcher,
+    StringMatcherMode, SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds,
+    TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
     TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;

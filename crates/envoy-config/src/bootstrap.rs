@@ -19,6 +19,13 @@ pub struct Bootstrap {
     /// in the upstream DynamicResources proto is rejected loudly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_resources: Option<DynamicResources>,
+    /// 108.1 D1: `layered_runtime` — the runtime layer stack (ADR-0171/ADR-0172).
+    /// `None` (absent) and `Some(LayeredRuntime { layers: [] })` are DIFFERENT
+    /// states upstream and must stay different here — see `LayeredRuntime`.
+    /// `skip_serializing_if` keeps `/config_dump` byte-identical for the 86
+    /// pre-existing fixtures, none of which carries a `layered_runtime` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layered_runtime: Option<LayeredRuntime>,
     /// 18 D3: clusters loaded from the CDS file by `load_dynamic_resources`.
     /// `None` = not loaded yet (parse_bootstrap leaves it None — the fuzz
     /// target does no I/O); `Some(vec)` = loaded (possibly empty).
@@ -997,6 +1004,62 @@ impl RuntimeValue {
             RuntimeValue::Map(_) => String::new(),
         }
     }
+}
+
+/// 108.1 D1: `envoy.config.bootstrap.v3.LayeredRuntime` — the ordered layer
+/// stack. Only the `static_layer` arm is implemented (SPEC §1 D2 / CF-108-1).
+///
+/// **`layers` being EMPTY is not the same as the block being ABSENT.** MEASURED
+/// against `envoyproxy/envoy:v1.33.0`: no `layered_runtime:` at all yields
+/// `{"entries":{},"layers":[]}` with `runtime.num_layers: 0`, whereas
+/// `layered_runtime: {}` OR `layered_runtime: {layers: []}` makes upstream
+/// synthesize ONE layer named the EMPTY STRING with `num_layers: 1`. That is why
+/// `Bootstrap.layered_runtime` is an `Option` and this field is not — the
+/// synthesis is performed by [`crate::runtime::RuntimeSnapshot::from_bootstrap`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LayeredRuntime {
+    #[serde(default)]
+    pub layers: Vec<RuntimeLayer>,
+}
+
+/// 108.1 D1: one entry of `LayeredRuntime.layers` —
+/// `envoy.config.core.v3.RuntimeLayer`. `name` plus a `layer_specifier` oneof of
+/// which EXACTLY ONE arm must be set (MEASURED: absent → upstream
+/// `field: "layer_specifier", reason: is required`; two arms → upstream
+/// `'admin_layer' has already been set … as part of a oneof`).
+///
+/// **The three unimplemented arms are declared, not omitted (CF-108-1).** With
+/// `deny_unknown_fields` an undeclared `disk_layer:` would fail as an opaque
+/// serde unknown-field error; declaring them as `serde_yaml::Value` surfaces a
+/// precise `ConfigError` instead AND makes the oneof cardinality count correct
+/// when two arms are set. This is the landed `HashPolicy` recognize-then-reject
+/// pattern. They are ACCEPTED by upstream and BOOT-FATAL here — a recorded
+/// reject-direction divergence under the ADR-0049 all-fatal posture, and
+/// differentially unobservable because a rejected config never reaches the wire.
+///
+/// `disk_layer` needs a filesystem watch (this host has virtiofs and no inotify),
+/// `rtds_layer` needs an xDS cluster, and `admin_layer` is state-MUTATING via
+/// `POST /runtime_modify` (CF-108-2). Each belongs to its own later phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLayer {
+    /// PGV-required, `min_len 1` upstream. Empty or absent is boot-fatal.
+    #[serde(default)]
+    pub name: String,
+    /// The one implemented oneof arm: a map of runtime key → value, flattened to
+    /// dotted keys at arbitrary depth by the snapshot store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_layer: Option<std::collections::BTreeMap<String, RuntimeValue>>,
+    /// Recognized-but-unsupported arm (rejected by `validate_layered_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_layer: Option<serde_yaml::Value>,
+    /// Recognized-but-unsupported arm (rejected by `validate_layered_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtds_layer: Option<serde_yaml::Value>,
+    /// Recognized-but-unsupported arm (rejected by `validate_layered_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_layer: Option<serde_yaml::Value>,
 }
 
 /// A `json_format` value — a single `google.protobuf.Struct` value (ADR-0094
@@ -19608,6 +19671,96 @@ my.nested:
         // for a hard i64 limit.
         let m = runtime_values("k: 9223372036854775808\n");
         assert!(matches!(m["k"], RuntimeValue::Float(_)), "got {:?}", m["k"]);
+    }
+
+    #[test]
+    fn layered_runtime_absent_empty_and_populated_are_three_distinct_states() {
+        // SPEC §2 N-8, MEASURED against envoyproxy/envoy:v1.33.0:
+        //   no block            -> {"entries":{},"layers":[]}    num_layers 0
+        //   layered_runtime: {} -> {"entries":{},"layers":[""]}  num_layers 1
+        //   layers: []          -> {"entries":{},"layers":[""]}  num_layers 1
+        // The Option is what keeps state 1 distinguishable from states 2/3.
+        let base = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let absent = crate::parse_bootstrap(base).expect("valid");
+        assert!(
+            absent.layered_runtime.is_none(),
+            "absent block must be None"
+        );
+
+        let empty_block = crate::parse_bootstrap(&format!("{base}layered_runtime: {{}}\n"))
+            .expect("empty layered_runtime must parse");
+        assert!(
+            empty_block
+                .layered_runtime
+                .as_ref()
+                .expect("Some")
+                .layers
+                .is_empty(),
+            "an empty block parses to Some(LayeredRuntime {{ layers: [] }})"
+        );
+
+        let empty_layers =
+            crate::parse_bootstrap(&format!("{base}layered_runtime:\n  layers: []\n"))
+                .expect("empty layers list must parse");
+        assert!(
+            empty_layers
+                .layered_runtime
+                .as_ref()
+                .expect("Some")
+                .layers
+                .is_empty()
+        );
+
+        let populated = crate::parse_bootstrap(&format!(
+            "{base}layered_runtime:\n  layers:\n  - name: base_layer\n    static_layer:\n      some.key: v\n"
+        ))
+        .expect("populated must parse");
+        let lr = populated.layered_runtime.as_ref().expect("Some");
+        assert_eq!(lr.layers.len(), 1);
+        assert_eq!(lr.layers[0].name, "base_layer");
+        assert_eq!(
+            lr.layers[0].static_layer.as_ref().expect("static_layer")["some.key"],
+            RuntimeValue::Str("v".to_string())
+        );
+    }
+
+    #[test]
+    fn layered_runtime_rejects_unknown_keys_and_stays_out_of_config_dump_when_absent() {
+        let base = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        // An unknown arm gives upstream `no such field`; here deny_unknown_fields
+        // rejects it. Only the VERDICT is contracted (§7.2), not the text.
+        let err = crate::parse_bootstrap(&format!(
+            "{base}layered_runtime:\n  layers:\n  - name: l\n    bogus_layer: {{}}\n"
+        ))
+        .expect_err("an unknown layer arm must reject");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+
+        // Unknown key directly under `layered_runtime`.
+        let err = crate::parse_bootstrap(&format!("{base}layered_runtime:\n  bogus: 1\n"))
+            .expect_err("an unknown layered_runtime key must reject");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+
+        // Gate (b)'s mechanism: with no block, the field must be ABSENT from the
+        // serialized bootstrap, so /config_dump is byte-identical for all 86
+        // pre-existing fixtures.
+        let b = crate::parse_bootstrap(base).expect("valid");
+        let dumped = serde_json::to_string(&b).expect("serialize");
+        assert!(
+            !dumped.contains("layered_runtime"),
+            "an absent layered_runtime must not appear in /config_dump; got {dumped}"
+        );
     }
 }
 
