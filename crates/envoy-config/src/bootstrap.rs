@@ -2463,6 +2463,75 @@ pub struct HashPolicyHeader {
     pub header_name: String,
 }
 
+/// 108.1 D2: the four MEASURED reject-direction rules for `layered_runtime`,
+/// plus the CF-108-1 fail-loud rejection of the three unimplemented arms.
+///
+/// Rule order is deliberate and matches upstream's MEASURED order of complaint:
+/// PGV `name` first (it is a field constraint), then oneof CARDINALITY (upstream
+/// reports `'admin_layer' has already been set … as part of a oneof` for two
+/// arms, so a `static_layer` + `admin_layer` config must report the cardinality
+/// violation, NOT the unsupported arm), then the unsupported-arm rejection, and
+/// duplicate names LAST because upstream raises that at a post-PGV stage.
+///
+/// Mutates nothing, so it is idempotent — required, because `validate()` runs
+/// twice on a config using dynamic resources (`parse_bootstrap` then
+/// `load_dynamic_resources`).
+///
+/// Error TEXT is not part of the equivalence contract (§7.2); only the VERDICT is.
+pub(crate) fn validate_layered_runtime(lr: &LayeredRuntime) -> Result<(), crate::ConfigError> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (position, layer) in lr.layers.iter().enumerate() {
+        if layer.name.is_empty() {
+            return Err(crate::ConfigError::EmptyRuntimeLayerName { position });
+        }
+
+        // Count the set oneof arms. The three unimplemented arms are DECLARED
+        // (PLAN DD-3) precisely so they can be counted here; leaving them to
+        // `deny_unknown_fields` would make a two-arm config an opaque serde
+        // error instead of a precise cardinality rejection.
+        let arms: [(bool, &'static str); 4] = [
+            (layer.static_layer.is_some(), "static_layer"),
+            (layer.disk_layer.is_some(), "disk_layer"),
+            (layer.rtds_layer.is_some(), "rtds_layer"),
+            (layer.admin_layer.is_some(), "admin_layer"),
+        ];
+        let set: Vec<&'static str> = arms
+            .iter()
+            .filter(|(present, _)| *present)
+            .map(|(_, name)| *name)
+            .collect();
+
+        match set.len() {
+            0 => {
+                return Err(crate::ConfigError::RuntimeLayerMissingSpecifier {
+                    layer: layer.name.clone(),
+                });
+            }
+            1 => {
+                // CF-108-1: exactly one arm — reject it if it is not static_layer.
+                if set[0] != "static_layer" {
+                    return Err(crate::ConfigError::UnsupportedRuntimeLayerType {
+                        layer: layer.name.clone(),
+                        arm: set[0],
+                    });
+                }
+            }
+            _ => {
+                return Err(crate::ConfigError::RuntimeLayerMultipleSpecifiers {
+                    layer: layer.name.clone(),
+                });
+            }
+        }
+
+        if !seen.insert(layer.name.as_str()) {
+            return Err(crate::ConfigError::DuplicateRuntimeLayerName {
+                layer: layer.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 28 Task 4: validate a single route `hash_policy` entry. The MVP supports only
 /// the `header` specifier; any other recognized specifier
 /// (`cookie` / `connection_properties` / `query_parameter` / `filter_state`) is
@@ -3611,6 +3680,14 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                 v.to_string(),
             ));
         }
+    }
+
+    // 108.1 D2: `layered_runtime` is a bootstrap-level block with no listener or
+    // cluster dependency, so it validates here — before the listener walk and
+    // before any cluster-reference deferral. `None` (absent) is legal and is NOT
+    // the same as an empty block; see `LayeredRuntime`.
+    if let Some(lr) = bootstrap.layered_runtime.as_ref() {
+        validate_layered_runtime(lr)?;
     }
 
     // 18 D1/D3: while CDS is configured-but-unloaded, cluster-reference checks
@@ -19760,6 +19837,148 @@ admin:
         assert!(
             !dumped.contains("layered_runtime"),
             "an absent layered_runtime must not appear in /config_dump; got {dumped}"
+        );
+    }
+
+    // --- 108.1 Task 4: validate_layered_runtime (SPEC §2 N-12; PLAN DD-3) ---
+
+    /// Build a `LayeredRuntime` from a layers-only YAML fragment, bypassing
+    /// `parse_bootstrap` so the validator can be unit-tested in isolation.
+    fn layered_runtime(yaml: &str) -> LayeredRuntime {
+        serde_yaml::from_str(yaml).expect("layered_runtime fragment must parse")
+    }
+
+    #[test]
+    fn validate_layered_runtime_accepts_one_and_two_static_layers() {
+        // SPEC §2 N-6: TWO static layers with distinct names are LEGAL upstream
+        // (num_layers: 2). This is what makes multi-layer precedence witnessable
+        // inside 108.1 without the out-of-scope admin_layer.
+        let ok = layered_runtime(
+            r#"
+layers:
+- name: base_layer
+  static_layer:
+    shared.key: from_base
+- name: override_layer
+  static_layer:
+    shared.key: from_override
+"#,
+        );
+        super::validate_layered_runtime(&ok).expect("two distinct static layers are legal");
+
+        // An empty layers list is legal (SPEC §2 N-8).
+        super::validate_layered_runtime(&LayeredRuntime::default()).expect("empty layers is legal");
+
+        // An empty static_layer map is legal — it is a set arm with no keys.
+        let empty_arm = layered_runtime("layers:\n- name: l\n  static_layer: {}\n");
+        super::validate_layered_runtime(&empty_arm).expect("an empty static_layer is a set arm");
+    }
+
+    #[test]
+    fn validate_layered_runtime_rejects_empty_and_duplicate_names() {
+        // Rule 1: PGV min_len 1 on `name`.
+        let unnamed = layered_runtime("layers:\n- name: \"\"\n  static_layer: {}\n");
+        match super::validate_layered_runtime(&unnamed).expect_err("empty name rejects") {
+            crate::ConfigError::EmptyRuntimeLayerName { position } => assert_eq!(position, 0),
+            other => panic!("expected EmptyRuntimeLayerName, got {other:?}"),
+        }
+
+        // An ABSENT name is the same rejection, not a serde error: `name` carries
+        // #[serde(default)] so it arrives as the empty string.
+        let absent_name = layered_runtime("layers:\n- static_layer: {}\n");
+        assert!(
+            matches!(
+                super::validate_layered_runtime(&absent_name),
+                Err(crate::ConfigError::EmptyRuntimeLayerName { position: 0 })
+            ),
+            "an absent name must reject exactly like an empty one"
+        );
+
+        // The position must identify the OFFENDING layer, not always 0.
+        let second_unnamed = layered_runtime(
+            "layers:\n- name: ok\n  static_layer: {}\n- name: \"\"\n  static_layer: {}\n",
+        );
+        match super::validate_layered_runtime(&second_unnamed).expect_err("rejects") {
+            crate::ConfigError::EmptyRuntimeLayerName { position } => assert_eq!(position, 1),
+            other => panic!("expected EmptyRuntimeLayerName at 1, got {other:?}"),
+        }
+
+        // Rule 2: duplicate names.
+        let dup = layered_runtime(
+            "layers:\n- name: same\n  static_layer: {}\n- name: same\n  static_layer: {}\n",
+        );
+        match super::validate_layered_runtime(&dup).expect_err("duplicate name rejects") {
+            crate::ConfigError::DuplicateRuntimeLayerName { layer } => assert_eq!(layer, "same"),
+            other => panic!("expected DuplicateRuntimeLayerName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_layered_runtime_enforces_oneof_cardinality_and_rejects_unsupported_arms() {
+        // Rule 3: no arm at all.
+        let none_set = layered_runtime("layers:\n- name: l\n");
+        match super::validate_layered_runtime(&none_set).expect_err("no specifier rejects") {
+            crate::ConfigError::RuntimeLayerMissingSpecifier { layer } => assert_eq!(layer, "l"),
+            other => panic!("expected RuntimeLayerMissingSpecifier, got {other:?}"),
+        }
+
+        // Rule 4: more than one arm. Checked BEFORE the unsupported-arm check, so
+        // static_layer + admin_layer reports the cardinality violation — which is
+        // what upstream reports ('admin_layer' has already been set ...).
+        let two_arms =
+            layered_runtime("layers:\n- name: l\n  static_layer: {}\n  admin_layer: {}\n");
+        match super::validate_layered_runtime(&two_arms).expect_err("two arms reject") {
+            crate::ConfigError::RuntimeLayerMultipleSpecifiers { layer } => assert_eq!(layer, "l"),
+            other => panic!("expected RuntimeLayerMultipleSpecifiers, got {other:?}"),
+        }
+
+        // CF-108-1: each unsupported arm ALONE is rejected, and names itself.
+        // Table-driven so a future arm costs one line.
+        for (yaml, expected_arm) in [
+            (
+                "layers:\n- name: l\n  disk_layer:\n    symlink_root: /srv\n",
+                "disk_layer",
+            ),
+            (
+                "layers:\n- name: l\n  rtds_layer:\n    name: rtds\n",
+                "rtds_layer",
+            ),
+            ("layers:\n- name: l\n  admin_layer: {}\n", "admin_layer"),
+        ] {
+            let lr = layered_runtime(yaml);
+            match super::validate_layered_runtime(&lr).expect_err("unsupported arm rejects") {
+                crate::ConfigError::UnsupportedRuntimeLayerType { layer, arm } => {
+                    assert_eq!(layer, "l");
+                    assert_eq!(arm, expected_arm);
+                }
+                other => {
+                    panic!("expected UnsupportedRuntimeLayerType({expected_arm}), got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_bootstrap_runs_the_layered_runtime_validator() {
+        // The wiring test: the validator must be reachable from the real entry
+        // point, not merely callable in a unit test.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+layered_runtime:
+  layers:
+  - name: same
+    static_layer: {}
+  - name: same
+    static_layer: {}
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject via parse_bootstrap");
+        assert!(
+            matches!(err, crate::ConfigError::DuplicateRuntimeLayerName { .. }),
+            "got {err:?}"
         );
     }
 }
