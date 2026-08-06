@@ -933,6 +933,72 @@ pub struct SubstitutionFormatString {
     pub omit_empty_values: bool,
 }
 
+/// 108.1 D1: one value inside a `layered_runtime` `static_layer` map — a scalar
+/// or a nested map, recursive to arbitrary depth (SPEC §2 N-4: `my.nested: {sub_key: v,
+/// deeper: {leaf: w}}` yields entries `my.nested.sub_key` AND `my.nested.deeper.leaf`
+/// with NO intermediate entry).
+///
+/// **NOT `JsonFormatValue` (below), and the two must never be merged.** That type
+/// cannot represent NUMBERS by design (ADR-0094 §D / CF-39-1) — a runtime key
+/// `some.key: 42` is legal upstream and MEASURED — and its `Format(String)` arm
+/// compiles every string leaf as an access-log command-operator format string
+/// (`validate_json_format_value`), so a runtime value containing `%` would
+/// boot-reject. Different semantics, same shape; keep them apart.
+///
+/// **`#[serde(untagged)]` arm ORDER is load-bearing.** `Int` MUST precede
+/// `Float`: MEASURED, with the two reversed the integer `42` binds to
+/// `Float(42.0)`. It stringifies to `"42"` either way, so only an assertion on
+/// the VARIANT catches the mistake.
+///
+/// **CF-108-4 — envoy-rust follows YAML 1.2; upstream Envoy is YAML 1.1.** An
+/// unquoted `y`/`n`/`on`/`off` booleanizes upstream (`key: y` → `true` →
+/// `final_value` `"true"`) but is a plain string here. This is RECORDED, not
+/// fixed: MEASURED against `serde_yaml 0.9.34`, unquoted `y` and quoted `"y"`
+/// both deserialize to `String("y")` — indistinguishable at the
+/// `serde_yaml::Value` level itself — so no parse-time transform can booleanize
+/// the first without also booleanizing the second, and upstream renders quoted
+/// `"y"` as `"y"`. Normalising would replace one divergence with another.
+///
+/// **CF-108-5 — float rendering beyond `1.5` is UNMEASURED.** Only
+/// `1.5` → `"1.5"` was measured upstream. Rust renders `1.0` → `"1"` and
+/// `1e6` → `"1000000"`; both are plausible and neither is confirmed. Re-measure
+/// before putting any float in a differential fixture.
+///
+/// A `null`, a sequence, an absent value, and an integer outside `i64` all match
+/// NO arm and are boot-fatal (recorded reject-direction divergences under the
+/// ADR-0049 all-fatal posture; upstream behaviour UNMEASURED).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RuntimeValue {
+    /// YAML `true` / `false` → `"true"` / `"false"` after stringification.
+    Bool(bool),
+    /// YAML integer. MUST stay ahead of `Float` — see the type doc.
+    Int(i64),
+    /// YAML float. MEASURED upstream only for `1.5` (CF-108-5).
+    Float(f64),
+    /// YAML string, including the empty string (SPEC §2 N-7).
+    Str(String),
+    /// YAML map → recurse. Flattened to dotted keys by
+    /// [`crate::runtime::RuntimeSnapshot`]; produces no entry of its own.
+    Map(std::collections::BTreeMap<String, RuntimeValue>),
+}
+
+impl RuntimeValue {
+    /// 108.1 D3: render a SCALAR leaf the way upstream's `/runtime` does — every
+    /// value stringifies (SPEC §2 N-3). `Map` is unreachable for a caller that
+    /// flattens first; it renders as the empty string rather than panicking,
+    /// because a `Map` leaf is not an entry at all and must never surface a value.
+    pub fn stringify(&self) -> String {
+        match self {
+            RuntimeValue::Bool(b) => b.to_string(),
+            RuntimeValue::Int(i) => i.to_string(),
+            RuntimeValue::Float(f) => f.to_string(),
+            RuntimeValue::Str(s) => s.clone(),
+            RuntimeValue::Map(_) => String::new(),
+        }
+    }
+}
+
 /// A `json_format` value — a single `google.protobuf.Struct` value (ADR-0094
 /// §A–§D). Recursive: a command-operator format string (`Format`), a `bool` or
 /// `null` literal (emitted native-typed per §D), a nested object (keys SORTED at
@@ -19414,6 +19480,134 @@ static_resources:
         assert_eq!(cfg.subset_selectors.len(), 1);
         assert!(cfg.subset_selectors[0].keys.is_empty());
         assert!(super::validate_cluster(c).is_ok(), "empty keys → Ok");
+    }
+
+    // --- 108.1 Task 1: RuntimeValue (SPEC §2 N-2/N-3/N-4/N-7; PLAN DD-1/DD-4/DD-5/DD-6) ---
+
+    /// Parse a bare `static_layer` map body into the value model. Used by every
+    /// RuntimeValue test below so the tests exercise the SAME serde path the
+    /// real `RuntimeLayer.static_layer` field uses.
+    fn runtime_values(yaml: &str) -> std::collections::BTreeMap<String, RuntimeValue> {
+        serde_yaml::from_str(yaml).expect("static_layer body must parse")
+    }
+
+    #[test]
+    fn runtime_value_binds_each_scalar_arm_in_declared_order() {
+        let m = runtime_values(
+            r#"
+b_true: true
+b_false: false
+i_pos: 42
+i_neg: -7
+f_frac: 1.5
+s_plain: hello
+s_empty: ""
+"#,
+        );
+        // DD-4: `Int` MUST precede `Float`. With the arms reversed, `42` binds
+        // to `Float(42.0)` and still stringifies to "42" — so this assertion on
+        // the VARIANT, not on the stringification, is the only thing that
+        // catches the mistake.
+        assert_eq!(m["b_true"], RuntimeValue::Bool(true));
+        assert_eq!(m["b_false"], RuntimeValue::Bool(false));
+        assert_eq!(m["i_pos"], RuntimeValue::Int(42));
+        assert_eq!(m["i_neg"], RuntimeValue::Int(-7));
+        assert_eq!(m["f_frac"], RuntimeValue::Float(1.5));
+        assert_eq!(m["s_plain"], RuntimeValue::Str("hello".to_string()));
+        // SPEC §2 N-7: an explicitly-empty string is a legitimate entry.
+        assert_eq!(m["s_empty"], RuntimeValue::Str(String::new()));
+    }
+
+    #[test]
+    fn runtime_value_nests_to_arbitrary_depth_and_stringifies_scalars() {
+        let m = runtime_values(
+            r#"
+my.nested:
+  sub_key: v
+  deeper:
+    leaf: w
+"#,
+        );
+        // SPEC §2 N-4: the model keeps the nesting; FLATTENING is the snapshot
+        // store's job (Task 5), not the value type's.
+        let RuntimeValue::Map(outer) = &m["my.nested"] else {
+            panic!("expected a Map, got {:?}", m["my.nested"]);
+        };
+        assert_eq!(outer["sub_key"], RuntimeValue::Str("v".to_string()));
+        let RuntimeValue::Map(inner) = &outer["deeper"] else {
+            panic!("expected a nested Map, got {:?}", outer["deeper"]);
+        };
+        assert_eq!(inner["leaf"], RuntimeValue::Str("w".to_string()));
+
+        // SPEC §2 N-3: every scalar stringifies. Table-driven so a new measured
+        // cell costs ONE line (the 76.2 design that measurably beat 22 separate
+        // `#[test]` fns: 255 LoC vs ~400).
+        let cells: &[(RuntimeValue, &str)] = &[
+            (RuntimeValue::Bool(true), "true"),
+            (RuntimeValue::Bool(false), "false"),
+            (RuntimeValue::Int(42), "42"),
+            (RuntimeValue::Int(-7), "-7"),
+            // CF-108-5: `1.5` is the ONLY float cell MEASURED upstream.
+            (RuntimeValue::Float(1.5), "1.5"),
+            (RuntimeValue::Str("hello".to_string()), "hello"),
+            (RuntimeValue::Str(String::new()), ""),
+        ];
+        for (v, expected) in cells {
+            assert_eq!(&v.stringify(), expected, "stringify({v:?})");
+        }
+    }
+
+    #[test]
+    fn runtime_value_follows_yaml_1_2_and_records_the_cf_108_4_divergence() {
+        // CF-108-4 (PLAN DD-1). Upstream Envoy parses YAML 1.1, where unquoted
+        // `y`/`n`/`on`/`off` booleanize: `key: y` → `true` → final_value "true".
+        // envoy-rust follows serde_yaml's YAML 1.2 core schema, where they are
+        // plain strings. This test PINS the divergence so it stays deliberate.
+        //
+        // It is NOT fixable at parse time: MEASURED, unquoted `y` and quoted
+        // `"y"` both arrive as String("y") — the quoting bit is destroyed by the
+        // scanner — and upstream renders quoted `"y"` as "y", so booleanizing
+        // would mint an opposite-direction divergence on an equally legal
+        // spelling.
+        let m = runtime_values("a: y\nb: n\nc: on\nd: off\ne: \"y\"\n");
+        for k in ["a", "b", "c", "d", "e"] {
+            assert!(
+                matches!(m[k], RuntimeValue::Str(_)),
+                "CF-108-4: {k} must stay a string under YAML 1.2, got {:?}",
+                m[k]
+            );
+        }
+        assert_eq!(m["a"].stringify(), "y");
+        assert_eq!(m["c"].stringify(), "on");
+        // The two spellings are indistinguishable — this equality IS the reason
+        // normalisation is impossible, not an incidental detail.
+        assert_eq!(m["a"], m["e"]);
+
+        // But real YAML 1.2 booleans DO bind to `Bool`.
+        let t = runtime_values("k: true\n");
+        assert_eq!(t["k"], RuntimeValue::Bool(true));
+    }
+
+    #[test]
+    fn runtime_value_rejects_shapes_that_match_no_arm() {
+        // PLAN DD-6. Recorded reject-direction divergences (ADR-0049 all-fatal);
+        // upstream behaviour for these shapes is UNMEASURED. Error TEXT is not
+        // part of the equivalence contract (§7.2) — only the VERDICT is pinned.
+        for (label, yaml) in [
+            ("null", "k: ~\n"),
+            ("sequence", "k: [1, 2]\n"),
+            ("absent value", "k:\n"),
+            ("integer beyond i64", "k: 100000000000000000000\n"),
+        ] {
+            let r = serde_yaml::from_str::<std::collections::BTreeMap<String, RuntimeValue>>(yaml);
+            assert!(r.is_err(), "{label} must be rejected, got {r:?}");
+        }
+
+        // Measured contrast: an integer just past i64::MAX silently WIDENS to
+        // Float rather than rejecting. Pinned so the boundary is not mistaken
+        // for a hard i64 limit.
+        let m = runtime_values("k: 9223372036854775808\n");
+        assert!(matches!(m["k"], RuntimeValue::Float(_)), "got {:?}", m["k"]);
     }
 }
 
