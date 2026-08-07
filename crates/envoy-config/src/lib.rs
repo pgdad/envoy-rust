@@ -10,6 +10,7 @@ pub mod eds;
 pub mod lds;
 pub mod matcher;
 pub mod rds;
+pub mod runtime;
 
 pub use bootstrap::{
     AccessLog, AccessLogFilter, AccessLogTypedConfig, Action, Address, Admin, AndFilter,
