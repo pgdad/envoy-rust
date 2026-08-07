@@ -58,6 +58,65 @@ impl RuntimeSnapshot {
     pub fn num_keys(&self) -> usize {
         self.entries.len()
     }
+
+    /// Build a snapshot from an ordered layer stack.
+    ///
+    /// `layer_names` is passed separately from `layers` because an ABSENT
+    /// `layered_runtime` block and a PRESENT-but-empty one differ in their layer
+    /// NAMES but not in their layer CONTENT (SPEC §2 N-8): upstream synthesizes
+    /// one layer named the EMPTY STRING for the empty block, and that synthetic
+    /// layer has no `RuntimeLayer` behind it. `from_bootstrap` owns that
+    /// distinction; this function is a total function over whatever stack it is
+    /// handed. **Invariant: `layer_names.len()` MUST equal `layers.len()` unless
+    /// `layers` is empty**, in which case each key simply gets `layer_names.len()`
+    /// empty slots — which is exactly the empty-block case.
+    ///
+    /// Two MEASURED rules, both easy to get wrong:
+    /// - every key gets ONE SLOT PER CONFIGURED LAYER, `""` where absent, in
+    ///   config order (N-6) — slot count is a property of the stack, not the key;
+    /// - `final_value` is the last NON-EMPTY slot (N-7), NOT the last slot. An
+    ///   explicitly-set `""` does not override a lower layer, and is
+    ///   indistinguishable on the wire from absence.
+    pub fn from_layers(layer_names: Vec<String>, layers: &[RuntimeLayer]) -> RuntimeSnapshot {
+        let slot_count = layer_names.len();
+        let flattened: Vec<BTreeMap<String, String>> = layers.iter().map(flatten_layer).collect();
+
+        let mut entries: BTreeMap<String, RuntimeEntry> = BTreeMap::new();
+        for per_layer in &flattened {
+            for key in per_layer.keys() {
+                entries.entry(key.clone()).or_insert_with(|| RuntimeEntry {
+                    layer_values: vec![String::new(); slot_count],
+                    final_value: String::new(),
+                });
+            }
+        }
+
+        for (index, per_layer) in flattened.iter().enumerate() {
+            for (key, value) in per_layer {
+                if let Some(entry) = entries.get_mut(key)
+                    && let Some(slot) = entry.layer_values.get_mut(index)
+                {
+                    *slot = value.clone();
+                }
+            }
+        }
+
+        for entry in entries.values_mut() {
+            // Last NON-EMPTY wins; an all-empty key keeps the empty string.
+            entry.final_value = entry
+                .layer_values
+                .iter()
+                .rev()
+                .find(|v| !v.is_empty())
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        RuntimeSnapshot {
+            layer_names,
+            entries,
+        }
+    }
 }
 
 /// Flatten one layer's `static_layer` into dotted keys → stringified values.
@@ -197,5 +256,97 @@ static_layer:
         // total, because 108.2 renders snapshots and must never panic.)
         let none = layer("name: l\n");
         assert!(flatten_layer(&none).is_empty());
+    }
+
+    #[test]
+    fn from_layers_reproduces_the_measured_two_layer_transcript() {
+        // SPEC §2 N-6 and N-7, MEASURED against envoyproxy/envoy:v1.33.0. TWO
+        // static layers with distinct names are LEGAL, which is what makes
+        // multi-layer precedence witnessable in 108.1 without the out-of-scope
+        // admin_layer. The upstream response was, verbatim:
+        //
+        //   "shared.key":       {"layer_values":["from_base","from_override"],"final_value":"from_override"}
+        //   "only.in.base":     {"layer_values":["base_val",""],              "final_value":"base_val"}
+        //   "only.in.override": {"layer_values":["","over_val"],              "final_value":"over_val"}
+        //   "empty.in.override":{"layer_values":["real_value",""],            "final_value":"real_value"}
+        //   with "layers":["base_layer","override_layer"], num_layers 2, num_keys 4.
+        let base = layer(
+            r#"
+name: base_layer
+static_layer:
+  shared.key: from_base
+  only.in.base: base_val
+  empty.in.override: real_value
+"#,
+        );
+        let over = layer(
+            r#"
+name: override_layer
+static_layer:
+  shared.key: from_override
+  only.in.override: over_val
+  empty.in.override: ""
+"#,
+        );
+        let snap = RuntimeSnapshot::from_layers(
+            vec!["base_layer".to_string(), "override_layer".to_string()],
+            &[base, over],
+        );
+
+        assert_eq!(snap.layer_names, vec!["base_layer", "override_layer"]);
+        assert_eq!(snap.num_layers(), 2);
+        assert_eq!(snap.num_keys(), 4);
+
+        // Table-driven: (key, expected slots, expected final_value).
+        for (key, slots, final_value) in [
+            (
+                "shared.key",
+                vec!["from_base", "from_override"],
+                "from_override",
+            ),
+            ("only.in.base", vec!["base_val", ""], "base_val"),
+            ("only.in.override", vec!["", "over_val"], "over_val"),
+            // THE rule most likely to be got wrong: an explicitly-set "" does
+            // NOT override a lower layer. "last wins" would give "" here.
+            ("empty.in.override", vec!["real_value", ""], "real_value"),
+        ] {
+            let e = snap
+                .entries
+                .get(key)
+                .unwrap_or_else(|| panic!("missing {key}"));
+            assert_eq!(e.layer_values, slots, "layer_values for {key}");
+            assert_eq!(e.final_value, final_value, "final_value for {key}");
+        }
+    }
+
+    #[test]
+    fn from_layers_gives_every_key_one_slot_per_configured_layer() {
+        // Slot COUNT is a property of the layer STACK, not of the key: a key
+        // present in only one of three layers still gets three slots.
+        let a = layer("name: a\nstatic_layer:\n  only.in.a: v\n");
+        let b = layer("name: b\nstatic_layer: {}\n");
+        let c = layer("name: c\nstatic_layer: {}\n");
+        let snap = RuntimeSnapshot::from_layers(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            &[a, b, c],
+        );
+        let e = &snap.entries["only.in.a"];
+        assert_eq!(e.layer_values, vec!["v", "", ""]);
+        assert_eq!(e.final_value, "v");
+        assert_eq!(snap.num_layers(), 3);
+        assert_eq!(snap.num_keys(), 1);
+    }
+
+    #[test]
+    fn from_layers_keeps_an_all_empty_key_as_an_entry_with_an_empty_final_value() {
+        // SPEC §2 N-7, single-layer probe, MEASURED:
+        //   my.empty.string.key: "" -> {"final_value":"","layer_values":[""]}
+        // and it IS counted in num_keys.
+        let only = layer("name: l\nstatic_layer:\n  my.empty.string.key: \"\"\n");
+        let snap = RuntimeSnapshot::from_layers(vec!["l".to_string()], &[only]);
+        let e = &snap.entries["my.empty.string.key"];
+        assert_eq!(e.layer_values, vec![""]);
+        assert_eq!(e.final_value, "");
+        assert_eq!(snap.num_keys(), 1, "an all-empty key is still a key");
     }
 }
