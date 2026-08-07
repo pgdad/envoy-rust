@@ -1,0 +1,50 @@
+node: { id: fuzz-108.1, cluster: fuzz-108.1 }
+static_resources:
+  listeners:
+    - name: l1
+      address: { socket_address: { address: 127.0.0.1, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: v
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 503, body: { inline_string: "fuzz\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+# Phase 108.1: the `layered_runtime` static_layer surface. TWO layers with
+# distinct names are legal (MEASURED), which exercises the slot/precedence path;
+# `empty.in.override` pins that an explicit "" does NOT override a lower layer.
+# Every scalar arm of the recursive value type appears, plus two-level nesting.
+layered_runtime:
+  layers:
+    - name: base_layer
+      static_layer:
+        shared.key: from_base
+        only.in.base: base_val
+        empty.in.override: real_value
+        k.bool: true
+        k.int: 42
+        k.negint: -7
+        k.float: 1.5
+        k.empty: ""
+        my.nested:
+          sub_key: v
+          deeper:
+            leaf: w
+    - name: override_layer
+      static_layer:
+        shared.key: from_override
+        only.in.override: over_val
+        empty.in.override: ""
