@@ -18,7 +18,7 @@
 //! workspace enables `preserve_order` nowhere), and a canonically-ordered store
 //! keeps the renderer deterministic before `serde_json` is involved.
 
-use crate::{RuntimeLayer, RuntimeValue};
+use crate::{LayeredRuntime, RuntimeLayer, RuntimeValue};
 use std::collections::BTreeMap;
 
 /// One runtime key's view across the layer stack.
@@ -116,6 +116,30 @@ impl RuntimeSnapshot {
             layer_names,
             entries,
         }
+    }
+
+    /// Build the snapshot a parsed `Bootstrap` implies. **This is the entry
+    /// point sibling 108.2's admin `GET /runtime` renderer calls.**
+    ///
+    /// The absent-vs-empty distinction lives here and nowhere else (SPEC §2 N-8,
+    /// MEASURED): no `layered_runtime:` block yields ZERO layers, while
+    /// `layered_runtime: {}` or `layered_runtime: {layers: []}` yields ONE layer
+    /// named the EMPTY STRING. Upstream synthesizes that layer internally, which
+    /// is why it is created here rather than in the schema — a config-declared
+    /// layer named `""` is boot-fatal (PGV `min_len 1`), so the synthetic layer
+    /// deliberately bypasses `validate_layered_runtime`.
+    pub fn from_bootstrap(bootstrap: &crate::Bootstrap) -> RuntimeSnapshot {
+        let Some(lr): Option<&LayeredRuntime> = bootstrap.layered_runtime.as_ref() else {
+            // Absent: zero layers, zero keys.
+            return RuntimeSnapshot::default();
+        };
+        if lr.layers.is_empty() {
+            // Present but empty, in EITHER spelling: one synthetic layer named
+            // the empty string, and no keys.
+            return RuntimeSnapshot::from_layers(vec![String::new()], &[]);
+        }
+        let names: Vec<String> = lr.layers.iter().map(|l| l.name.clone()).collect();
+        RuntimeSnapshot::from_layers(names, &lr.layers)
     }
 }
 
@@ -348,5 +372,78 @@ static_layer:
         assert_eq!(e.layer_values, vec![""]);
         assert_eq!(e.final_value, "");
         assert_eq!(snap.num_keys(), 1, "an all-empty key is still a key");
+    }
+
+    #[test]
+    fn from_bootstrap_distinguishes_absent_from_empty_from_populated() {
+        // SPEC §2 N-8, MEASURED against envoyproxy/envoy:v1.33.0:
+        //   | config                          | /runtime                     | num_layers | num_keys |
+        //   | no layered_runtime block        | {"entries":{},"layers":[]}   | 0          | 0        |
+        //   | layered_runtime: {}             | {"entries":{},"layers":[""]} | 1          | 0        |
+        //   | layered_runtime: { layers: [] } | {"entries":{},"layers":[""]} | 1          | 0        |
+        // Upstream synthesizes ONE layer named the EMPTY STRING for both empty
+        // spellings. Collapsing None and Some(empty) MINTS a divergence.
+        let base = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let absent = crate::parse_bootstrap(base).expect("valid");
+        let snap = RuntimeSnapshot::from_bootstrap(&absent);
+        assert!(snap.layer_names.is_empty(), "absent block -> layers: []");
+        assert_eq!(snap.num_layers(), 0);
+        assert_eq!(snap.num_keys(), 0);
+
+        for spelling in ["layered_runtime: {}\n", "layered_runtime:\n  layers: []\n"] {
+            let b = crate::parse_bootstrap(&format!("{base}{spelling}")).expect("valid");
+            let snap = RuntimeSnapshot::from_bootstrap(&b);
+            assert_eq!(
+                snap.layer_names,
+                vec![String::new()],
+                "an empty block synthesizes ONE layer named the empty string ({spelling:?})"
+            );
+            assert_eq!(snap.num_layers(), 1);
+            assert_eq!(snap.num_keys(), 0);
+        }
+
+        // Populated: names come from config, in config order.
+        let b = crate::parse_bootstrap(&format!(
+            "{base}layered_runtime:\n  layers:\n  - name: base_layer\n    static_layer:\n      a.b: 1\n      n:\n        deep: x\n  - name: override_layer\n    static_layer:\n      a.b: 2\n"
+        ))
+        .expect("valid");
+        let snap = RuntimeSnapshot::from_bootstrap(&b);
+        assert_eq!(snap.layer_names, vec!["base_layer", "override_layer"]);
+        assert_eq!(snap.num_layers(), 2);
+        // SPEC §2 N-5: num_keys counts FLATTENED LEAVES — `a.b` plus `n.deep`.
+        assert_eq!(snap.num_keys(), 2);
+        assert_eq!(snap.entries["a.b"].layer_values, vec!["1", "2"]);
+        assert_eq!(snap.entries["a.b"].final_value, "2");
+        assert_eq!(snap.entries["n.deep"].layer_values, vec!["x", ""]);
+        assert_eq!(snap.entries["n.deep"].final_value, "x");
+    }
+
+    #[test]
+    fn from_bootstrap_counts_flattened_leaves_not_declared_keys() {
+        // SPEC §2 N-5, MEASURED: a layer declaring 11 top-level YAML keys, one
+        // of them a nested map holding TWO leaves, yields num_keys: 12 — and
+        // that equals the `entries` object size exactly.
+        let mut yaml = String::from(
+            "admin:\n  address:\n    socket_address:\n      address: 127.0.0.1\n      port_value: 9901\nlayered_runtime:\n  layers:\n  - name: l\n    static_layer:\n",
+        );
+        for i in 0..10 {
+            yaml.push_str(&format!("      k{i}: v{i}\n"));
+        }
+        yaml.push_str("      nested:\n        one: a\n        two: b\n");
+        let b = crate::parse_bootstrap(&yaml).expect("valid");
+        let snap = RuntimeSnapshot::from_bootstrap(&b);
+        assert_eq!(snap.num_keys(), 12, "10 flat + 2 nested leaves");
+        assert_eq!(snap.entries.len(), snap.num_keys());
+        assert!(
+            !snap.entries.contains_key("nested"),
+            "no intermediate entry"
+        );
+        assert_eq!(snap.entries["nested.one"].final_value, "a");
     }
 }
