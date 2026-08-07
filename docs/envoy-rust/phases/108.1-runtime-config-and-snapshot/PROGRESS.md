@@ -15,6 +15,7 @@
 - §10 Task 9: regression sweep, size gate, gate (d)
 - §11 Deviations from `PLAN.md`, each with its reason
 - §12 What this session did NOT do
+- §13 CI on the state-3 head (a MEASUREMENT; state 4 owns the adjudication)
 
 ---
 
@@ -841,3 +842,52 @@ plan's message bodies are otherwise verbatim.
 - **The parallel workstream's four `.claude/worktrees/agent-*` worktrees were not
   touched.** Every worktree this session created was its own and was removed, with
   removal re-verified from the repo root.
+
+---
+
+## §13 — CI on the state-3 head (measured after the Task 9 commit)
+
+**This is a MEASUREMENT, not a gate adjudication.** State 4 owns §7.5 and must
+re-confirm it rather than inherit this.
+
+GitHub Actions recovered during this session (the `Incident with Actions` that
+began `2026-08-06T15:22:49Z` moved to `monitoring`; the component reads
+`operational`), so CI was confirmable. Run **`31134453388`** on the full 40-char
+SHA `c002d796d74fbc62f924112f10d0aa7f65ccd158`:
+
+```
+$ gh api repos/pgdad/envoy-rust/actions/runs/31134453388/jobs --jq '...'
+build + test + lint   success   15 steps   runner=GitHub Actions 1000004990
+fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + ...)
+                      success   13 steps   runner=GitHub Actions 1000004989
+
+conclusion=success    log bytes: 730058
+$ grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed' <log> | awk '{b++;p+=$4;fl+=$6}...'
+binaries=163 passed=2170 failed=0
+$ grep -c 'test result: FAILED' <log>
+0
+```
+
+**Step counts are 15 / 13 as required**, both jobs ran on real runners (a
+`runner_name:""` with `steps:0` would mean starvation and a rerun of the same
+SHA), and the log is 730 KB — not the ~120-byte artifact a `gh` invocation from
+outside the repo produces.
+
+**The plan's prediction landed EXACTLY:**
+
+```
+predicted (PLAN.md Task 9 Step 4) : binaries=163  passed=2170
+measured  (run 31134453388)       : binaries=163  passed=2170  failed=0
+2152 (baseline, run 31065720371) + 18 (new tests) = 2170          ✓
+binary count UNMOVED at 163 — no new test binary                  ✓
+```
+
+This also closes the identity from the other side: the local sweeps' `2164
+passed + 6 failed = 2170` equals CI's `2170 passed`, i.e. **every one of the six
+local REDs is green in CI** — the documented host-flake core plus tail, exactly
+as ADR-0164 predicts.
+
+**The three docs-only commits `4e80009` / `55dae04` / `879978f` still have no
+run and never will** — the outage swallowed them and GitHub does not
+retroactively create runs. They are docs-only (zero `crates/`/`tests/` bytes)
+and this run builds their content anyway.
