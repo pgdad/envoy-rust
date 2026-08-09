@@ -87,3 +87,33 @@
 - **Boundary gate:** fmt clean on first check (no reflow this time); clippy
   exit 0, 1 `Checking` line (non-zero).
 - **Commit:** `phase 108.2 task 3: AdminScrape expected_stats + fixture 0087 data`
+
+## Task 4 — differential test binary + the LOCAL fixture run + mutation checks
+
+- `tests/differential/tests/runtime_static_layer.rs` created (the 87th
+  differential test file / 164th workspace test binary).
+- `cargo build -p envoy-bin` FIRST (fresh debug binary — the stale-binary trap).
+- **The SPEC §5 LOCAL RUN, RECORDED:**
+  `cargo test -p differential --test runtime_static_layer -- --nocapture` →
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered
+  out; finished in 7.88s` (first run; container start included). Subsequent
+  runs 1.15-1.22 s — inside the plan's ~1-3 s window. Backend-free and
+  cluster-free, so fully verifiable on this host; Docker daemon was up
+  (`docker ps` clean). Transcript at scratchpad `fixture-0087-run1.log`.
+- **Mutation checks (in-place data mutations, serial, no parallel subagents):**
+  - (a) `shared.key.final_value` `"from_override"` → `"from_base"`: RED with
+    a real `test result: FAILED. 0 passed; 1 failed` line and the failure
+    text naming the witness — `required_subtree "entries" envoy != expected`
+    (the UPSTREAM side rejected the mutated expectation; the assertion
+    reaches a real assertion, not a compile/startup failure).
+  - (b) revert (a); `runtime.num_keys` `value: 14` → `13`: RED with
+    `upstream stat runtime.num_keys expected 13 got 14` — the wrong
+    flattened-leaf count fails loudly (bilateral: upstream checked first).
+  - (c) revert (b); `git diff --stat` EMPTY (byte-exact restore of the
+    tracked expectations.yaml); rerun → GREEN `1 passed` (the unmutated
+    control from the same tree).
+- **Boundary gate:** rustfmt reflowed the `run_fixture(...).await.expect(...)`
+  chain in the new test file (same formatting-only deviation class as Tasks
+  1-2); after `cargo fmt --all`: check clean, fixture still green
+  (`1 passed`, 1.15s). Clippy exit 0, 1 `Checking` line.
+- **Commit:** `phase 108.2 task 4: fixture 0087 differential test + local green`
