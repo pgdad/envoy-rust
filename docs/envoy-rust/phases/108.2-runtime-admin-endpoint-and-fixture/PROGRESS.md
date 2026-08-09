@@ -369,3 +369,22 @@ gRPC `:126`, WASM host `:191`); `108.2` has states 5-6 remaining and
 parent `108` closes only with it; the carry-forward set is live
 (CF-108-1/2/3, CF-76-1, CF-75-2/3/4/5/6, banked Minors/Nits through the
 108.1 REVIEW). NO `stop` file created.
+
+---
+
+## CI on the state-4 head (measured after the gate-record commit)
+
+Run **`31288147958`** on the full 40-char SHA
+`5767dfd95db9259317cd070fee2bbc0700937b9e` (the state-4 gate-record commit:
+PROGRESS.md state-4 section + the STATE.md advance to §5 state 5):
+
+- **Attempt 1: `success`** — no rerun needed. `build + test + lint` success
+  at **15** steps on a real runner (`runner_name` non-empty), fuzz success
+  at **13** steps. Whole-run conclusion **success**.
+- **CI test-count identity CONFIRMED:** the job log censuses
+  **164 `test result` lines** totalling **passed=2180, failed=0** — the
+  same identity as the state-3 baseline (run `31286236760` on `7eab102`)
+  and as this session's local sweep (`2174 + 6 = 2180`, the six local
+  REDs being the classified host-flake set that CI does not share).
+- Gate (b)'s CI leg is thereby closed on THIS session's own SHA, not
+  inherited: all 87 fixtures green in CI at the state-4 tree.
