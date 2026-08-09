@@ -117,3 +117,19 @@
   1-2); after `cargo fmt --all`: check clean, fixture still green
   (`1 passed`, 1.15s). Clippy exit 0, 1 `Checking` line.
 - **Commit:** `phase 108.2 task 4: fixture 0087 differential test + local green`
+
+## Task 5 — `BEHAVIOR_CONTRACT.md` `## Runtime` + admin row + stat mapping + fixture README
+
+- Three contract edits, all located BY TEXT: the `## Runtime` section
+  inserted immediately before `## xDS wire state machine`; the `/runtime`
+  row appended to `## Admin endpoint body shapes` after the
+  `/healthcheck/ok` row; the `**108.2 entries:**` three-row block appended
+  at the end of `## Stat-name mapping` (before its closing `---`). All three
+  texts transcribed verbatim from PLAN.md Task 5.
+- `tests/fixtures/0087-runtime-static-layer/README.md` created (the witness
+  ledger, the exclusion list, and the measurement provenance).
+- The fixture `0011` prose correction is RECORDED in the contract section
+  (fixture NOT edited — D-3.5).
+- **Insurance run:** `cargo test -p differential --test runtime_static_layer`
+  still `1 passed` after the docs-only edits.
+- **Commit:** `phase 108.2 task 5: BEHAVIOR_CONTRACT ## Runtime + fixture 0087 README`

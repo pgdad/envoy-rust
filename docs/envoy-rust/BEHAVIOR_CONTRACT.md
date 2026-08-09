@@ -1343,6 +1343,14 @@ encode-side behavior (cdn_loop is request-only).
 > time. When that lands, the paired allow-list entries drop together
 > and this paragraph is removed (no contract loosening).
 
+**108.2 entries:**
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `runtime.num_keys`, `runtime.num_layers` | value-exact | Gauges tracking the parsed config: flattened LEAF count (not declared top-level keys) and configured layer count. Deterministic on identical configs; fixture 0087 asserts `14`/`2` bilaterally. |
+| `runtime.load_success`, `runtime.override_dir_not_exists` | value-exact | Counters, `1` unconditionally at startup (`load_success` counts loads, not layers — measured `1` on a two-layer config). Real non-zero witnesses. |
+| `runtime.admin_overrides_active`, `runtime.deprecated_feature_seen_since_process_start`, `runtime.deprecated_feature_use`, `runtime.load_error`, `runtime.override_dir_exists` | value-exact (vacuous at 0) | `0` on every in-scope config (no admin layer, no deprecated-feature use, no disk layer). A differential `value: 0` assertion passes vacuously when the name is absent (`scrape_admin_stat` → `Ok(0)`); presence is pinned in-process by `envoy-bin::runtime_stats` tests. Names match one-to-one; kinds per upstream `# TYPE` lines (4 gauges / 5 counters). |
+
 ---
 
 ## Admin endpoint body shapes
@@ -1368,6 +1376,7 @@ encode-side behavior (cdn_loop is request-only).
 | `/drain_listeners` | POST | empty | Status 200; empty body (`content-length: 0`); effect-only endpoint. Invokes `DrainState::drain()`. Sticky — repeat POSTs are idempotent. Both proxies emit 200 OK on first AND subsequent POSTs. |
 | `/healthcheck/fail` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::fail_healthcheck()`. Flips `/ready` to 503 (per parent-08 SPEC §5.5 wire-state mapping); `/server_info.state` stays `"LIVE"` (server-state is independent of healthcheck-failure). |
 | `/healthcheck/ok` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::ok_healthcheck()`. Restores from `HealthcheckFailing` → `Live`. Sticky-drain: `/healthcheck/ok` AFTER `/drain_listeners` does NOT un-drain (the `HealthcheckFailing → Live` compare_exchange fails silently against the `Draining` state). |
+| `/runtime` | GET | JSON object | Top-level shape exactly `{ "entries": {...}, "layers": [...] }` (see `## Runtime`). Value-equal after canonical re-parse on identical configs — the fixture-0087 disposition is EMPTY allow-lists on both sides; upstream's per-request key-order shuffle is absorbed by `JsonShape`'s `serde_json` re-parse (`Map` is a `BTreeMap`; `preserve_order` enabled nowhere). Both sides pretty-print with no `content-length` (`transfer-encoding` handling is transport-level and not compared). POST → 405 `allow: GET` bilaterally. `/runtime_modify` is NOT served by envoy-rust (404) vs upstream POST-only (405 on GET) — recorded divergence CF-108-2, unwitnessed by any fixture. |
 
 ---
 
@@ -3149,6 +3158,84 @@ The same reasoning makes `content-length` value-exact for free, which is what pi
 > safety net that does not exist is worse than silence, because it stops the next reader looking.
 
 ---
+
+## Runtime
+
+> Authored at sub-phase 108.2 (phase-108 family opener; ADR-0171/0172/0173/0174).
+> Everything here is MEASURED against the pinned `envoyproxy/envoy:v1.33.0`
+> unless marked otherwise. The engine is `envoy_config::runtime` (108.1); the
+> observer is admin `GET /runtime` + the nine `runtime.*` stats (108.2).
+> Nothing READS the runtime store for behavior yet — the consumer slice
+> (`runtime_key` honoring, route `runtime_fraction`, RTDS) is future work,
+> which is why every landed "no runtime CONSUMER for this key" assertion
+> (incl. the test `runtime_key_is_rtds_inert`) stays true.
+
+**Layer grammar** (108.1): `layered_runtime.layers[]`, each with `name`
+(PGV min length 1) + exactly ONE of four oneof arms. Only `static_layer` is
+implemented; `disk_layer`/`rtds_layer`/`admin_layer` are declared and
+loudly rejected (CF-108-1, ADR-0173 DECISION 4 — a recorded reject-direction
+divergence; upstream accepts all three). Duplicate layer names reject
+bilaterally.
+
+**`GET /runtime`** — the eleventh admin endpoint, GET-only (POST → 405
+`allow: GET` on both sides). 200 `application/json`; body is exactly two
+top-level keys:
+
+| Shape rule | Measured behaviour |
+|---|---|
+| `entries` | object: flattened dotted key → `{"final_value": S, "layer_values": [S, …]}` — every value a STRING |
+| `layers` | array of layer NAMES, config order |
+| stringification | `true`→`"true"`, `42`→`"42"`, `-7`→`"-7"`, strings verbatim, `""` stays `""` |
+| floats | upstream preserves the RAW SOURCE TEXT (`1e6`→`"1e6"`, `1.50`→`"1.50"`, `.nan`→`".nan"` — 11 cells measured, ADR-0174); envoy-rust renders `f64` Display — divergent on every non-Display-stable spelling, RECORDED (CF-108-5 closed-as-recorded); fixtures use Display-stable spellings only (`1.5`) |
+| flattening | ARBITRARY depth; NO intermediate-map entries; `num_keys` counts flattened LEAVES |
+| slots | one `layer_values` slot per configured layer, `""` where the key is absent from that layer |
+| precedence | `final_value` = the last NON-EMPTY slot; an explicit `""` does NOT override and is wire-indistinguishable from absence |
+| absent vs empty | no block → `{"entries":{},"layers":[]}`; `layered_runtime: {}` or `{layers: []}` → ONE synthetic layer named `""` |
+| nondeterminism | upstream shuffles key order per request (measured: 8 GETs, 8 md5s, equal bytes); envoy-rust is BTreeMap-canonical; `BodyRule::JsonShape` re-parses both sides, so the comparison is order-insensitive |
+| query params | none exist; `?format=text` etc. silently ignored |
+| no pre-population | upstream does NOT surface its 89 built-in `envoy.reloadable_features.*` flags in `/runtime` (the pick-enabling measurement, ADR-0171 DECISION 3) |
+
+**The nine `runtime.*` stats** — registered unconditionally on both sides
+(all nine exist even with no `layered_runtime` block). Kinds per upstream's
+`/stats/prometheus` `# TYPE` lines: gauges `admin_overrides_active`,
+`deprecated_feature_seen_since_process_start`, `num_keys`, `num_layers`;
+counters `deprecated_feature_use`, `load_error`, `load_success`,
+`override_dir_exists`, `override_dir_not_exists`. Only `num_keys`/`num_layers`
+track config; `load_success` is `1` unconditionally (loads, not layers —
+measured `1` on a two-layer config) and `override_dir_not_exists` is `1`
+unconditionally; the other five are `0` on any in-scope config and are
+therefore VACUOUS as differential value assertions (`scrape_admin_stat`
+returns `Ok(0)` for an absent name) — their envoy-rust presence is pinned
+in-process (`envoy-bin::runtime_stats` tests).
+
+**Fixture `0011` prose correction (recorded here, fixture NOT edited —
+D-3.5):** `0011`'s `expectations.yaml:35` and `README.md:55` call the nine
+`runtime.*` stats "RTDS runtime layer. Deferred to the xDS family." As of
+108.2 they are neither deferred nor xDS-family — they are emitted by the
+static-layer runtime subsystem. The nine allow-list entries at
+`expectations.yaml:234-242` stay (the allow-list filters a set difference in
+the permissive direction; once both sides emit the names they leave the
+difference entirely, so the entries are inert-but-harmless). Deleting them is
+optional tightening for a session that legitimately touches `0011`.
+
+**Recorded divergences and NOT-MEASURED cells** (all excluded from fixture
+`0087`): CF-108-4 (unquoted `y`/`n`/`on`/`off` booleanize upstream — YAML
+1.1 — but not here; ADR-0173); CF-108-5 (float source-text preservation,
+above; also on the `/config_dump` cascade, where upstream emits float cells
+as SOURCE-TEXT STRINGS while envoy-rust emits JSON NUMBERS — pinned as ours
+by `config_dump_serializes_layered_runtime_positively`); non-finite floats
+(`.nan`/`.inf` boot clean both sides; upstream renders source text,
+envoy-rust would render `"NaN"`/`"inf"`; envoy-rust's own `Deserialize`
+rejects the JSON `null` its `Serialize` would emit — 108.1 REVIEW M-3,
+recorded); CF-108-3 (a nested map containing `numerator` is ONE
+protobuf-text-format key upstream, flattened here); CF-108-2
+(`/runtime_modify` upstream-only: POST-only, 405 on GET, 503 `No admin layer
+specified` without an admin layer; envoy-rust 404s it); NOT MEASURED
+upstream: a flattened-key collision inside one layer (`a: {b: 1}` + `a.b: 2`
+— envoy-rust: deterministic, dotted spelling wins by BTreeMap byte order,
+silently drops a value — 108.1 REVIEW M-1), an empty nested map as a value
+(M-7), empty or dot-bearing key SEGMENTS (N-5), an explicit-null
+`static_layer:` (N-4).
 
 ## xDS wire state machine
 
