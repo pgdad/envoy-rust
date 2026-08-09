@@ -9,6 +9,7 @@ mod argv;
 mod direct_response;
 mod echo;
 mod network_rbac;
+mod runtime_stats;
 mod tls_handler;
 
 fn main() -> std::process::ExitCode {
@@ -117,6 +118,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // when no HCM uses rds — the §5.2 inertness invariant).
     envoy_listener::register_rds_stats(&bootstrap, &registry)
         .context("registering http.*.rds.* stats")?;
+    // 108.2 D5: the nine runtime.* stats, registered UNCONDITIONALLY —
+    // upstream emits all nine even with no `layered_runtime` block (SPEC §2).
+    runtime_stats::register_runtime_stats(&bootstrap, &registry)
+        .context("registering runtime.* stats")?;
 
     // 08.2 D13b: construct the shared DrainState ONCE at startup. Cloned
     // into the admin handler (writer; for the 3 POST endpoints + /server_info

@@ -33,3 +33,27 @@
 - **Anchors:** re-derived by text pre-edit; `endpoint.rs` was 3091 lines at
   task start (identical to the plan's measurement — no drift since `ced6802`).
 - **Commit:** `phase 108.2 task 1: admin GET /runtime — the eleventh endpoint`
+
+## Task 2 — the nine `runtime.*` stats (envoy-bin)
+
+- **RED (verified, with a shape correction):** with
+  `crates/envoy-bin/src/runtime_stats.rs` created but NOT declared in
+  `main.rs`, `cargo test -p envoy-bin --bin envoy-bin runtime_stats` printed
+  `test result: ok. 0 passed; 0 failed; ... 37 filtered out` — NOT the plan's
+  predicted `E0583`: an undeclared `.rs` file is simply never compiled, so
+  there is no error, only the absence of the tests. Per the standing
+  `0 passed; N filtered out` trap this is a false GREEN by exit code and the
+  true RED by count: the two tests did not exist for the build.
+- **GREEN:** after `mod runtime_stats;` (following `mod network_rbac;`) and
+  the `register_runtime_stats(&bootstrap, &registry)` call directly after
+  `register_rds_stats` in `main.rs`:
+  `cargo test -p envoy-bin --bin envoy-bin runtime_stats` →
+  `test result: ok. 2 passed; 0 failed` (the plan's stated count).
+- Kinds pinned per DD-6 (4 gauges / 5 counters); both value tables asserted;
+  `num_keys` flattened-leaf semantics witnessed via `nested.deep` (4, not 3);
+  registration calls `RuntimeSnapshot::from_bootstrap` only (DD-2).
+- **Boundary gate:** fmt needed one reflow pass again (the `num_layers`
+  assert line in the loop — same formatting-only deviation class as Task 1);
+  then `cargo fmt --all -- --check` clean; clippy exit 0, 1 `Checking` line
+  (non-zero).
+- **Commit:** `phase 108.2 task 2: the nine runtime.* stats`
