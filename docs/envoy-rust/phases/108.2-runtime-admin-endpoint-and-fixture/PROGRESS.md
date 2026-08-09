@@ -57,3 +57,33 @@
   then `cargo fmt --all -- --check` clean; clippy exit 0, 1 `Checking` line
   (non-zero).
 - **Commit:** `phase 108.2 task 2: the nine runtime.* stats`
+
+## Task 3 — `expected_stats` harness extension + fixture `0087` data files
+
+- **RED (verified):** with the parse test
+  (`fixture_0087_expectations_parses_as_admin_scrape_with_expected_stats`)
+  inserted and the three fixture data files written,
+  `cargo test -p differential --lib fixture_0087` failed with exactly the
+  predicted `error[E0026]: variant 'Driver::AdminScrape' does not have a
+  field named 'expected_stats'`.
+- **GREEN:** after the four lib.rs edits — (a) the `#[serde(default)]`
+  `expected_stats: Vec<KeepAliveExpectedStat>` field, (b) the dispatch
+  destructure + pass-through, (c) the widened 8-arg `run_admin_scrape_arm`
+  with `#[allow(clippy::too_many_arguments)]` + justification (DD-7), (d)
+  the STEP 3.5 `assert_expected_stats_bilaterally` call between the scrape
+  loop and STEP 4 — `cargo test -p differential --lib` →
+  `test result: ok. 162 passed; 0 failed; 2 ignored`. **Count-mismatch
+  investigated and resolved:** the plan's "164" is the TOTAL (the 2 ignored
+  are pre-existing Docker-gated tests); measured baseline at the task-2
+  commit is `161 passed; 2 ignored` = 163 total, so the delta is exactly the
+  +1 new parse test (163 → 164 total). The new test passes
+  (`1 passed; 163 filtered out` on the name filter).
+- Fixture `0087` data files carry the plan's measured transcript verbatim:
+  14 entries (every scalar a quoted YAML string), `layers`
+  `["base_layer","override_layer"]`, nine `expected_stats` with exactly the
+  four non-zero witnesses first, subtree anchors at single-segment `entries`
+  / `layers` only (DD-8). `envoy-rust.yaml` uses the NAME-ONLY echo spelling
+  (DD-3); zero clusters, zero backends.
+- **Boundary gate:** fmt clean on first check (no reflow this time); clippy
+  exit 0, 1 `Checking` line (non-zero).
+- **Commit:** `phase 108.2 task 3: AdminScrape expected_stats + fixture 0087 data`

@@ -353,6 +353,18 @@ pub enum Driver {
         #[serde(default)]
         pre_requests: Vec<PreRequest>,
         scrapes: Vec<AdminScrapeCase>,
+        /// 108.2 D5: bilateral ABSOLUTE-value admin-stat assertions, run as
+        /// STEP 3.5 (after the scrape loop, before `post_admin_assertions`).
+        /// Reuses `KeepAliveExpectedStat` + `assert_expected_stats_bilaterally`
+        /// verbatim — each named stat must equal `value` on BOTH proxies.
+        /// Absolute (not ADR-0131 deltas) because `runtime.*` stats are set
+        /// once at startup and no readiness connect perturbs them. ⚠ The
+        /// vacuous-pass trap applies: `scrape_admin_stat` returns `Ok(0)` for
+        /// a name the proxy never registered, so a `value: 0` entry passes
+        /// even when the stat is ABSENT — only non-zero entries are real
+        /// witnesses, and fixture READMEs must say which is which.
+        #[serde(default)]
+        expected_stats: Vec<KeepAliveExpectedStat>,
         /// 08.2 Task 7 (D16): wire-level invariants verified AFTER the
         /// scrape loop. Today's only variant
         /// (`DataPlaneConnectionRefused`) probes a data-plane listener
@@ -4450,6 +4462,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             pre_admin_actions,
             pre_requests,
             scrapes,
+            expected_stats,
             post_admin_assertions,
         } => {
             run_admin_scrape_arm(
@@ -4459,6 +4472,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 pre_admin_actions,
                 pre_requests,
                 scrapes,
+                expected_stats,
                 post_admin_assertions,
             )
             .await?;
@@ -6688,6 +6702,11 @@ async fn run_http2_arm(
 
 /// `Driver::AdminScrape` arm of `run_fixture` — extracted verbatim (pure code
 /// motion; the arm-level rationale comments remain at the dispatch site).
+// The 108.2 expected_stats widening takes this to 8 args. Mirrors the
+// AdminHandler::new precedent: the params are the driver variant's own fields
+// threaded verbatim from the dispatch site, and a params struct would obscure
+// the field-to-arg correspondence the destructure makes obvious.
+#[allow(clippy::too_many_arguments)]
 async fn run_admin_scrape_arm(
     ctx: &FixtureCtx<'_>,
     upstream: upstream::UpstreamProxy,
@@ -6695,6 +6714,7 @@ async fn run_admin_scrape_arm(
     pre_admin_actions: &[AdminAction],
     pre_requests: &[PreRequest],
     scrapes: &[AdminScrapeCase],
+    expected_stats: &[KeepAliveExpectedStat],
     post_admin_assertions: &[AdminAssertion],
 ) -> Result<()> {
     let FixtureCtx {
@@ -6875,6 +6895,13 @@ async fn run_admin_scrape_arm(
     for (case, upstream_resp, subject_resp) in &results {
         assert_admin_scrape_case(case, upstream_resp, subject_resp)?;
     }
+
+    // STEP 3.5 (108.2 D5): bilateral absolute-value stat assertions. Runs
+    // after the scrape loop so a body-shape failure surfaces first (the
+    // richer diagnostic), and before the wire-level post_admin_assertions,
+    // preserving lock-in #18's temporal ordering for the existing steps.
+    assert_expected_stats_bilaterally(upstream_admin_addr, subject_admin_addr, expected_stats)
+        .await?;
 
     // STEP 4: post_admin_assertions — wire-level invariants
     // verified AFTER the scrape loop. Today's only variant
@@ -8897,6 +8924,51 @@ equivalence:
         let wire = b"3\r\nabc\r\n0\r\nTrailer-Name: value\r\n\r\n";
         let decoded = super::decode_chunked(wire).expect("trailer tolerated");
         assert_eq!(decoded, b"abc");
+    }
+
+    /// 108.2 D6: fixture 0087's expectations parse into the AdminScrape
+    /// shape, INCLUDING the new `expected_stats` field — two /runtime
+    /// scrapes (one `entries` subtree, one `layers`) and nine bilateral
+    /// stat assertions of which FOUR are non-zero witnesses.
+    #[test]
+    fn fixture_0087_expectations_parses_as_admin_scrape_with_expected_stats() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests/fixtures/0087-runtime-static-layer/expectations.yaml");
+        let e = load_expectations(&path).expect("parses");
+        match e.driver {
+            Driver::AdminScrape {
+                ref pre_admin_actions,
+                ref pre_requests,
+                ref scrapes,
+                ref expected_stats,
+                ref post_admin_assertions,
+            } => {
+                assert!(pre_admin_actions.is_empty());
+                assert!(pre_requests.is_empty());
+                assert!(post_admin_assertions.is_empty());
+                assert_eq!(scrapes.len(), 2, "two /runtime scrapes");
+                assert!(scrapes.iter().all(|s| s.path == "/runtime"));
+                assert_eq!(expected_stats.len(), 9, "all nine runtime.* stats");
+                let non_zero: Vec<&str> = expected_stats
+                    .iter()
+                    .filter(|s| s.value != 0)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                assert_eq!(
+                    non_zero,
+                    vec![
+                        "runtime.num_keys",
+                        "runtime.num_layers",
+                        "runtime.load_success",
+                        "runtime.override_dir_not_exists"
+                    ],
+                    "exactly the four real witnesses are non-zero"
+                );
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
     }
 
     #[test]

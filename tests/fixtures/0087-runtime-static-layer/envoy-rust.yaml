@@ -1,0 +1,65 @@
+# Sub-phase 108.2 fixture 0087 — the admin GET /runtime differential (D6).
+# Backend-free and CLUSTER-FREE: the echo listener exists only because
+# run_fixture's data-plane accept-ready wait needs a {{PORT}} listener
+# (fixture 0001's spelling); no traffic is ever driven at it.
+#
+# The layered_runtime block witnesses every measured /runtime rule
+# (BEHAVIOR_CONTRACT `## Runtime`): scalar stringification (bool, int,
+# negative int, float, string, quoted numeric string, empty string),
+# arbitrary-depth flattening to dotted keys, two-layer slot ordering, the
+# ""-absent slot marker, and last-NON-EMPTY-wins precedence.
+#
+# Deliberately ABSENT (all recorded, none witnessed here):
+#   - unquoted y/n/on/off values — CF-108-4 (YAML 1.1 vs 1.2 divergence);
+#   - floats whose source spelling differs from Rust f64 Display output
+#     (`1.0`, `1e6`, `-0.0`, `1e-7`, `.nan`, …) — upstream renders the raw
+#     SOURCE TEXT, envoy-rust renders f64 Display (CF-108-5, ADR-0174);
+#     `1.5` is spelling-stable and is the one float cell both sides agree on;
+#   - nested maps containing `numerator` — CF-108-3 (protobuf text-format);
+#   - the envoy.reloadable_features. prefix (non-fatal envoy_bug stderr).
+node:
+  id: envoy-rust-phase-108.2-fixture-0087
+  cluster: envoy-rust-phase-108.2
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: {{ADMIN_PORT}}
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {{PORT}}
+      filter_chains:
+        - filters:
+            # Name-only spelling, per the fixture-0001 envoy-rust precedent:
+            # envoy-rust's typed_config enum does not model the echo filter's
+            # @type; the name-only form selects the same built-in echo filter.
+            - name: envoy.filters.network.echo
+  clusters: []
+layered_runtime:
+  layers:
+    - name: base_layer
+      static_layer:
+        diff.bool.true.key: true
+        diff.bool.false.key: false
+        diff.int.key: 42
+        diff.negative.key: -7
+        diff.float.key: 1.5
+        diff.string.key: hello
+        diff.quoted.number.key: "42"
+        diff.empty.string.key: ""
+        diff.nested:
+          sub_key: v
+          deeper:
+            leaf: w
+        shared.key: from_base
+        only.in.base: base_val
+        empty.in.override: real_value
+    - name: override_layer
+      static_layer:
+        shared.key: from_override
+        only.in.override: over_val
+        empty.in.override: ""

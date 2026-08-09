@@ -1,0 +1,121 @@
+# Sub-phase 108.2 fixture 0087 — Driver::AdminScrape over GET /runtime (D6).
+#
+# TWO scrapes of the SAME path, because BodyRule::JsonShape permits only ONE
+# required_subtree per rule (tests/differential/src/lib.rs, JsonSubtreeRule):
+# scrape 1 anchors the whole `entries` object, scrape 2 anchors `layers`.
+# Both carry required_keys [entries, layers] and EMPTY per-side allow-lists —
+# the intent is that NOTHING needs allow-listing; if something does, that is
+# a finding, not a knob to turn (SPEC §1 D6).
+#
+# The expected values below are the MEASURED upstream response — taken
+# against envoyproxy/envoy:v1.33.0 (digest sha256:56da5afd…70c2) with THIS
+# fixture's exact layered_runtime block at the 108.2 state-2 PLAN-write
+# (2026-08-08; two scrapes, md5-distinct at identical 1508 bytes — the
+# per-request key-order shuffle JsonShape's canonical re-parse absorbs).
+# Every scalar is a YAML STRING here (quoted) because /runtime stringifies
+# every value; an unquoted 42 would YAML-parse as an integer and the
+# JsonShape expected-conversion would then compare JSON 42 against "42".
+#
+# ⚠ subtree paths are WALKED ON DOTS (walk_pointer): "entries" and "layers"
+# are single-segment and safe; a path pointing INTO an entry
+# ("entries.diff.int.key") would mis-walk the dotted KEY as five segments.
+# Never anchor a subtree below `entries`.
+driver:
+  kind: admin_scrape
+  pre_requests: []
+  scrapes:
+    # -------------------------------------------------------------------
+    # Scrape 1 — the whole `entries` object (all 14 flattened keys).
+    # -------------------------------------------------------------------
+    - path: /runtime
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["entries", "layers"]
+        required_subtree:
+          path: "entries"
+          expected:
+            diff.bool.true.key:
+              final_value: "true"
+              layer_values: ["true", ""]
+            diff.bool.false.key:
+              final_value: "false"
+              layer_values: ["false", ""]
+            diff.int.key:
+              final_value: "42"
+              layer_values: ["42", ""]
+            diff.negative.key:
+              final_value: "-7"
+              layer_values: ["-7", ""]
+            diff.float.key:
+              final_value: "1.5"
+              layer_values: ["1.5", ""]
+            diff.string.key:
+              final_value: "hello"
+              layer_values: ["hello", ""]
+            diff.quoted.number.key:
+              final_value: "42"
+              layer_values: ["42", ""]
+            diff.empty.string.key:
+              final_value: ""
+              layer_values: ["", ""]
+            diff.nested.sub_key:
+              final_value: "v"
+              layer_values: ["v", ""]
+            diff.nested.deeper.leaf:
+              final_value: "w"
+              layer_values: ["w", ""]
+            shared.key:
+              final_value: "from_override"
+              layer_values: ["from_base", "from_override"]
+            only.in.base:
+              final_value: "base_val"
+              layer_values: ["base_val", ""]
+            only.in.override:
+              final_value: "over_val"
+              layer_values: ["", "over_val"]
+            empty.in.override:
+              final_value: "real_value"
+              layer_values: ["real_value", ""]
+        allowlist_envoy_only_keys: []
+        allowlist_envoy_rust_only_keys: []
+        value_may_differ_keys: []
+    # -------------------------------------------------------------------
+    # Scrape 2 — the `layers` array (names in config order).
+    # -------------------------------------------------------------------
+    - path: /runtime
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["entries", "layers"]
+        required_subtree:
+          path: "layers"
+          expected: ["base_layer", "override_layer"]
+        allowlist_envoy_only_keys: []
+        allowlist_envoy_rust_only_keys: []
+        value_may_differ_keys: []
+  # ---------------------------------------------------------------------
+  # STEP 3.5 — the nine runtime.* stats, bilateral ABSOLUTE values
+  # (108.2 D5 harness extension; values MEASURED on this exact config).
+  #
+  # ⚠ WITNESS LEDGER (the scrape_admin_stat Ok(0) vacuous-pass rule,
+  # tests/differential/src/lib.rs:4504-4507): only the FOUR non-zero
+  # entries are real witnesses — num_keys (14 flattened leaves, NOT 13
+  # declared keys), num_layers (2), load_success (1 — loads, not layers),
+  # override_dir_not_exists (1, unconditional). The five value-0 entries
+  # pass vacuously if the name is absent; their PRESENCE on the envoy-rust
+  # side is pinned in-process by
+  # envoy-bin::runtime_stats::registers_all_nine_runtime_stats_with_measured_values_and_kinds.
+  # ---------------------------------------------------------------------
+  expected_stats:
+    - { name: "runtime.num_keys", value: 14 }
+    - { name: "runtime.num_layers", value: 2 }
+    - { name: "runtime.load_success", value: 1 }
+    - { name: "runtime.override_dir_not_exists", value: 1 }
+    - { name: "runtime.admin_overrides_active", value: 0 }
+    - { name: "runtime.deprecated_feature_seen_since_process_start", value: 0 }
+    - { name: "runtime.deprecated_feature_use", value: 0 }
+    - { name: "runtime.load_error", value: 0 }
+    - { name: "runtime.override_dir_exists", value: 0 }
