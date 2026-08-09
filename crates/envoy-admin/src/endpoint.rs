@@ -54,6 +54,16 @@ pub enum AdminEndpoint {
     /// land in §9 family). See BEHAVIOR_CONTRACT § "Admin endpoint body shapes".
     Listeners,
 
+    /// 108.2 D4: `GET /runtime` — the runtime snapshot the parsed bootstrap
+    /// implies, rendered as pretty JSON with exactly two top-level keys
+    /// (`entries`, `layers`) per upstream Envoy v1.33.0's admin runtime
+    /// surface (BEHAVIOR_CONTRACT `## Runtime`). Computed per request from
+    /// the handler's cached `Arc<Bootstrap>` via
+    /// `RuntimeSnapshot::from_bootstrap` — the documented entry point; the
+    /// renderer never calls `from_layers` directly, whose slot-count
+    /// invariant is unenforced on a `pub` API (108.1 REVIEW M-5).
+    Runtime,
+
     /// Phase 08.2 D9: `POST /drain_listeners` — invokes `DrainState::drain()`
     /// and returns 200 OK with an empty body. Effect-only endpoint: the
     /// listener accept loops observe the `drain_signal()` notify and start
@@ -107,6 +117,8 @@ impl AdminEndpoint {
             "/server_info" => Some(AdminEndpoint::ServerInfo),
             "/clusters" => Some(AdminEndpoint::Clusters),
             "/listeners" => Some(AdminEndpoint::Listeners),
+            // 108.2 D4 — the eleventh endpoint (the eighth GET).
+            "/runtime" => Some(AdminEndpoint::Runtime),
             // 08.2 D9 / D10 — three POST endpoints. Method-arm filtering
             // happens in `dispatch`; `from_path` resolves the path only.
             "/drain_listeners" => Some(AdminEndpoint::DrainListeners),
@@ -127,7 +139,8 @@ impl AdminEndpoint {
             | AdminEndpoint::ConfigDump
             | AdminEndpoint::ServerInfo
             | AdminEndpoint::Clusters
-            | AdminEndpoint::Listeners => "GET",
+            | AdminEndpoint::Listeners
+            | AdminEndpoint::Runtime => "GET",
             // 08.2 D9 / D10 — effect-only POST endpoints.
             AdminEndpoint::DrainListeners
             | AdminEndpoint::HealthcheckFail
@@ -172,6 +185,8 @@ impl AdminEndpoint {
             AdminEndpoint::ServerInfo => render_server_info(handler),
             AdminEndpoint::Clusters => render_clusters(handler),
             AdminEndpoint::Listeners => render_listeners(handler),
+            // 108.2 D4: the runtime snapshot renderer.
+            AdminEndpoint::Runtime => render_runtime(handler),
             // 08.2 D9 / D10 — the three POST endpoints route through the
             // `handler.drain()` accessor (08.2 D13b, Task 4). Each render fn
             // invokes the corresponding `DrainState` method (drain /
@@ -928,6 +943,60 @@ pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_
         let _ = writeln!(&mut body, "{name}::{addr}");
     }
     text_200_no_len(body)
+}
+
+/// 108.2 D4: top-level body for `GET /runtime` — exactly two keys, `entries`
+/// then `layers`, mirroring upstream Envoy v1.33.0's measured shape
+/// (BEHAVIOR_CONTRACT `## Runtime`). OWNED rather than lifetime-borrowed
+/// (contrast [`ConfigDumpBody`]): the snapshot is COMPUTED per request from
+/// the cached bootstrap, so there is nothing to borrow from.
+#[derive(Serialize)]
+struct RuntimeBody {
+    entries: std::collections::BTreeMap<String, RuntimeEntryBody>,
+    layers: Vec<String>,
+}
+
+/// 108.2 D4: one `entries` value — `final_value` (the last NON-EMPTY layer
+/// slot) plus `layer_values` (one slot per configured layer, `""` where the
+/// key is absent from that layer). Field semantics live on
+/// `envoy_config::runtime::RuntimeEntry`; this struct exists only to give the
+/// wire shape a `Serialize` derive without imposing serde on `envoy-config`'s
+/// engine type.
+#[derive(Serialize)]
+struct RuntimeEntryBody {
+    final_value: String,
+    layer_values: Vec<String>,
+}
+
+/// 108.2 D4: render `GET /runtime`. Delegates the entire snapshot semantics
+/// (arbitrary-depth flattening, stringification, slot layout, last-non-empty
+/// precedence, the absent-vs-empty distinction) to
+/// `RuntimeSnapshot::from_bootstrap` — the 108.1-landed, reviewed entry
+/// point — and hands the result to the shared [`json_pretty_200`] helper, so
+/// the response plumbing (pretty JSON, `application/json`, no
+/// `content-length`) is byte-identical to `/config_dump`'s and
+/// `/server_info`'s. Key order on the wire is `BTreeMap`-canonical; the
+/// differential comparison is order-insensitive either way
+/// (`BodyRule::JsonShape` re-parses both sides).
+fn render_runtime(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    let snapshot = envoy_config::runtime::RuntimeSnapshot::from_bootstrap(handler.bootstrap());
+    let body = RuntimeBody {
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|(key, entry)| {
+                (
+                    key,
+                    RuntimeEntryBody {
+                        final_value: entry.final_value,
+                        layer_values: entry.layer_values,
+                    },
+                )
+            })
+            .collect(),
+        layers: snapshot.layer_names,
+    };
+    json_pretty_200(&body, "RuntimeBody")
 }
 
 /// Phase 08.2 D9: `/drain_listeners` POST endpoint. Invokes `DrainState::drain()`
@@ -2363,6 +2432,11 @@ mod dispatch_tests {
             AdminEndpoint::dispatch("GET", "/listeners"),
             Dispatch::Endpoint(AdminEndpoint::Listeners)
         ));
+        // 108.2 D4 adds the eleventh endpoint (the eighth GET).
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/runtime"),
+            Dispatch::Endpoint(AdminEndpoint::Runtime)
+        ));
     }
 
     #[test]
@@ -2422,6 +2496,8 @@ mod dispatch_tests {
         assert_eq!(AdminEndpoint::ServerInfo.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::Clusters.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::Listeners.allowed_method(), "GET");
+        // 108.2 D4.
+        assert_eq!(AdminEndpoint::Runtime.allowed_method(), "GET");
     }
 
     #[test]
@@ -2937,6 +3013,51 @@ pub(crate) mod test_support {
     pub(crate) const TINY_BOOTSTRAP: &str =
         "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
 
+    /// 108.2 D4: the SPEC §2 N-6/N-7 two-layer transcript, MEASURED against
+    /// envoyproxy/envoy:v1.33.0 (the four-cell precedence table also pinned
+    /// at `envoy_config::runtime`'s `from_layers_reproduces_the_measured_two_layer_transcript`).
+    pub(crate) const RUNTIME_TWO_LAYER_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+static_resources:
+  listeners: []
+  clusters: []
+layered_runtime:
+  layers:
+    - name: base_layer
+      static_layer:
+        shared.key: from_base
+        only.in.base: base_val
+        empty.in.override: real_value
+    - name: override_layer
+      static_layer:
+        shared.key: from_override
+        only.in.override: over_val
+        empty.in.override: \"\"
+";
+
+    /// 108.2: one layer carrying every scalar shape, for the POSITIVE
+    /// `/config_dump` serialization pin (108.1 REVIEW M-6 closure).
+    pub(crate) const RUNTIME_SCALARS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+static_resources:
+  listeners: []
+  clusters: []
+layered_runtime:
+  layers:
+    - name: scalars
+      static_layer:
+        k.bool: true
+        k.int: 42
+        k.float: 1.5
+        k.str: hello
+        k.nested:
+          leaf: v
+";
+
     /// Bootstrap WITH `dynamic_resources.cds_config` configured (triggers the
     /// conditional ClustersConfigDump emission; the fixture-0026 regression
     /// shape). The `path` is never read at render time — loaded resources
@@ -3087,5 +3208,163 @@ load_assignment:
             Some(drain),
             Vec::new(),
         )
+    }
+}
+
+/// 108.2 D4/D5: `GET /runtime` renderer + dispatch coverage, and the
+/// 108.1 REVIEW M-6 closure (the positive `/config_dump` serialization pin
+/// for `layered_runtime`). Mirrors the per-endpoint test-module convention
+/// (`config_dump_tests`, `server_info_tests`, …).
+#[cfg(test)]
+mod runtime_tests {
+    use super::test_support::{
+        RUNTIME_SCALARS_BOOTSTRAP, RUNTIME_TWO_LAYER_BOOTSTRAP, TINY_BOOTSTRAP, dump_value,
+        handler_with_bootstrap,
+    };
+    use super::{AdminEndpoint, Dispatch};
+
+    // ------------------------------------------------------------------
+    // 108.2 D4: `GET /runtime` renderer tests.
+    // ------------------------------------------------------------------
+
+    /// SPEC §2 (MEASURED): a bootstrap with NO `layered_runtime` block
+    /// renders exactly `{"entries":{},"layers":[]}` — zero layers, zero
+    /// keys — with the shared pretty-JSON response shape (`application/json`,
+    /// `reason: None`, deliberately NO `content-length`).
+    #[test]
+    fn runtime_renders_empty_snapshot_for_absent_block() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::Runtime.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.reason, None);
+        assert!(
+            resp.headers
+                .contains(&("content-type".to_string(), "application/json".to_string())),
+            "content-type application/json: {:?}",
+            resp.headers
+        );
+        assert!(
+            !resp
+                .headers
+                .iter()
+                .any(|(name, _)| name == "content-length"),
+            "the pretty-JSON admin shape deliberately carries no content-length"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).expect("valid JSON");
+        assert_eq!(v, serde_json::json!({"entries": {}, "layers": []}));
+    }
+
+    /// SPEC §2 N-8 (MEASURED): `layered_runtime: {}` synthesizes ONE layer
+    /// named the EMPTY STRING — `{"entries":{},"layers":[""]}` — which is
+    /// NOT the absent-block shape. Collapsing the two mints a divergence.
+    #[test]
+    fn runtime_renders_one_empty_string_layer_for_an_empty_block() {
+        let yaml = format!("{TINY_BOOTSTRAP}layered_runtime: {{}}\n");
+        let handler = handler_with_bootstrap(&yaml);
+        let resp = AdminEndpoint::Runtime.render_with(&handler);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).expect("valid JSON");
+        assert_eq!(v, serde_json::json!({"entries": {}, "layers": [""]}));
+    }
+
+    /// SPEC §2 N-6/N-7 (MEASURED): the four-cell two-layer precedence
+    /// transcript, rendered through the WHOLE `/runtime` cascade — slot
+    /// order follows config order, `""` marks absence, and `final_value` is
+    /// the last NON-EMPTY slot (`empty.in.override` is the cell "last wins"
+    /// would get wrong).
+    #[test]
+    fn runtime_renders_the_measured_two_layer_snapshot() {
+        let handler = handler_with_bootstrap(RUNTIME_TWO_LAYER_BOOTSTRAP);
+        let resp = AdminEndpoint::Runtime.render_with(&handler);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).expect("valid JSON");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "entries": {
+                    "empty.in.override": {
+                        "final_value": "real_value",
+                        "layer_values": ["real_value", ""]
+                    },
+                    "only.in.base": {
+                        "final_value": "base_val",
+                        "layer_values": ["base_val", ""]
+                    },
+                    "only.in.override": {
+                        "final_value": "over_val",
+                        "layer_values": ["", "over_val"]
+                    },
+                    "shared.key": {
+                        "final_value": "from_override",
+                        "layer_values": ["from_base", "from_override"]
+                    }
+                },
+                "layers": ["base_layer", "override_layer"]
+            })
+        );
+    }
+
+    /// SPEC §2 (MEASURED): `/runtime` has no `format` query parameter —
+    /// `?format=text` and any unknown parameter are ignored and the path
+    /// still dispatches (the established `from_path` query-strip).
+    #[test]
+    fn runtime_query_string_still_dispatches() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/runtime?format=text"),
+            Dispatch::Endpoint(AdminEndpoint::Runtime)
+        ));
+    }
+
+    /// CF-108-2 boundary: upstream serves `POST /runtime_modify` (405 on
+    /// GET); envoy-rust has no `/runtime_modify` at all (404, unwitnessed
+    /// here — recorded divergence). `/runtime` itself is GET-only on BOTH
+    /// sides: POST answers 405 with `allow: GET`.
+    #[test]
+    fn runtime_post_is_method_not_allowed() {
+        assert_eq!(
+            AdminEndpoint::dispatch("POST", "/runtime"),
+            Dispatch::MethodNotAllowed { allow: "GET" }
+        );
+        assert_eq!(
+            AdminEndpoint::dispatch("GET", "/runtime_modify"),
+            Dispatch::NotFound
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 108.1 REVIEW M-6 closure: the POSITIVE `/config_dump` serialization
+    // pin for `layered_runtime`.
+    // ------------------------------------------------------------------
+
+    /// A `#[serde(skip)]` on `Bootstrap.layered_runtime` — or a broken
+    /// `Serialize` arm on `RuntimeValue` — would survive every 108.1 test
+    /// (they pin only the ABSENT direction). This test pins the PRESENT
+    /// direction through the real `/config_dump` cascade. The float cell
+    /// pins our JSON-NUMBER shape deliberately: upstream `/config_dump`
+    /// emits float cells as SOURCE-TEXT STRINGS (`"1.5"`), a RECORDED
+    /// divergence (108.1 REVIEW M-4; ADR-0174) that fixture 0087 does not
+    /// scrape and no fixture witnesses.
+    #[test]
+    fn config_dump_serializes_layered_runtime_positively() {
+        let v = dump_value(&handler_with_bootstrap(RUNTIME_SCALARS_BOOTSTRAP));
+        let sl = &v["configs"][0]["bootstrap"]["layered_runtime"]["layers"][0]["static_layer"];
+        assert_eq!(sl["k.bool"], serde_json::json!(true));
+        assert_eq!(sl["k.int"], serde_json::json!(42));
+        assert_eq!(sl["k.float"], serde_json::json!(1.5));
+        assert_eq!(sl["k.str"], serde_json::json!("hello"));
+        assert_eq!(sl["k.nested"]["leaf"], serde_json::json!("v"));
+        assert_eq!(
+            v["configs"][0]["bootstrap"]["layered_runtime"]["layers"][0]["name"],
+            serde_json::json!("scalars")
+        );
+
+        // The ABSENT direction stays absent (`skip_serializing_if`) — the
+        // property that keeps the 86 pre-existing `/config_dump` fixtures
+        // byte-identical.
+        let v = dump_value(&handler_with_bootstrap(TINY_BOOTSTRAP));
+        assert!(
+            v["configs"][0]["bootstrap"]
+                .get("layered_runtime")
+                .is_none(),
+            "absent layered_runtime must not serialize"
+        );
     }
 }
