@@ -133,3 +133,42 @@
 - **Insurance run:** `cargo test -p differential --test runtime_static_layer`
   still `1 passed` after the docs-only edits.
 - **Commit:** `phase 108.2 task 5: BEHAVIOR_CONTRACT ## Runtime + fixture 0087 README`
+
+## Task 6 — gate-(d) record + the full regression sweep
+
+- **Gate (d), RECORDED EXPLICITLY (SPEC §9(d) — record, don't silently
+  skip):** this slice adds NO fuzz target and NO corpus seed, and `ci.yml`
+  needs NO new step. The slice touches no parser: the `layered_runtime`
+  parser landed (and was fuzz-covered) in 108.1; this slice only renders and
+  counts the already-parsed store. The pre-existing `parse_bootstrap`
+  short-budget CI run covers the only parser surface adjacent to this work.
+- **Full workspace sweep** (`cargo build --workspace --all-targets` clean,
+  then `cargo test --workspace --no-fail-fast`, full redirect to
+  `sweep-108-2.log`, censused by the `---- <name> stdout ----` markers and
+  the `(ok|FAILED)` awk-4/6 recipe):
+  - **binaries 164** (163 + `runtime_static_layer`) — matches the plan.
+  - **passed=2174, failed=6, passed+failed=2180 = 2170 (CI baseline, run
+    31260569093 on `ced6802`) + 10 new** (6 envoy-admin + 2 envoy-bin +
+    1 differential-lib + 1 fixture binary) — the identity HOLDS.
+  - Failures: the deterministic five-member host-flake core (ADR-0164:
+    `access_log_h2_rcd_upstream_reset`, `access_log_h2_uc_upstream_reset`,
+    `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset`,
+    `admin_config_dump_server_info`) plus ONE tail member:
+    `admin_ready_returns_200_post_migration` (`WouldBlock` driving `/ready`
+    — an `admin_*` name overlapping this phase's surface, so it was
+    classified by TEXT and ISOLATION per the standing rule: the text is a
+    socket readiness race, not a `/runtime` failure, and it PASSES in
+    isolation 2/2 — the open-ended startup-race tail signature, NOT a
+    regression).
+  - `runtime_static_layer` (fixture 0087) passed INSIDE the full parallel
+    sweep — no parallel-load flake exposure observed for the new fixture.
+- **§6.1 mid-execution trigger, final adjudication: DID NOT FIRE** — no
+  task's sub-steps exceeded ~10 items; net non-docs LoC measured
+  `git diff --numstat d1760b0 HEAD -- . ':(exclude)docs/'` = **854** (+855
+  −1) vs the ~1500 gate (the plan projected ≈905 — the README came in at 66
+  lines vs the ~115 estimate).
+- **No ADR fired this session** — no mid-execution decision arose: the plan
+  was executed as written; the deviations (rustfmt reflows ×3 tasks, the
+  Task-2 RED shape, the Task-3 count-vs-total reading) are recorded per-task
+  above and none changed the plan's shape. Ledger head stays **ADR-0174**.
+- **Commit:** `phase 108.2 task 6: gate-(d) record + regression sweep`
