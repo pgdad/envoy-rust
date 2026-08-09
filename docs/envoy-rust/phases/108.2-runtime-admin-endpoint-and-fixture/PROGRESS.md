@@ -388,3 +388,25 @@ PROGRESS.md state-4 section + the STATE.md advance to §5 state 5):
   REDs being the classified host-flake set that CI does not share).
 - Gate (b)'s CI leg is thereby closed on THIS session's own SHA, not
   inherited: all 87 fixtures green in CI at the state-4 tree.
+
+---
+
+## CI on the state-5 head (measured after the review commit)
+
+Run **`31308413275`** on the full 40-char SHA
+`483ea2f667b35a6d3ff42141f7ed3fd35ef58d6c` (the state-5 review commit:
+REVIEW.md APPROVED + the STATE.md advance to §5 state 6):
+
+- **Attempt 1: `success`** — no rerun needed. `build + test + lint` success
+  at **15** steps on a real runner (`GitHub Actions 1000005134`), fuzz
+  success at **13** steps (`GitHub Actions 1000005135`). Whole-run
+  conclusion **success**.
+- **CI test-count identity CONFIRMED:** the build-job log censuses
+  **164 `test result` lines** totalling **passed=2180, failed=0** — the
+  same identity as the state-3/state-4 baselines and the independent
+  re-census of the reviewed HEAD (run `31288441844` on `42fb9d7…`) that
+  `REVIEW.md` §0.3 records.
+- Method note, banked in the traps ledger: the jobs-API log archive's
+  numeric file prefixes are NOT stable across runs (this run's `0_` file
+  is the FUZZ job where prior runs' `0_` was build+test) — select the job
+  log by NAME, never by prefix.
