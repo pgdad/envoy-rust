@@ -172,3 +172,33 @@
   Task-2 RED shape, the Task-3 count-vs-total reading) are recorded per-task
   above and none changed the plan's shape. Ledger head stays **ADR-0174**.
 - **Commit:** `phase 108.2 task 6: gate-(d) record + regression sweep`
+
+---
+
+## CI on the state-3 head (measured after the STATE.md-advance commit)
+
+**This is a MEASUREMENT, not a gate adjudication.** State 4 owns §7.5 and must
+re-confirm it rather than inherit this.
+
+Run **`31286236760`** on the full 40-char SHA
+`7eab102a935433362651615ec8b6fd4f9220a32e` (the STATE.md-advance commit,
+carrying all six task commits):
+
+- **Attempt 1: `failure`** — real runners, steps **15**/**13**; fmt, clippy,
+  build, h2spec install, image pre-pull all green; the `test` step failed on
+  ONE test: `xds_rds_hot_reload::name_absent_reload_warm_rejects_and_keeps_last_good`
+  panicking at `envoy-bin HCM ready: Os { code: 111, kind: ConnectionRefused }`
+  — the CF-75-6 ephemeral-port fatal-startup STARTUP-RACE family signature
+  (reserve-then-drop `reserve_port()`), in a test file this session never
+  touched. Classified by TEXT (an HCM readiness connect, nothing
+  runtime/admin-surface) and dispatched per the standing rule: RERUN THE SAME
+  SHA. The fuzz job succeeded on attempt 1 (13 steps).
+- **Attempt 2 (rerun --failed, same SHA): `success`** — `build + test + lint`
+  success at **15** steps on a real runner (`runner_name` non-empty), fuzz
+  success stands at **13** steps. Whole-run conclusion **success**.
+- **CI test-count identity CONFIRMED:** the rerun log censuses
+  **164 `test result` lines** (binaries 163 → 164) totalling
+  **passed=2180, failed=0** — exactly `2170 (baseline run 31260569093 on
+  ced6802) + 10 new #[test] fns` (6 envoy-admin + 2 envoy-bin +
+  1 differential-lib + 1 fixture binary). The state-4 baseline identity is
+  therefore **2180 on run `31286236760` (`7eab102`)**.
