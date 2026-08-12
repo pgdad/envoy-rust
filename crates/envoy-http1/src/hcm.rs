@@ -882,7 +882,7 @@ async fn serve_connection(
         // no longer split the two views). `route_snapshot` lives to the
         // build_response_in call site in this same loop iteration.
         let route_snapshot = config.current_route_config();
-        let matched_route = resolve_route_in(&route_snapshot, &req);
+        let matched_route = resolve_route_in(&route_snapshot, &req, &config.runtime);
         pipeline.apply_route_config(matched_route.as_ref().map(ResolvedRoute::route));
 
         // 25.1 D1: read the Content-Length-delimited request body into `req.body`
@@ -926,7 +926,7 @@ async fn serve_connection(
                 } else {
                     // Reuse the per-request snapshot taken at resolve time —
                     // no second RwLock read, identical table to `resolve_route_in`.
-                    build_response_in(&route_snapshot, &mut req, close)
+                    build_response_in(&route_snapshot, &mut req, close, &config.runtime)
                 };
                 RequestPath::Match(outcome)
             }
@@ -2014,7 +2014,7 @@ pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute>
     // single snapshot into both `resolve_route_in` and `build_response_in`
     // (see the handler) — one lock read per request, and resolve/build share
     // the exact same table even if the RDS watcher swaps concurrently.
-    resolve_route_in(&config.current_route_config(), req)
+    resolve_route_in(&config.current_route_config(), req, &config.runtime)
 }
 
 /// Snapshot-threaded core of [`resolve_route`]: the caller owns the §5.4
@@ -2025,6 +2025,7 @@ pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute>
 pub(crate) fn resolve_route_in(
     route_config: &Arc<RouteConfiguration>,
     req: &Request,
+    runtime: &envoy_config::runtime::RuntimeSnapshot,
 ) -> Option<ResolvedRoute> {
     let host_raw = find_header(&req.headers, headers::HOST).filter(|h| !h.is_empty())?;
     let host = strip_port(host_raw);
@@ -2035,7 +2036,7 @@ pub(crate) fn resolve_route_in(
     let route_idx = route_config.virtual_hosts[vh_idx]
         .routes
         .iter()
-        .position(|r| route_matches(r, &req.path, &req.headers))?;
+        .position(|r| route_matches(r, &req.path, &req.headers, runtime))?;
     // Cheap refcount bump: the returned `ResolvedRoute` keeps the snapshot
     // alive for the caller's borrow, identical to the pre-snapshot-sharing
     // behaviour.
@@ -2052,7 +2053,7 @@ pub fn build_response(config: &HCMConfig, req: &mut Request, close: bool) -> Bui
     // handler comment) — behaviour-identical for a stable table, and strictly
     // MORE consistent under a concurrent RDS swap (resolve + build can no
     // longer land on two different tables).
-    build_response_in(&config.current_route_config(), req, close)
+    build_response_in(&config.current_route_config(), req, close, &config.runtime)
 }
 
 /// Snapshot-threaded core of [`build_response`]: routes against the caller's
@@ -2062,6 +2063,7 @@ pub(crate) fn build_response_in(
     route_config: &Arc<RouteConfiguration>,
     req: &mut Request,
     close: bool,
+    runtime: &envoy_config::runtime::RuntimeSnapshot,
 ) -> BuildOutcome {
     // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
     // Treat empty Host (`Host: \r\n`) as the same RFC violation as missing Host.
@@ -2101,7 +2103,7 @@ pub(crate) fn build_response_in(
     let route = match vh
         .routes
         .iter()
-        .find(|r| route_matches(r, &req.path, &req.headers))
+        .find(|r| route_matches(r, &req.path, &req.headers, runtime))
     {
         Some(r) => r,
         None => {
@@ -2189,7 +2191,22 @@ fn vh_matches(vh: &VirtualHost, host: &str) -> bool {
     })
 }
 
-fn route_matches(r: &Route, path: &str, headers: &[(String, String)]) -> bool {
+fn route_matches(
+    r: &Route,
+    path: &str,
+    headers: &[(String, String)],
+    runtime: &envoy_config::runtime::RuntimeSnapshot,
+) -> bool {
+    // 109.1: the runtime_fraction gate, evaluated FIRST (upstream AND-combines
+    // it with the path/header criteria; order is behavior-neutral for an AND).
+    // `route_fraction_passes` is infallible — every nondeterministic input is
+    // boot-fatal at all three validation paths, so the request path never
+    // sees an error.
+    if let Some(rf) = &r.r#match.runtime_fraction
+        && !runtime.route_fraction_passes(rf)
+    {
+        return false;
+    }
     let path_match = match (&r.r#match.prefix, &r.r#match.path) {
         (Some(p), None) => path.starts_with(p),
         (None, Some(p)) => path == p,
@@ -9934,6 +9951,140 @@ static_resources:
         }
     }
 
+    /// 109.1 Task 6 helper: an HCMConfig whose table carries a GATED
+    /// direct_response route (`/`-prefix, runtime_fraction default 100/HUNDRED
+    /// consulting gate.k, body "gated") ABOVE a bare catch-all
+    /// (`/`-prefix, body "fallback"), with `runtime` built from one code-built
+    /// layer mapping gate.k to `value` (None = empty snapshot). Values are
+    /// `RuntimeValue::Str` — a string "0" stringifies to the same final_value
+    /// as the yaml integer 0 (envoy-http1 has no serde_yaml dev-dep).
+    async fn gated_route_test_config(value: Option<&str>) -> HCMConfig {
+        let runtime = match value {
+            None => Arc::new(RuntimeSnapshot::default()),
+            Some(v) => {
+                let mut static_layer = std::collections::BTreeMap::new();
+                static_layer.insert(
+                    "gate.k".to_string(),
+                    envoy_config::RuntimeValue::Str(v.to_string()),
+                );
+                let layer = envoy_config::RuntimeLayer {
+                    name: "l".to_string(),
+                    static_layer: Some(static_layer),
+                    ..Default::default()
+                };
+                Arc::new(RuntimeSnapshot::from_layers(
+                    vec!["l".to_string()],
+                    &[layer],
+                ))
+            }
+        };
+        let mk_route = |name: &str, rf, body: &str| Route {
+            name: name.to_string(),
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![],
+                runtime_fraction: rf,
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some(body.to_string()),
+                },
+            }),
+            typed_per_filter_config: Default::default(),
+        };
+        HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![
+                        mk_route(
+                            "gated",
+                            Some(envoy_config::RuntimeFractionalPercent {
+                                default_value: envoy_config::FractionalPercent {
+                                    numerator: 100,
+                                    denominator: envoy_config::DenominatorType::Hundred,
+                                },
+                                runtime_key: Some("gate.k".to_string()),
+                            }),
+                            "gated",
+                        ),
+                        mk_route("fallback", None, "fallback"),
+                    ],
+                }],
+            })),
+            runtime,
+        }
+    }
+
+    /// The gate at call site 1 of 2 (`resolve_route_in`, the `.position(`):
+    /// key "0" -> the gated route NEVER matches; first-match-wins falls to the
+    /// catch-all. Key "100" -> the gated route matches.
+    #[tokio::test]
+    async fn resolve_route_honors_runtime_fraction_gate() {
+        let config = gated_route_test_config(Some("0")).await;
+        let req = make_req("/x", "localhost");
+        let r = resolve_route(&config, &req).expect("catch-all resolves");
+        assert!(
+            matches!(&r.route().action, RouteAction::DirectResponse(dr) if dr.body.inline_string.as_deref() == Some("fallback")),
+            "key 0 must skip the gated route"
+        );
+        let config = gated_route_test_config(Some("100")).await;
+        let r = resolve_route(&config, &req).expect("gated resolves");
+        assert!(
+            matches!(&r.route().action, RouteAction::DirectResponse(dr) if dr.body.inline_string.as_deref() == Some("gated")),
+            "key 100 must match the gated route"
+        );
+        // Absent key -> default_value (numerator 100) -> gated.
+        let config = gated_route_test_config(None).await;
+        let r = resolve_route(&config, &req).expect("resolves");
+        assert!(
+            matches!(&r.route().action, RouteAction::DirectResponse(dr) if dr.body.inline_string.as_deref() == Some("gated")),
+            "absent key must honor default_value 100"
+        );
+    }
+
+    /// The gate at call site 2 of 2 (`build_response_in`, the `.find(`):
+    /// the SAME table through build_response — the documented resolve/build
+    /// equivalence (hcm.rs "the 30-fixture regression-equivalence guarantee")
+    /// now includes the gate.
+    #[tokio::test]
+    async fn build_response_honors_runtime_fraction_gate() {
+        let config = gated_route_test_config(Some("0")).await;
+        let mut req = make_req("/x", "localhost");
+        match build_response(&config, &mut req, true) {
+            BuildOutcome::Synth(resp, _) => assert_eq!(
+                std::str::from_utf8(&resp.body).unwrap(),
+                "fallback",
+                "key 0 must serve the catch-all body"
+            ),
+            _other => panic!("expected BuildOutcome::Synth"),
+        }
+        let config = gated_route_test_config(Some("100")).await;
+        let mut req = make_req("/x", "localhost");
+        match build_response(&config, &mut req, true) {
+            BuildOutcome::Synth(resp, _) => assert_eq!(
+                std::str::from_utf8(&resp.body).unwrap(),
+                "gated",
+                "key 100 must serve the gated body"
+            ),
+            _other => panic!("expected BuildOutcome::Synth"),
+        }
+    }
+
     /// 30 Task 6: a config with a `RouteAction::Route` whose `action` carries an
     /// optional `metadata_match`. Used to assert `build_response` surfaces the
     /// route's `envoy.lb` map into `BuildOutcome::Proxy.subset_match`.
@@ -10495,33 +10646,33 @@ static_resources:
         // D1: a VALUE matcher + invert + ABSENT must NOT match the route.
         let r = route(HeaderMatcherMode::ExactMatch("v".into()), true);
         assert!(
-            route_matches(&r, "/x", &present),
+            route_matches(&r, "/x", &present, &RuntimeSnapshot::default()),
             "value+invert, present non-matching value → route matches"
         );
         assert!(
-            !route_matches(&r, "/x", &absent),
+            !route_matches(&r, "/x", &absent, &RuntimeSnapshot::default()),
             "value+invert, ABSENT → route must NOT match (D1 / CF-72-1 closed)"
         );
 
         // D2: a plain, NON-inverted `present_match: false` requires ABSENCE.
         let r = route(HeaderMatcherMode::PresentMatch(false), false);
         assert!(
-            !route_matches(&r, "/x", &present),
+            !route_matches(&r, "/x", &present, &RuntimeSnapshot::default()),
             "present_match:false with the header PRESENT → route must NOT match (D2)"
         );
         assert!(
-            route_matches(&r, "/x", &absent),
+            route_matches(&r, "/x", &absent, &RuntimeSnapshot::default()),
             "present_match:false with the header ABSENT → route matches"
         );
 
         // P1 THE GUARD: `present_match: true` + invert + ABSENT still matches.
         let r = route(HeaderMatcherMode::PresentMatch(true), true);
         assert!(
-            route_matches(&r, "/x", &absent),
+            route_matches(&r, "/x", &absent, &RuntimeSnapshot::default()),
             "present_match:true+invert, ABSENT → route STILL matches (P1 parity)"
         );
         assert!(
-            !route_matches(&r, "/x", &present),
+            !route_matches(&r, "/x", &present, &RuntimeSnapshot::default()),
             "present_match:true+invert, PRESENT → route does not match"
         );
     }

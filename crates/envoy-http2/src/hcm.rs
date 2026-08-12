@@ -1321,6 +1321,107 @@ mod tests {
         }
     }
 
+    /// 109.1: H2 inherits the runtime_fraction gate through the SHARED
+    /// resolver with ZERO H2 edits — `resolve_route`'s public signature is
+    /// unchanged and the gate lives inside it. Key "0" in the snapshot skips
+    /// the gated route for an H2-resolved request exactly as for H1.
+    #[tokio::test]
+    async fn h2_inherits_runtime_fraction_gate_via_shared_resolver() {
+        // The synth_h2_hcm_config shape with TWO direct_response routes — a
+        // gated "/"-prefix (consulting gate.k, body "gated") ABOVE a bare
+        // catch-all (body "fallback").
+        let mk_route = |rf, body: &str| Route {
+            name: String::new(),
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![],
+                runtime_fraction: rf,
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some(body.to_string()),
+                },
+            }),
+            typed_per_filter_config: Default::default(),
+        };
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![
+                        mk_route(
+                            Some(envoy_config::RuntimeFractionalPercent {
+                                default_value: envoy_config::FractionalPercent {
+                                    numerator: 100,
+                                    denominator: envoy_config::DenominatorType::Hundred,
+                                },
+                                runtime_key: Some("gate.k".to_string()),
+                            }),
+                            "gated",
+                        ),
+                        mk_route(None, "fallback"),
+                    ],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        // A one-layer snapshot mapping gate.k -> "0" (code-built; envoy-http2
+        // has no serde_yaml dev-dep).
+        let mut static_layer = std::collections::BTreeMap::new();
+        static_layer.insert(
+            "gate.k".to_string(),
+            envoy_config::RuntimeValue::Str("0".to_string()),
+        );
+        let layer = envoy_config::RuntimeLayer {
+            name: "l".to_string(),
+            static_layer: Some(static_layer),
+            ..Default::default()
+        };
+        let runtime = Arc::new(RuntimeSnapshot::from_layers(
+            vec!["l".to_string()],
+            &[layer],
+        ));
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let inner = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None, runtime)
+                .await
+                .expect("build"),
+        );
+        // The EXACT call H2 production makes (this file, the text
+        // `envoy_http1::hcm::resolve_route(&config.inner, &envoy_req)`).
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            version: envoy_http1::HttpVersion::Http11,
+            headers: vec![("host".to_string(), "localhost".to_string())],
+            bytes_consumed: 0,
+            body: None,
+        };
+        let r = envoy_http1::hcm::resolve_route(&inner, &req).expect("resolves");
+        assert!(
+            matches!(&r.route().action,
+                envoy_config::RouteAction::DirectResponse(dr)
+                    if dr.body.inline_string.as_deref() == Some("fallback")),
+            "H2's resolver call must honor the gate (key 0 -> catch-all)"
+        );
+    }
+
     /// Build a minimal HCM config with a single VH + single direct_response
     /// route (status 200, body "ok\n"). Used by most tests below.
     async fn synth_h2_hcm_config() -> Arc<Http1HCMConfig> {
