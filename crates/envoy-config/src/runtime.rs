@@ -7,11 +7,14 @@
 //! follows the landed `matcher.rs` precedent, where the `HeaderMatcher` schema
 //! sits in `bootstrap.rs` and the matching engine sits in its own module.
 //!
-//! **Nothing reads this store yet.** 108.1 builds the PRODUCER; sibling 108.2
-//! adds the admin `GET /runtime` endpoint and the nine `runtime.*` stats that
-//! observe it. This slice deliberately wires NEITHER the `RuntimeUInt32`
-//! (`status_code_filter`) NOR the `RuntimeFractionalPercent` (CSRF) consumer, so
-//! every existing "no runtime subsystem" assertion in the tree stays true.
+//! **The route `runtime_fraction` consumer is live as of 109.1** — the store's
+//! first behavioral reader (`RuntimeSnapshot::route_fraction_gate`, evaluated
+//! inside `envoy-http1`'s `route_matches`). 108.1 built the PRODUCER; 108.2
+//! added the admin `GET /runtime` endpoint and the nine `runtime.*` stats that
+//! observe it. The `RuntimeUInt32` (`status_code_filter`) and
+//! `RuntimeFractionalPercent` (CSRF) consumers and RTDS remain unbuilt, so
+//! every remaining "no runtime CONSUMER for this key" assertion in the tree
+//! (incl. the test `runtime_key_is_rtds_inert`) stays true.
 //!
 //! All ordering is `BTreeMap`-canonical. That is not incidental: sibling 108.2's
 //! differential fixture rests on `serde_json::Map` being a `BTreeMap` (the

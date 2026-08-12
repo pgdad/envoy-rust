@@ -14,7 +14,12 @@
 //! stays `1` on a TWO-layer config — it counts loads, not layers); the other
 //! five are `0` on any in-scope config. Values are set ONCE here — nothing
 //! mutates the snapshot after startup in this slice (no RTDS, no
-//! `/runtime_modify`, no override directory).
+//! `/runtime_modify`, no override directory). As of 109.1 the route
+//! `runtime_fraction` consumer READS the boot snapshot for behavior
+//! (`RuntimeSnapshot::route_fraction_gate` inside `route_matches`); the
+//! `RuntimeUInt32` (`status_code_filter`) and CSRF consumers and RTDS remain
+//! unbuilt, so every remaining "no runtime CONSUMER for this key" assertion
+//! stays true.
 
 use envoy_config::Bootstrap;
 use envoy_config::runtime::RuntimeSnapshot;

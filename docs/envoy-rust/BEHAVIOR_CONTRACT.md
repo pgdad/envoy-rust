@@ -3165,10 +3165,11 @@ The same reasoning makes `content-length` value-exact for free, which is what pi
 > Everything here is MEASURED against the pinned `envoyproxy/envoy:v1.33.0`
 > unless marked otherwise. The engine is `envoy_config::runtime` (108.1); the
 > observer is admin `GET /runtime` + the nine `runtime.*` stats (108.2).
-> Nothing READS the runtime store for behavior yet — the consumer slice
-> (`runtime_key` honoring, route `runtime_fraction`, RTDS) is future work,
-> which is why every landed "no runtime CONSUMER for this key" assertion
-> (incl. the test `runtime_key_is_rtds_inert`) stays true.
+> The route `runtime_fraction` consumer is live as of 109.1
+> (`RuntimeSnapshot::route_fraction_gate`, evaluated inside `route_matches`);
+> the `RuntimeUInt32` (`status_code_filter`) and CSRF consumers and RTDS
+> remain unbuilt, which is why every remaining "no runtime CONSUMER for this
+> key" assertion (incl. the test `runtime_key_is_rtds_inert`) stays true.
 
 **Layer grammar** (108.1): `layered_runtime.layers[]`, each with `name`
 (PGV min length 1) + exactly ONE of four oneof arms. Only `static_layer` is
