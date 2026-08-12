@@ -57,6 +57,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     envoy_config::load_dynamic_resources(&mut bootstrap)?;
     let bootstrap = std::sync::Arc::new(bootstrap);
 
+    // 109.1: the boot runtime snapshot, built ONCE and Arc-shared into every
+    // HCMConfig (route runtime_fraction gates read it; admin /runtime keeps
+    // its own per-request rebuild, deliberately untouched).
+    let runtime_snapshot = std::sync::Arc::new(
+        envoy_config::runtime::RuntimeSnapshot::from_bootstrap(&bootstrap),
+    );
+
     // Phase 08.1 D13a: capture the process-start `Instant` once at startup
     // so the admin `/server_info` renderer (Task 6) can compute uptime as
     // `Instant::now().duration_since(start_instant)`. Mirrors the pre-task
@@ -482,6 +489,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                                             std::sync::Arc::clone(&cluster_mgr),
                                             std::sync::Arc::clone(&registry),
                                             None, // the uring worker keeps its own per-worker pool
+                                            std::sync::Arc::clone(&runtime_snapshot),
                                         )
                                         .await?,
                                     );
@@ -543,6 +551,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                                         std::sync::Arc::clone(&cluster_mgr),
                                         std::sync::Arc::clone(&registry),
                                         Some(worker_pool_mgr),
+                                        std::sync::Arc::clone(&runtime_snapshot),
                                     )
                                     .await?,
                                 );
@@ -620,6 +629,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                                 std::sync::Arc::clone(&cluster_mgr),
                                 std::sync::Arc::clone(&registry),
                                 Some(std::sync::Arc::clone(&pool_mgr)),
+                                std::sync::Arc::clone(&runtime_snapshot),
                             )
                             .await?,
                         );

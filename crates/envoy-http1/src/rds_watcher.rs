@@ -251,6 +251,7 @@ mod tests {
     use crate::hcm::HCMStats;
     use envoy_cluster::xds_watch::POLL_INTERVAL;
     use envoy_config::RouteConfiguration;
+    use envoy_config::runtime::RuntimeSnapshot;
     use std::sync::RwLock;
     use std::time::Duration;
 
@@ -355,6 +356,7 @@ static_resources:
                 validate_clusters: None,
                 virtual_hosts: vec![],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         // Seed the rds.* counters at the post-initial-load `1/1/0/0/1` state, so
         // a successful reload moves them to `2/2/0/0/2` (the §6.2 expectation).
@@ -720,6 +722,7 @@ static_resources:
                 validate_clusters: None,
                 virtual_hosts: vec![],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 

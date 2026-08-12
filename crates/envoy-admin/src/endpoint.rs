@@ -2031,6 +2031,7 @@ mod routes_config_dump_tests {
                 Arc::new(ClusterManager::empty()),
                 registry,
                 None,
+                Arc::new(envoy_config::runtime::RuntimeSnapshot::default()),
             )
             .await
             .expect("HCMConfig::from_config"),

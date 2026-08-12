@@ -174,6 +174,14 @@ pub struct HCMConfig {
     /// the proxy arm falls back to a per-call `Client::connect`, preserving
     /// every pre-13.1 HCM unit test without a pool dependency.
     pub pool_mgr: Option<Arc<crate::pool::H1PoolManager>>,
+    /// 109.1 (ADR-0176 D4): the boot runtime snapshot, built ONCE per proxy
+    /// boot (`RuntimeSnapshot::from_bootstrap` in envoy-bin) and shared by
+    /// Arc-clone. Read by `route_matches` to evaluate
+    /// `RouteMatch.runtime_fraction` gates; `RuntimeSnapshot::default()` (the
+    /// empty snapshot) makes every lookup fall back to `default_value`, which
+    /// is exactly the no-`layered_runtime` semantics — the right value for
+    /// test literals.
+    pub runtime: Arc<envoy_config::runtime::RuntimeSnapshot>,
 }
 
 impl HCMConfig {
@@ -182,6 +190,7 @@ impl HCMConfig {
         cluster_mgr: Arc<envoy_cluster::ClusterManager>,
         registry: Arc<envoy_stats::StatsRegistry>,
         pool_mgr: Option<Arc<crate::pool::H1PoolManager>>,
+        runtime: Arc<envoy_config::runtime::RuntimeSnapshot>,
     ) -> Result<Self, Http1Error> {
         // The validator (envoy-config Task 2) has already enforced shape.
         // This constructor is `Result<>` for forward-compat with 04.3's
@@ -246,6 +255,7 @@ impl HCMConfig {
             access_log: access_log_sinks,
             filter_pipeline,
             pool_mgr,
+            runtime,
         })
     }
 
@@ -2505,6 +2515,7 @@ pub(crate) fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envoy_config::runtime::RuntimeSnapshot;
     use envoy_config::{DataSource, HashPolicyHeader, LbMetadata, RouteAction_Route, RouteMatch};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2978,6 +2989,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -3129,6 +3141,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: foo.example.com:8080\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -3195,6 +3208,7 @@ static_resources:
                     ],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -3254,6 +3268,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         // Host doesn't match any VH → 404.
         let req = b"GET / HTTP/1.1\r\nHost: other.example.com\r\nConnection: close\r\n\r\n";
@@ -3330,6 +3345,7 @@ static_resources:
                     routes,
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -3901,6 +3917,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -4621,9 +4638,15 @@ static_resources:
             }],
         };
         let hcm_config = Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry), None)
-                .await
-                .expect("HCMConfig builds"),
+            HCMConfig::from_config(
+                &envoy_cfg,
+                cluster_mgr,
+                Arc::clone(&registry),
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCMConfig builds"),
         );
 
         // Re-register the counter to capture the same Arc the HCM holds.
@@ -4694,9 +4717,15 @@ static_resources:
             }],
         };
         let hcm_config = Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry), None)
-                .await
-                .expect("HCMConfig builds"),
+            HCMConfig::from_config(
+                &envoy_cfg,
+                cluster_mgr,
+                Arc::clone(&registry),
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCMConfig builds"),
         );
         (hcm_config, registry)
     }
@@ -4779,9 +4808,15 @@ static_resources:
             }],
         };
         Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
-                .await
-                .expect("HCMConfig builds"),
+            HCMConfig::from_config(
+                &envoy_cfg,
+                cluster_mgr,
+                registry,
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCMConfig builds"),
         )
     }
 
@@ -4925,9 +4960,15 @@ static_resources:
             }],
         };
         Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
-                .await
-                .expect("HCMConfig builds"),
+            HCMConfig::from_config(
+                &envoy_cfg,
+                cluster_mgr,
+                registry,
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCMConfig builds"),
         )
     }
 
@@ -5416,9 +5457,15 @@ static_resources:
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let cluster_mgr = cluster_mgr_empty().await;
         let config = Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
-                .await
-                .expect("HCMConfig builds"),
+            HCMConfig::from_config(
+                &envoy_cfg,
+                cluster_mgr,
+                registry,
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCMConfig builds"),
         );
 
         // Three requests, all → 200. Only the first carries the matching header.
@@ -6017,6 +6064,7 @@ static_resources:
                         }],
                     }],
                 })),
+                runtime: Arc::new(RuntimeSnapshot::default()),
             });
             let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
             let _ = drive(config, req).await;
@@ -6093,6 +6141,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let _ = drive(config, req).await;
@@ -6165,6 +6214,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
         let _ = drive(config, req).await;
@@ -6303,6 +6353,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -6509,6 +6560,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         (config, registry)
     }
@@ -6705,9 +6757,15 @@ static_resources:
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let cluster_mgr = cluster_mgr_empty().await;
         let envoy_cfg = task6_envoy_hcm_config();
-        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
-            .await
-            .expect("HCMConfig::from_config succeeds with single Router");
+        let hcm_cfg = HCMConfig::from_config(
+            &envoy_cfg,
+            cluster_mgr,
+            registry,
+            None,
+            Arc::new(RuntimeSnapshot::default()),
+        )
+        .await
+        .expect("HCMConfig::from_config succeeds with single Router");
         // No public accessor to inspect filters.len(); verify via clone shape.
         let _cloned: envoy_filter::FilterPipeline = (*hcm_cfg.filter_pipeline).clone();
     }
@@ -6723,7 +6781,14 @@ static_resources:
         let cluster_mgr = cluster_mgr_empty().await;
         let mut envoy_cfg = task6_envoy_hcm_config();
         envoy_cfg.http_filters.clear();
-        let result = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None).await;
+        let result = HCMConfig::from_config(
+            &envoy_cfg,
+            cluster_mgr,
+            registry,
+            None,
+            Arc::new(RuntimeSnapshot::default()),
+        )
+        .await;
         match result {
             Err(Http1Error::FilterPipeline(envoy_filter::FilterError::EmptyChain)) => {}
             other => panic!("expected FilterPipeline(EmptyChain), got {other:?}"),
@@ -6743,9 +6808,15 @@ static_resources:
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let cluster_mgr = cluster_mgr_empty().await;
         let envoy_cfg = task6_envoy_hcm_config();
-        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
-            .await
-            .expect("HCMConfig::from_config succeeds with single Router");
+        let hcm_cfg = HCMConfig::from_config(
+            &envoy_cfg,
+            cluster_mgr,
+            registry,
+            None,
+            Arc::new(RuntimeSnapshot::default()),
+        )
+        .await
+        .expect("HCMConfig::from_config succeeds with single Router");
         let arc1 = Arc::clone(&hcm_cfg.filter_pipeline);
         let arc2 = Arc::clone(&hcm_cfg.filter_pipeline);
         assert!(Arc::strong_count(&arc1) >= 2);
@@ -6800,6 +6871,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -6897,6 +6969,7 @@ static_resources:
                     routes: vec![matcher_route],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -6952,6 +7025,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -7241,6 +7315,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let _ = drive(config, req).await;
@@ -7360,6 +7435,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7452,6 +7528,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7582,6 +7659,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7673,6 +7751,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET /nomatch HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7767,6 +7846,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: nomatch.test\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7855,6 +7935,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET /nomatch HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -7939,6 +8020,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: nomatch.test\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -8044,6 +8126,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nx-tier: prod\r\nConnection: close\r\n\r\n";
         let _ = drive(config, req).await;
@@ -8167,6 +8250,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
 
         // Re-register the shared cx_total handle for assertion.
@@ -8357,6 +8441,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
 
         // Re-register the SHARED cx_active handle for assertion.
@@ -8484,6 +8569,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         })
     }
 
@@ -9127,6 +9213,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9219,6 +9306,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9298,6 +9386,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9367,6 +9456,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9444,6 +9534,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9536,6 +9627,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9632,6 +9724,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         });
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -9820,6 +9913,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         }
     }
 
@@ -9877,6 +9971,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         }
     }
 
@@ -9912,6 +10007,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         }
     }
 
@@ -9999,6 +10095,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         }
     }
 
@@ -10147,6 +10244,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         };
         let req = make_req("/other", "localhost");
         assert!(
@@ -10192,6 +10290,7 @@ static_resources:
                     }],
                 }],
             })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
         };
         let req = make_req("/foo", "myhost:8080");
         let route = resolve_route(&config, &req).expect("port-stripped host must match");
