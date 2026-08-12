@@ -2901,6 +2901,14 @@ pub struct RouteMatch {
     pub path: Option<String>,
     #[serde(default)]
     pub headers: Vec<HeaderMatcher>,
+    /// 109.1 (ADR-0176): optional runtime-keyed fractional gate. Reuses the
+    /// CSRF wire type `RuntimeFractionalPercent`. The gate is evaluated by
+    /// `RuntimeSnapshot::route_fraction_gate` (the SPEC §1.3 cascade) and is
+    /// deterministic-only: every nondeterministic input is boot-fatal
+    /// (CF-109-1/2). Present inside `jwt_authn.rules[].match` it is boot-fatal
+    /// (CF-109-3) — the hand-copied jwt matcher never reads it.
+    #[serde(default)]
+    pub runtime_fraction: Option<RuntimeFractionalPercent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -20239,6 +20247,7 @@ admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
                         prefix: Some("/".to_string()),
                         path: None,
                         headers: vec![],
+                        runtime_fraction: None,
                     },
                     requires: crate::JwtRequirement {
                         provider_name: "nope".to_string(),
@@ -20298,6 +20307,7 @@ admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
                         prefix: Some("/".to_string()),
                         path: None,
                         headers: vec![],
+                        runtime_fraction: None,
                     },
                     requires: crate::JwtRequirement {
                         provider_name: "p1".to_string(),
@@ -20305,6 +20315,42 @@ admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
                 }],
             };
             assert!(validate_jwt_authn_config(&cfg, "l0").is_ok());
+        }
+
+        /// 109.1 Task 2: `match.runtime_fraction` parses (accept direction), stays
+        /// optional, and deny_unknown_fields still rejects a misspelling.
+        #[test]
+        fn route_match_runtime_fraction_parses_and_stays_optional() {
+            let m: crate::RouteMatch = serde_yaml::from_str(
+                r#"
+prefix: "/gated"
+runtime_fraction:
+  default_value: { numerator: 100, denominator: HUNDRED }
+  runtime_key: gate.k
+"#,
+            )
+            .expect("runtime_fraction must parse");
+            let rf = m.runtime_fraction.expect("field present");
+            assert_eq!(rf.default_value.numerator, 100);
+            assert_eq!(rf.runtime_key.as_deref(), Some("gate.k"));
+
+            // runtime_key stays optional inside the block.
+            let m: crate::RouteMatch = serde_yaml::from_str(
+                "path: \"/x\"\nruntime_fraction:\n  default_value: { numerator: 0 }\n",
+            )
+            .expect("keyless runtime_fraction must parse");
+            assert!(m.runtime_fraction.unwrap().runtime_key.is_none());
+
+            // Absent field → None (100 existing literals rely on this default).
+            let m: crate::RouteMatch = serde_yaml::from_str("prefix: \"/\"\n").expect("bare match");
+            assert!(m.runtime_fraction.is_none());
+
+            // deny_unknown_fields is retained: a misspelling stays boot-fatal.
+            assert!(
+                serde_yaml::from_str::<crate::RouteMatch>("prefix: \"/\"\nruntime_fractoin: {}\n")
+                    .is_err(),
+                "unknown fields must still reject"
+            );
         }
     }
 

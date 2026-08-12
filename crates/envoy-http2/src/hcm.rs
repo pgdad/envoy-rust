@@ -1343,6 +1343,7 @@ mod tests {
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -1497,6 +1498,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -1806,7 +1808,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
-                        },
+                         runtime_fraction: None, },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
                             body: DataSource {
@@ -1920,7 +1922,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
-                        },
+                         runtime_fraction: None, },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
                             body: DataSource {
@@ -2018,6 +2020,7 @@ static_resources:
                                 prefix: Some("/".to_string()),
                                 path: None,
                                 headers: vec![],
+                                runtime_fraction: None,
                             },
                             action: RouteAction::DirectResponse(DirectResponse {
                                 status: 200,
@@ -2039,6 +2042,7 @@ static_resources:
                                 prefix: Some("/".to_string()),
                                 path: None,
                                 headers: vec![],
+                                runtime_fraction: None,
                             },
                             action: RouteAction::DirectResponse(DirectResponse {
                                 status: 200,
@@ -2448,6 +2452,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -2618,6 +2623,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "budget_cluster".to_string(),
@@ -2800,6 +2806,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -2886,6 +2893,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -3058,6 +3066,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "subset_cluster".to_string(),
@@ -3169,6 +3178,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "subset_cluster".to_string(),
@@ -3276,6 +3286,7 @@ static_resources:
                             prefix: Some("/specific".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -3376,6 +3387,7 @@ static_resources:
                                 prefix: Some("/ok".to_string()),
                                 path: None,
                                 headers: vec![],
+                                runtime_fraction: None,
                             },
                             action: RouteAction::DirectResponse(DirectResponse {
                                 status: 200,
@@ -3392,6 +3404,7 @@ static_resources:
                                 prefix: Some("/err".to_string()),
                                 path: None,
                                 headers: vec![],
+                                runtime_fraction: None,
                             },
                             action: RouteAction::DirectResponse(DirectResponse {
                                 status: 503,
@@ -3497,6 +3510,7 @@ static_resources:
                             prefix: Some("/err".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 503,
@@ -3608,6 +3622,7 @@ static_resources:
                             prefix: None,
                             path: Some("/x".to_string()),
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -3755,6 +3770,7 @@ static_resources:
                             prefix: None,
                             path: Some("/x".to_string()),
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -3935,6 +3951,7 @@ static_resources:
                             prefix: Some("/specific".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -4024,6 +4041,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -4123,6 +4141,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -4260,6 +4279,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -4347,6 +4367,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -4742,6 +4763,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: route_status,
@@ -4813,6 +4835,7 @@ static_resources:
                                 mode: HeaderMatcherMode::ExactMatch("seen".to_string()),
                                 invert_match: false,
                             }],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -4892,6 +4915,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
@@ -5099,6 +5123,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -5412,6 +5437,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -5617,6 +5643,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -5855,6 +5882,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -5944,6 +5972,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
@@ -6539,6 +6568,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: envoy_config::RouteAction::DirectResponse(
                             envoy_config::DirectResponse {
@@ -6663,6 +6693,7 @@ static_resources:
                             prefix: Some("/".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: envoy_config::RouteAction::DirectResponse(
                             envoy_config::DirectResponse {
@@ -6752,6 +6783,7 @@ static_resources:
                         mode,
                         invert_match: invert,
                     }],
+                    runtime_fraction: None,
                 },
                 action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
                     status: 200,
@@ -6768,6 +6800,7 @@ static_resources:
                     prefix: Some("/".to_string()),
                     path: None,
                     headers: vec![],
+                    runtime_fraction: None,
                 },
                 action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
                     status: 200,
@@ -6878,6 +6911,7 @@ static_resources:
                             prefix: Some("/a-host".to_string()),
                             path: None,
                             headers: vec![],
+                            runtime_fraction: None,
                         },
                         action: RouteAction::Redirect(rd),
                         typed_per_filter_config: Default::default(),

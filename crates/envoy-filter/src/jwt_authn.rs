@@ -280,6 +280,7 @@ mod tests {
                     prefix: Some(rule_prefix.to_string()),
                     path: None,
                     headers: vec![],
+                    runtime_fraction: None,
                 },
                 requires: envoy_config::JwtRequirement {
                     provider_name: "prov".to_string(),
@@ -612,6 +613,7 @@ mod tests {
                         mode: HeaderMatcherMode::ExactMatch("yes".to_string()),
                         invert_match: false,
                     }],
+                    runtime_fraction: None,
                 },
                 requires: envoy_config::JwtRequirement {
                     provider_name: "prov".to_string(),
@@ -692,6 +694,7 @@ mod tests {
                                 mode,
                                 invert_match: invert,
                             }],
+                            runtime_fraction: None,
                         },
                         requires: envoy_config::JwtRequirement {
                             provider_name: "prov".to_string(),

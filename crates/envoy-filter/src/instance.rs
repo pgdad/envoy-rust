@@ -295,6 +295,7 @@ mod tests {
                     prefix: Some("/".to_string()),
                     path: None,
                     headers: vec![],
+                    runtime_fraction: None,
                 },
                 requires: envoy_config::JwtRequirement {
                     provider_name: "provider1".to_string(),

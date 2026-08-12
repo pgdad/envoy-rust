@@ -140,6 +140,7 @@ pub(crate) fn test_route_with_pfc_map(
             prefix: Some("/".to_string()),
             path: None,
             headers: vec![],
+            runtime_fraction: None,
         },
         action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
             status: 200,

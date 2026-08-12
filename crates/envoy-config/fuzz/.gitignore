@@ -64,5 +64,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/metadata_filter.yaml
 !corpus/parse_bootstrap/route_redirect_action.yaml
 !corpus/parse_bootstrap/layered_runtime.yaml
+!corpus/parse_bootstrap/runtime_fraction_route.yaml
 artifacts/
 target/
