@@ -3698,6 +3698,11 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
         validate_layered_runtime(lr)?;
     }
 
+    // 109.1: the boot runtime snapshot, built once for the whole validation
+    // walk. `from_bootstrap` is total; validators never mutate
+    // `layered_runtime`, so the snapshot stays accurate across the walk.
+    let runtime_snapshot = crate::runtime::RuntimeSnapshot::from_bootstrap(bootstrap);
+
     // 18 D1/D3: while CDS is configured-but-unloaded, cluster-reference checks
     // DEFER (the references may resolve against the CDS file once
     // load_dynamic_resources runs). Captured here as a `bool` before the
@@ -3923,6 +3928,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             chain_has_tls,
                             &listener.name,
                             defer_cluster_refs,
+                            &runtime_snapshot,
                         )?;
                     }
                     crate::DIRECT_RESPONSE_FILTER => {
@@ -4234,6 +4240,7 @@ fn validate_hcm(
     chain_has_tls: bool,
     listener_name: &str,
     defer_cluster_refs: bool,
+    runtime: &crate::runtime::RuntimeSnapshot,
 ) -> Result<(), crate::ConfigError> {
     // codec_type: AUTO, HTTP1, and HTTP2 are runtime-supported. HTTP3 is
     // rejected pending future work. HTTP2 over TLS is rejected separately
@@ -4314,6 +4321,7 @@ fn validate_hcm(
         for r in &mut vh.routes {
             // RouteMatch: exactly one of {prefix, path} is Some.
             validate_route_match_cardinality(r.r#match.prefix.is_some(), r.r#match.path.is_some())?;
+            validate_route_runtime_fraction(&r.r#match, runtime, listener_name, &r.name)?;
             // 04.3: dispatch on the action variant. DirectResponse keeps its
             // 04.1 status-range + body-shape checks. The Route(_) arm has no
             // validator obligation in Task 1; Task 2 wires UnknownCluster.
@@ -4805,6 +4813,14 @@ pub(crate) fn validate_jwt_authn_config(
             rule.r#match.prefix.is_some(),
             rule.r#match.path.is_some(),
         )?;
+        // 109.1 (CF-109-3): the hand-copied jwt matcher never evaluates
+        // runtime gates — a present runtime_fraction here would be silently
+        // inert, the exact ADR-0049 divergence class. Boot-fatal instead.
+        if rule.r#match.runtime_fraction.is_some() {
+            return Err(crate::ConfigError::UnsupportedRuntimeFractionInJwtRule {
+                listener: listener_name.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -4823,6 +4839,53 @@ fn validate_route_match_cardinality(
         (false, false) => Err(crate::ConfigError::UnsupportedRouteMatcher {
             matcher: "neither prefix nor path is set",
         }),
+    }
+}
+
+/// 109.1: validate a route's optional `runtime_fraction` against the boot
+/// runtime snapshot, mapping the lookup's error classes onto boot-fatal
+/// `ConfigError`s. Shared by all THREE validation paths: boot `validate_hcm`,
+/// post-merge `load_dynamic_resources` → `validate()`, and RDS reload
+/// `reparse_and_select_route_config` (which passes the rds file path as
+/// `listener` context, the `validate_redirect_oneofs` precedent).
+pub(crate) fn validate_route_runtime_fraction(
+    m: &crate::RouteMatch,
+    runtime: &crate::runtime::RuntimeSnapshot,
+    listener: &str,
+    route: &str,
+) -> Result<(), crate::ConfigError> {
+    use crate::runtime::FractionGateError;
+    let Some(rf) = &m.runtime_fraction else {
+        return Ok(());
+    };
+    match runtime.route_fraction_gate(rf) {
+        Ok(_) => Ok(()),
+        Err(FractionGateError::NondeterministicValue { key, value }) => Err(
+            crate::ConfigError::UnsupportedNonDeterministicRuntimeFraction {
+                listener: listener.to_string(),
+                route: route.to_string(),
+                key,
+                value,
+            },
+        ),
+        Err(FractionGateError::MapShapedKey { key }) => {
+            Err(crate::ConfigError::UnsupportedMapShapedRuntimeKey {
+                listener: listener.to_string(),
+                route: route.to_string(),
+                key,
+            })
+        }
+        Err(FractionGateError::NondeterministicDefault {
+            numerator,
+            denominator,
+        }) => Err(
+            crate::ConfigError::UnsupportedNonDeterministicRuntimeFractionDefault {
+                listener: listener.to_string(),
+                route: route.to_string(),
+                numerator,
+                denominator,
+            },
+        ),
     }
 }
 
@@ -12030,6 +12093,63 @@ dynamic_resources:
         assert_eq!(b.dynamic_listeners.as_ref().unwrap().len(), 1);
         assert_eq!(b.all_listeners().count(), 1);
         assert_eq!(b.all_listeners().next().unwrap().name, "lds_listener");
+    }
+
+    /// 109.1 Task 3, path 2 of 3: an LDS-delivered listener carrying a
+    /// nondeterministic runtime_fraction is rejected by the post-merge
+    /// validate() — same validator, same snapshot, defer-then-revalidate.
+    /// The consulted key `gate.k: 50` lives in the STATIC bootstrap's
+    /// `layered_runtime`; the gated route arrives only via the LDS file, so
+    /// boot-time parse_bootstrap (zero listeners) accepts and the POST-MERGE
+    /// re-validation is the path that must reject.
+    #[test]
+    fn load_dynamic_resources_rejects_lds_delivered_nondeterministic_runtime_fraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        let lds_yaml = r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: lds_listener
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 10000 }
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: ingress_http
+        codec_type: HTTP1
+        route_config:
+          name: rc
+          validate_clusters: false
+          virtual_hosts:
+          - name: vh
+            domains: ["*"]
+            routes:
+            - match:
+                prefix: "/gated"
+                runtime_fraction:
+                  default_value: { numerator: 100, denominator: HUNDRED }
+                  runtime_key: gate.k
+              route: { cluster: static_c }
+        http_filters:
+        - name: envoy.filters.http.router
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+        std::fs::write(&lds_path, lds_yaml).unwrap();
+        // bootstrap_yaml_with_lds + a layered_runtime block making gate.k
+        // nondeterministic (50).
+        let yaml = format!(
+            "{}layered_runtime:\n  layers:\n  - name: base\n    static_layer:\n      gate.k: 50\n",
+            bootstrap_yaml_with_lds(lds_path.to_str().unwrap())
+        );
+        let mut b = crate::parse_bootstrap(&yaml).expect("boot accepts: no static listener");
+        let err = crate::load_dynamic_resources(&mut b).expect_err("post-merge must reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::UnsupportedNonDeterministicRuntimeFraction { .. }
+        ));
     }
 
     // (b) missing LDS file is fatal.
@@ -20351,6 +20471,148 @@ runtime_fraction:
                     .is_err(),
                 "unknown fields must still reject"
             );
+        }
+
+        /// 109.1 Task 3 helper: a full bootstrap whose single gated route consults
+        /// `gate.k`; `layer_body` is the static_layer yaml fragment for the key
+        /// (empty string = no layered_runtime block), `rf_yaml` the
+        /// runtime_fraction block.
+        fn runtime_fraction_bootstrap(layer_body: &str, rf_yaml: &str) -> String {
+            let layered = if layer_body.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "layered_runtime:\n  layers:\n  - name: base\n    static_layer:\n{layer_body}"
+                )
+            };
+            format!(
+                r#"admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
+{layered}static_resources:
+  listeners:
+  - name: l0
+    address:
+      socket_address: {{ address: 127.0.0.1, port_value: 10000 }}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: HTTP1
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: vh
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/gated"
+{rf_yaml}                direct_response: {{ status: 200, body: {{ inline_string: ok }} }}
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#
+            )
+        }
+
+        const RF_KEYED_100: &str = "                  runtime_fraction:\n                    default_value: { numerator: 100, denominator: HUNDRED }\n                    runtime_key: gate.k\n";
+
+        /// 109.1 Task 3: the three boot-fatal classes at the BOOT path (path 1 of
+        /// three), one accept-direction control per reject.
+        #[test]
+        fn boot_rejects_nondeterministic_map_shaped_and_bad_default_runtime_fractions() {
+            // CF-109-1: consulted value strictly between 0 and 100 (int + widened float/string forms).
+            for value in ["50", "0.5", "1.5", "\"0.5\""] {
+                let yaml =
+                    runtime_fraction_bootstrap(&format!("      gate.k: {value}\n"), RF_KEYED_100);
+                let err = crate::parse_bootstrap(&yaml)
+                    .expect_err("nondeterministic value must be boot-fatal");
+                assert!(
+                    matches!(err, crate::ConfigError::UnsupportedNonDeterministicRuntimeFraction { ref key, .. } if key == "gate.k"),
+                    "value {value}: got {err:?}"
+                );
+            }
+            // CF-109-2: map-shaped consulted key (the snapshot-prefix rule).
+            let yaml = runtime_fraction_bootstrap(
+                "      gate.k:\n        numerator: 0\n        denominator: HUNDRED\n",
+                RF_KEYED_100,
+            );
+            assert!(matches!(
+                crate::parse_bootstrap(&yaml).expect_err("map-shaped consulted key must be boot-fatal"),
+                crate::ConfigError::UnsupportedMapShapedRuntimeKey { ref key, .. } if key == "gate.k"
+            ));
+            // Non-deterministic default_value.
+            let yaml = runtime_fraction_bootstrap(
+                "",
+                "                  runtime_fraction:\n                    default_value: { numerator: 50, denominator: HUNDRED }\n",
+            );
+            assert!(matches!(
+                crate::parse_bootstrap(&yaml)
+                    .expect_err("nondeterministic default must be boot-fatal"),
+                crate::ConfigError::UnsupportedNonDeterministicRuntimeFractionDefault {
+                    numerator: 50,
+                    ..
+                }
+            ));
+            // Accept-direction controls: deterministic values and defaults BOOT.
+            for (layer, rf) in [
+                ("      gate.k: 0\n", RF_KEYED_100),
+                ("      gate.k: 100\n", RF_KEYED_100),
+                ("      gate.k: abc\n", RF_KEYED_100), // unparseable -> default, deterministic
+                ("", RF_KEYED_100),                    // absent key -> default
+            ] {
+                let yaml = runtime_fraction_bootstrap(layer, rf);
+                crate::parse_bootstrap(&yaml)
+                    .expect("deterministic runtime_fraction must be accepted");
+            }
+        }
+
+        /// 109.1 Task 3 (CF-109-3): runtime_fraction inside jwt rules is boot-fatal.
+        #[test]
+        fn jwt_rule_with_runtime_fraction_is_rejected() {
+            // Mirrors jwt_authn_validator_accepts_valid's cfg construction, then
+            // sets runtime_fraction on the rule's match.
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "p1".to_string(),
+                crate::JwtProvider {
+                    issuer: "i".to_string(),
+                    audiences: vec![],
+                    local_jwks: crate::DataSource {
+                        filename: None,
+                        inline_string: Some(VALID_JWKS.to_string()),
+                    },
+                    forward: false,
+                },
+            );
+            let mut cfg = crate::JwtAuthnConfig {
+                providers,
+                rules: vec![crate::RequirementRule {
+                    r#match: crate::RouteMatch {
+                        prefix: Some("/".to_string()),
+                        path: None,
+                        headers: vec![],
+                        runtime_fraction: None,
+                    },
+                    requires: crate::JwtRequirement {
+                        provider_name: "p1".to_string(),
+                    },
+                }],
+            };
+            cfg.rules[0].r#match.runtime_fraction = Some(crate::RuntimeFractionalPercent {
+                default_value: crate::FractionalPercent {
+                    numerator: 0,
+                    denominator: crate::DenominatorType::Hundred,
+                },
+                runtime_key: None,
+            });
+            assert!(matches!(
+                validate_jwt_authn_config(&cfg, "l0").unwrap_err(),
+                crate::ConfigError::UnsupportedRuntimeFractionInJwtRule { .. }
+            ));
         }
     }
 

@@ -765,6 +765,52 @@ pub enum ConfigError {
     )]
     UnsupportedRuntimeKeyedCsrfFilterEnabled { listener: String },
 
+    /// CF-109-1 (WIDENED, ADR-0176 D3): consulted runtime value strictly
+    /// between 0 and 100 — upstream samples per request; envoy-rust is
+    /// deterministic-only.
+    #[error(
+        "route runtime_fraction on `{listener}` route `{route}`: runtime key `{key}` resolves to `{value}`, strictly between 0 and 100 — upstream samples per request; envoy-rust supports only deterministic 0/>=100 values (CF-109-1)"
+    )]
+    UnsupportedNonDeterministicRuntimeFraction {
+        listener: String,
+        route: String,
+        key: String,
+        value: String,
+    },
+
+    /// CF-109-2 (ADR-0176 D3): map-shaped value at (or beside) a CONSULTED
+    /// key — the store flattens maps to dotted keys, so a plain lookup would
+    /// silently fall back to the default where upstream honors the map.
+    #[error(
+        "route runtime_fraction on `{listener}` route `{route}`: runtime key `{key}` carries a map-shaped (or dotted-sibling) value in the runtime snapshot — unsupported (CF-109-2)"
+    )]
+    UnsupportedMapShapedRuntimeKey {
+        listener: String,
+        route: String,
+        key: String,
+    },
+
+    /// The runtime_fraction's own default_value is non-deterministic
+    /// (numerator neither 0 nor the denominator value) — the house
+    /// `selects_deterministic` discipline (CSRF/fault precedent).
+    #[error(
+        "route runtime_fraction on `{listener}` route `{route}`: default_value {numerator}/{denominator} is non-deterministic (numerator must be 0 or the denominator value)"
+    )]
+    UnsupportedNonDeterministicRuntimeFractionDefault {
+        listener: String,
+        route: String,
+        numerator: u32,
+        denominator: u32,
+    },
+
+    /// CF-109-3 (ADR-0176): `runtime_fraction` inside `jwt_authn.rules[].match`
+    /// — the hand-copied jwt matcher would silently ignore it (upstream honors
+    /// it there).
+    #[error(
+        "jwt_authn on listener `{listener}`: rules[].match.runtime_fraction is unsupported (CF-109-3) — the jwt requirement matcher does not evaluate runtime gates"
+    )]
+    UnsupportedRuntimeFractionInJwtRule { listener: String },
+
     /// 12.1: cluster has more than one `health_checks` entry (phase-12 supports 0 or 1).
     #[error(
         "cluster '{cluster}' has more than one health_checks entry; phase 12 supports at most one"
