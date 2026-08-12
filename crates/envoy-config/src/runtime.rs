@@ -141,6 +141,117 @@ impl RuntimeSnapshot {
         let names: Vec<String> = lr.layers.iter().map(|l| l.name.clone()).collect();
         RuntimeSnapshot::from_layers(names, &lr.layers)
     }
+
+    /// 109.1: the store's FIRST typed lookup — resolve a route
+    /// `runtime_fraction` to its deterministic gate per the SPEC §1.3 cascade,
+    /// MEASURED against envoyproxy/envoy:v1.33.0 (23 cells: parent §1.1 + the
+    /// V-8 closure §1.2):
+    ///
+    /// 1. key consulted and any entry starts with `"<key>."` → `MapShapedKey`;
+    /// 2. key consulted, present, `final_value` parses as finite f64 `v`:
+    ///    `v == 0` → Never; `v >= 100` → Always; `0 < v < 100` →
+    ///    `NondeterministicValue`; `v < 0` → fall through to the default;
+    /// 3. key absent / unparseable / non-finite / not consulted → the
+    ///    `default_value`: numerator `0` → Never, `== denominator.value()` →
+    ///    Always, else `NondeterministicDefault`.
+    ///
+    /// An empty `runtime_key` string is treated as not-consulted (upstream
+    /// unmeasured; the absent-like reading, recorded in the PLAN).
+    pub fn route_fraction_gate(
+        &self,
+        rf: &crate::RuntimeFractionalPercent,
+    ) -> Result<FractionGate, FractionGateError> {
+        if let Some(key) = rf.runtime_key.as_deref().filter(|k| !k.is_empty()) {
+            let prefix = format!("{key}.");
+            if self
+                .entries
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(name, _)| name.starts_with(&prefix))
+            {
+                return Err(FractionGateError::MapShapedKey {
+                    key: key.to_string(),
+                });
+            }
+            if let Some(entry) = self.entries.get(key)
+                && let Ok(v) = entry.final_value.parse::<f64>()
+                && v.is_finite()
+            {
+                if v == 0.0 {
+                    return Ok(FractionGate::Never);
+                }
+                if v >= 100.0 {
+                    return Ok(FractionGate::Always);
+                }
+                if v > 0.0 {
+                    return Err(FractionGateError::NondeterministicValue {
+                        key: key.to_string(),
+                        value: entry.final_value.clone(),
+                    });
+                }
+                // v < 0: MEASURED → default_value (cells N1/N2); fall through.
+            }
+            // Absent key, unparseable or non-finite value: default (cells
+            // 1, 2, 10, 11, B1-B3); fall through.
+        }
+        let p = &rf.default_value;
+        if p.numerator == 0 {
+            Ok(FractionGate::Never)
+        } else if p.numerator == p.denominator.value() {
+            Ok(FractionGate::Always)
+        } else {
+            Err(FractionGateError::NondeterministicDefault {
+                numerator: p.numerator,
+                denominator: p.denominator.value(),
+            })
+        }
+    }
+
+    /// 109.1: infallible request-path wrapper over [`Self::route_fraction_gate`].
+    /// The `Err` arm is VALIDATED-UNREACHABLE in production — all three error
+    /// classes are boot-fatal at every validation path (boot, post-merge, RDS
+    /// reload) — and deliberately does NOT panic (the rds_watcher
+    /// `unreachable!()` lesson, 76.2 I-1): it falls back to the
+    /// `default_value`'s sign, which is total and deterministic.
+    pub fn route_fraction_passes(&self, rf: &crate::RuntimeFractionalPercent) -> bool {
+        match self.route_fraction_gate(rf) {
+            Ok(FractionGate::Always) => true,
+            Ok(FractionGate::Never) => false,
+            Err(_) => rf.default_value.numerator != 0,
+        }
+    }
+}
+
+/// 109.1: the deterministic route-gate verdict of a validated
+/// `RuntimeFractionalPercent`. `Always` = the runtime_fraction gate passes and
+/// prefix/path/headers matching applies unchanged; `Never` = the route never
+/// matches. There is no sampling arm by design — every nondeterministic input
+/// is boot-fatal (CF-109-1/2, ADR-0176 DECISION 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FractionGate {
+    Always,
+    Never,
+}
+
+/// 109.1: the boot-fatal classes of the SPEC §1.3 evaluation cascade. The
+/// three validation paths map these onto `ConfigError` variants with listener/
+/// route context; the request path never sees them (`route_fraction_passes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FractionGateError {
+    /// CF-109-1 (WIDENED at ADR-0176): the consulted key's `final_value`
+    /// parses as a finite f64 strictly between 0 and 100 — upstream samples
+    /// per request (integer `50` GATED 27/33 over 60; float `1.5` GATED 1/40).
+    NondeterministicValue { key: String, value: String },
+    /// CF-109-2, the SNAPSHOT-PREFIX rule (SPEC §3 D3): some entry name starts
+    /// with `"<key>."`, i.e. a map-shaped value was flattened at (or beside)
+    /// the consulted key — a plain lookup would silently use `default_value`
+    /// where upstream honors the map (pick cells 7-8).
+    MapShapedKey { key: String },
+    /// The `default_value` itself is non-deterministic: numerator neither `0`
+    /// nor `== denominator.value()` (the house `selects_deterministic`
+    /// discipline; upstream also accepts `>` — the recorded slightly-narrower
+    /// divergence, parent SPEC §3 D2(a)).
+    NondeterministicDefault { numerator: u32, denominator: u32 },
 }
 
 /// Flatten one layer's `static_layer` into dotted keys → stringified values.
@@ -445,5 +556,330 @@ admin:
             "no intermediate entry"
         );
         assert_eq!(snap.entries["nested.one"].final_value, "a");
+    }
+
+    /// 109.1 Task 1 helpers: build a snapshot from yaml layer fragments, and a
+    /// RuntimeFractionalPercent literal.
+    fn snap(layer_yamls: &[&str]) -> RuntimeSnapshot {
+        let layers: Vec<crate::RuntimeLayer> = layer_yamls.iter().map(|y| layer(y)).collect();
+        let names = layers.iter().map(|l| l.name.clone()).collect();
+        RuntimeSnapshot::from_layers(names, &layers)
+    }
+
+    fn rf(
+        numerator: u32,
+        denominator: crate::DenominatorType,
+        key: Option<&str>,
+    ) -> crate::RuntimeFractionalPercent {
+        crate::RuntimeFractionalPercent {
+            default_value: crate::FractionalPercent {
+                numerator,
+                denominator,
+            },
+            runtime_key: key.map(str::to_string),
+        }
+    }
+
+    /// 109.1 SPEC §1.3: the evaluation cascade, pinned against EVERY measured
+    /// cell of §1.1 (13, re-run at the split) and §1.2 (10 V-8 closure cells),
+    /// plus the §1.3/§7 derived edges. One measured cell = one table row.
+    #[test]
+    fn route_fraction_gate_pins_every_measured_cell() {
+        use crate::DenominatorType::{Hundred, Million};
+        use FractionGate::{Always, Never};
+        let empty = RuntimeSnapshot::default();
+        let one = |v: &str| snap(&[&format!("name: l\nstatic_layer:\n  gate.k: {v}\n")]);
+
+        // (label, snapshot, rf, expected)
+        let ok_cells: Vec<(
+            &str,
+            RuntimeSnapshot,
+            crate::RuntimeFractionalPercent,
+            FractionGate,
+        )> = vec![
+            (
+                "cell 1: absent key, default 100 -> Always",
+                empty.clone(),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell 2: absent key, default 0 -> Never",
+                empty.clone(),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell 3: key 0 overrides default 100 -> Never",
+                one("0"),
+                rf(100, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell 4: key 100, default 0 -> Always",
+                one("100"),
+                rf(0, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell 6: quoted \"0\" parses like the integer -> Never",
+                one("\"0\""),
+                rf(100, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell 9: integer value is numerator over HUNDRED, not the default's MILLION -> Always",
+                one("100"),
+                rf(0, Million, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell 10: unparseable -> default 100 -> Always",
+                one("abc"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell 11: unparseable -> default 0 -> Never (both directions)",
+                one("abc"),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell 12: 200 >= 100 -> Always",
+                one("200"),
+                rf(0, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell 13: two layers, base 100 override 0, last-wins final \"0\" -> Never",
+                snap(&[
+                    "name: base\nstatic_layer:\n  gate.k: 100\n",
+                    "name: over\nstatic_layer:\n  gate.k: 0\n",
+                ]),
+                rf(100, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell B1: bool true -> default 100 -> Always",
+                one("true"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell B2: bool true -> default 0 -> Never",
+                one("true"),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell B3: bool false is NOT 0 -> default 100 -> Always",
+                one("false"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell F1: yaml 0.0 self-heals to \"0\" via Display -> parses as 0 -> Never",
+                one("0.0"),
+                rf(100, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "cell F2: yaml 100.0 self-heals to \"100\" -> Always",
+                one("100.0"),
+                rf(0, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell N1: -7 -> default 100 -> Always",
+                one("-7"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "cell N2: -7 -> default 0 -> Never (both directions)",
+                one("-7"),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            // §1.3/§7 derived edges (recorded, upstream-unmeasured where noted):
+            (
+                "edge: empty-string value -> default (final_value last-NON-EMPTY rule)",
+                one("\"\""),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "edge: NaN spelling -> non-finite -> default",
+                one("NaN"),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "edge: inf spelling -> non-finite -> default",
+                one("inf"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "edge: negative float -0.5 -> v < 0 -> default",
+                one("-0.5"),
+                rf(100, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "edge: exponent 1e6 parses >= 100 -> Always (recorded; excluded from fixtures)",
+                one("1e6"),
+                rf(0, Hundred, Some("gate.k")),
+                Always,
+            ),
+            (
+                "edge: -0.0 == 0.0 in IEEE -> Never",
+                one("-0.0"),
+                rf(100, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "edge: no runtime_key at all -> pure default 100 -> Always",
+                empty.clone(),
+                rf(100, Hundred, None),
+                Always,
+            ),
+            (
+                "edge: empty runtime_key is not consulted -> default 0 -> Never",
+                one("0"),
+                rf(0, Hundred, Some("")),
+                Never,
+            ),
+        ];
+        for (label, s, r, expected) in ok_cells {
+            assert_eq!(s.route_fraction_gate(&r), Ok(expected), "{label}");
+        }
+
+        // Boot-fatal cells (CF-109-1: 0 < v < 100; the WIDENED class includes
+        // non-integral floats and float-shaped strings — MEASURED, §1.2).
+        for (label, s, r) in [
+            (
+                "cell 5: integer 50 is per-request nondeterministic upstream",
+                one("50"),
+                rf(100, Hundred, Some("gate.k")),
+            ),
+            (
+                "cell F3: 0.5 parses upstream (NOT default) -> boot-fatal here",
+                one("0.5"),
+                rf(100, Hundred, Some("gate.k")),
+            ),
+            (
+                "cell F4: 1.5 parsed AND per-request sampled upstream (GATED 1/40)",
+                one("1.5"),
+                rf(0, Hundred, Some("gate.k")),
+            ),
+            (
+                "cell S1: quoted \"0.5\" parses like the float",
+                one("\"0.5\""),
+                rf(100, Hundred, Some("gate.k")),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    s.route_fraction_gate(&r),
+                    Err(FractionGateError::NondeterministicValue { ref key, .. }) if key == "gate.k"
+                ),
+                "{label}"
+            );
+        }
+
+        // CF-109-2, the SNAPSHOT-PREFIX rule (cells 7/8 + the two conservative
+        // edges analysed in SPEC §3 D3): consulted key K is fatal iff ANY entry
+        // starts with "K.".
+        let map_snap = snap(&[
+            "name: l\nstatic_layer:\n  gate.k:\n    numerator: 0\n    denominator: HUNDRED\n",
+        ]);
+        for (label, s, r) in [
+            (
+                "cell 7: map value at consulted key, default 100",
+                map_snap.clone(),
+                rf(100, Hundred, Some("gate.k")),
+            ),
+            (
+                "cell 8: map value at consulted key, default 0",
+                map_snap.clone(),
+                rf(0, Hundred, Some("gate.k")),
+            ),
+            (
+                "edge: scalar K beside literal dotted sibling K.foo -> conservatively fatal (recorded)",
+                snap(&["name: l\nstatic_layer:\n  gate.k: 100\n  gate.k.foo: 1\n"]),
+                rf(0, Hundred, Some("gate.k")),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    s.route_fraction_gate(&r),
+                    Err(FractionGateError::MapShapedKey { ref key }) if key == "gate.k"
+                ),
+                "{label}"
+            );
+        }
+        // ...but a DIFFERENT key's dotted entries do NOT trip the prefix rule,
+        // and a PREFIX-SHARING SIBLING (gate.k2) does not either ("gate.k" is
+        // not a string-prefix of "gate.k2" WITH the dot).
+        let sibling = snap(&["name: l\nstatic_layer:\n  gate.k2: 100\n  other.map.leaf: 1\n"]);
+        assert_eq!(
+            sibling.route_fraction_gate(&rf(100, Hundred, Some("gate.k"))),
+            Ok(Always),
+            "prefix rule must use \"K.\" — a sibling gate.k2 entry is NOT a gate.k map"
+        );
+
+        // Non-deterministic default_value (numerator neither 0 nor the
+        // denominator value) is fatal whenever the default is REACHED —
+        // directly (no key) or via the unparseable fallback.
+        for (label, s, r) in [
+            (
+                "edge: default 50/HUNDRED, no key",
+                empty.clone(),
+                rf(50, Hundred, None),
+            ),
+            (
+                "edge: default 150/HUNDRED reached via unparseable value",
+                one("abc"),
+                rf(150, Hundred, Some("gate.k")),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    s.route_fraction_gate(&r),
+                    Err(FractionGateError::NondeterministicDefault { .. })
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// 109.1 Task 1: the infallible request-path wrapper. Ok maps directly;
+    /// the Err arm (validated-unreachable in production — all three error
+    /// classes are boot-fatal at every validation path) falls back to the
+    /// default_value's sign, total and panic-free.
+    #[test]
+    fn route_fraction_passes_is_total_and_maps_the_gate() {
+        use crate::DenominatorType::Hundred;
+        let empty = RuntimeSnapshot::default();
+        let fifty = snap(&["name: l\nstatic_layer:\n  gate.k: 50\n"]);
+        assert!(
+            empty.route_fraction_passes(&rf(100, Hundred, Some("gate.k"))),
+            "Always -> true"
+        );
+        assert!(
+            !empty.route_fraction_passes(&rf(0, Hundred, Some("gate.k"))),
+            "Never -> false"
+        );
+        // Err fallback: nondeterministic value, default 100 -> true; default 0 -> false.
+        assert!(
+            fifty.route_fraction_passes(&rf(100, Hundred, Some("gate.k"))),
+            "Err fallback follows default sign (non-zero)"
+        );
+        assert!(
+            !fifty.route_fraction_passes(&rf(0, Hundred, Some("gate.k"))),
+            "Err fallback follows default sign (zero)"
+        );
     }
 }
