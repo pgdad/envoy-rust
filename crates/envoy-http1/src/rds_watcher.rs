@@ -185,6 +185,9 @@ fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
         &target.path,
         &target.route_config_name,
         &move |name| cluster_mgr.get(name).is_some(),
+        // 109.1: the boot snapshot the store carries (D4) — the warm path
+        // validates runtime_fraction gates against the SAME snapshot as boot.
+        &target.store.runtime,
     );
     match result {
         Ok(new_rc) => {
@@ -219,11 +222,26 @@ fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
                 envoy_config::ConfigError::RdsRouteConfigNotFound { .. }
                 | envoy_config::ConfigError::UnknownCluster(_)
                 | envoy_config::ConfigError::RedirectPathRewriteConflict { .. }
-                | envoy_config::ConfigError::RedirectSchemeRewriteConflict { .. } => {
+                | envoy_config::ConfigError::RedirectSchemeRewriteConflict { .. }
+                // 109.1: the three snapshot-dependent runtime_fraction
+                // validation rejects — the SAME class as UnknownCluster (the
+                // config parsed fine, its CONTENT is refused against the boot
+                // snapshot). `UnsupportedRuntimeFractionInJwtRule` is
+                // deliberately NOT here: `reparse` cannot return it (RDS route
+                // configs carry no jwt_authn rules).
+                | envoy_config::ConfigError::UnsupportedNonDeterministicRuntimeFraction { .. }
+                | envoy_config::ConfigError::UnsupportedMapShapedRuntimeKey { .. }
+                | envoy_config::ConfigError::UnsupportedNonDeterministicRuntimeFractionDefault { .. } => {
                     target.counters.update_rejected.add(1);
                 }
-                // `reparse_and_select_route_config` can return ONLY the six
-                // variants matched above. Any other `ConfigError` here means the
+                // `reparse_and_select_route_config` can return ONLY the NINE
+                // variants matched above (RdsFileError / RdsParseError /
+                // RdsRouteConfigNotFound / UnknownCluster /
+                // RedirectPathRewriteConflict / RedirectSchemeRewriteConflict /
+                // UnsupportedNonDeterministicRuntimeFraction /
+                // UnsupportedMapShapedRuntimeKey /
+                // UnsupportedNonDeterministicRuntimeFractionDefault).
+                // Any other `ConfigError` here means the
                 // producer grew a new returnable variant without updating this
                 // classifier — fail loud rather than silently misbucket it. If a
                 // new variant is added, this match must be extended explicitly.
@@ -298,6 +316,30 @@ resources:
     async fn store_with_cluster(
         cluster_name: &str,
     ) -> (Arc<HCMConfig>, RdsCounters, Arc<envoy_stats::StatsRegistry>) {
+        store_with_cluster_and_runtime(cluster_name, Arc::new(RuntimeSnapshot::default())).await
+    }
+
+    // 109.1 Task 5: a one-layer snapshot mapping `gate.k` to the integer 50 —
+    // the CF-109-1 nondeterministic class. Built in code (envoy-http1 has no
+    // serde_yaml dev-dep; `RuntimeValue::Int` stringifies to "50" exactly as
+    // the yaml spelling would).
+    fn snapshot_with_gate_k_50() -> RuntimeSnapshot {
+        let mut static_layer = std::collections::BTreeMap::new();
+        static_layer.insert("gate.k".to_string(), envoy_config::RuntimeValue::Int(50));
+        let layer = envoy_config::RuntimeLayer {
+            name: "l".to_string(),
+            static_layer: Some(static_layer),
+            ..Default::default()
+        };
+        RuntimeSnapshot::from_layers(vec!["l".to_string()], &[layer])
+    }
+
+    // 109.1 Task 5: `store_with_cluster` with a caller-supplied runtime
+    // snapshot, for reload tests exercising the runtime_fraction validators.
+    async fn store_with_cluster_and_runtime(
+        cluster_name: &str,
+        runtime: Arc<RuntimeSnapshot>,
+    ) -> (Arc<HCMConfig>, RdsCounters, Arc<envoy_stats::StatsRegistry>) {
         let yaml = format!(
             r#"
 admin:
@@ -356,7 +398,7 @@ static_resources:
                 validate_clusters: None,
                 virtual_hosts: vec![],
             })),
-            runtime: Arc::new(RuntimeSnapshot::default()),
+            runtime,
         });
         // Seed the rds.* counters at the post-initial-load `1/1/0/0/1` state, so
         // a successful reload moves them to `2/2/0/0/2` (the §6.2 expectation).
@@ -489,6 +531,68 @@ static_resources:
             counters: counters.clone(),
         };
         reload(&target).expect_err("unknown-cluster reload returns Err");
+
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_rejected.value(), 1);
+        assert_eq!(counters.update_failure.value(), 0);
+        assert_eq!(counters.update_success.value(), 1);
+        assert_eq!(counters.config_reload.value(), 1);
+    }
+
+    // 109.1 Task 5: an RDS file naming `local_route` whose single route to
+    // `cluster` carries a runtime_fraction gate consulting `gate.k`.
+    fn rds_gated_file_body(cluster: &str) -> String {
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    routes:
+    - match:
+        prefix: "/"
+        runtime_fraction:
+          default_value: {{ numerator: 100, denominator: HUNDRED }}
+          runtime_key: gate.k
+      route: {{ cluster: {cluster} }}
+"#
+        )
+    }
+
+    /// 109.1 Task 5 (the 76.2 I-1 regression class, closed BEFORE it can
+    /// open): an RDS reload delivering a route whose runtime_fraction
+    /// resolves nondeterministically against the boot snapshot must be
+    /// warm-REJECTED — Err + update_rejected ticked + live table untouched —
+    /// and must NOT hit the classifier's `unreachable!()` abort arm.
+    #[tokio::test]
+    async fn reload_warm_rejects_nondeterministic_runtime_fraction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(&path, &rds_gated_file_body("known_cluster"));
+        let runtime = Arc::new(snapshot_with_gate_k_50());
+        let (store, counters, _reg) =
+            store_with_cluster_and_runtime("known_cluster", runtime).await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        let result = reload(&target);
+        assert!(
+            matches!(
+                result,
+                Err(envoy_config::ConfigError::UnsupportedNonDeterministicRuntimeFraction { .. })
+            ),
+            "got {result:?}"
+        );
 
         let after = store.current_route_config();
         assert!(Arc::ptr_eq(&before, &after), "last-good table kept");

@@ -102,6 +102,7 @@ pub fn reparse_and_select_route_config(
     path: &std::path::Path,
     route_config_name: &str,
     known_cluster: &dyn Fn(&str) -> bool,
+    runtime: &crate::runtime::RuntimeSnapshot,
 ) -> Result<RouteConfiguration, crate::ConfigError> {
     let path_str = path.display().to_string();
     // Step 1: re-read.
@@ -147,6 +148,18 @@ pub fn reparse_and_select_route_config(
     // A fourth variant must fail to build until it is handled here.
     for vh in &selected.virtual_hosts {
         for route in &vh.routes {
+            // 109.1: the SAME runtime_fraction validators as boot, applied
+            // against the BOOT snapshot (runtime state never mutates
+            // post-boot in this tree). A warm config must not install a gate
+            // the byte-identical boot config would reject. Context strings
+            // follow the `validate_redirect_oneofs` convention below (the rds
+            // path as the listener slot).
+            crate::bootstrap::validate_route_runtime_fraction(
+                &route.r#match,
+                runtime,
+                &format!("rds:{path_str}"),
+                &route.name,
+            )?;
             match &route.action {
                 crate::RouteAction::Route(ar) => {
                     if !known_cluster(&ar.cluster) {
@@ -318,9 +331,13 @@ resources:
     fn reparse_happy_path_reads_selects_and_validates() {
         let (_dir, path) = write_temp(&rds_body("local_route", "known_cluster"));
         // known-cluster predicate: only "known_cluster" exists.
-        let rc =
-            reparse_and_select_route_config(&path, "local_route", &|name| name == "known_cluster")
-                .expect("happy reload");
+        let rc = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|name| name == "known_cluster",
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .expect("happy reload");
         assert_eq!(rc.name, "local_route");
         assert_eq!(rc.virtual_hosts.len(), 1);
     }
@@ -329,7 +346,13 @@ resources:
     fn reparse_io_error_when_file_missing() {
         // step 1: an unreadable/missing file → RdsFileError (the update_failure class).
         let missing = std::path::Path::new("/no/such/rds/file.yaml");
-        let err = reparse_and_select_route_config(missing, "local_route", &|_| true).unwrap_err();
+        let err = reparse_and_select_route_config(
+            missing,
+            "local_route",
+            &|_| true,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::RdsFileError { .. }),
             "expected RdsFileError, got: {err:?}"
@@ -340,7 +363,13 @@ resources:
     fn reparse_parse_error_on_malformed_yaml() {
         // step 2: malformed YAML → RdsParseError (the update_failure class).
         let (_dir, path) = write_temp("resources: [unclosed");
-        let err = reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|_| true,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::RdsParseError { .. }),
             "expected RdsParseError, got: {err:?}"
@@ -352,7 +381,13 @@ resources:
         // step 3: the requested name is absent from the envelope →
         // RdsRouteConfigNotFound (the update_rejected class).
         let (_dir, path) = write_temp(&rds_body("other_route", "known_cluster"));
-        let err = reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|_| true,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::RdsRouteConfigNotFound { name, .. }
                 if name == "local_route"),
@@ -366,9 +401,13 @@ resources:
         // UnknownCluster (the update_rejected class — the recorded warm-reject
         // divergence vs Envoy, ADR-0066).
         let (_dir, path) = write_temp(&rds_body("local_route", "ghost_cluster"));
-        let err =
-            reparse_and_select_route_config(&path, "local_route", &|name| name == "known_cluster")
-                .unwrap_err();
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|name| name == "known_cluster",
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::UnknownCluster(c) if c == "ghost_cluster"),
             "expected UnknownCluster(ghost_cluster), got: {err:?}"
@@ -391,8 +430,13 @@ resources:
       direct_response: { status: 200, body: { inline_string: "ok" } }
 "#;
         let (_dir, path) = write_temp(yaml);
-        let rc = reparse_and_select_route_config(&path, "local_route", &|_| false)
-            .expect("direct_response needs no cluster");
+        let rc = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|_| false,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .expect("direct_response needs no cluster");
         assert_eq!(rc.name, "local_route");
     }
 
@@ -423,8 +467,13 @@ resources:
       redirect: { path_redirect: "/p", prefix_rewrite: "/q" }
 "#,
         );
-        let err = reparse_and_select_route_config(&path, "local_route", &|_| true)
-            .expect_err("a conflicting redirect oneof must be warm-rejected");
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|_| true,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .expect_err("a conflicting redirect oneof must be warm-rejected");
         assert!(
             matches!(err, crate::ConfigError::RedirectPathRewriteConflict { .. }),
             "expected RedirectPathRewriteConflict, got {err:?}"
@@ -448,12 +497,100 @@ resources:
       redirect: { host_redirect: "example.com" }
 "#,
         );
-        let rc = reparse_and_select_route_config(&path, "local_route", &|_| true)
-            .expect("a valid redirect route must reload warm");
+        let rc = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|_| true,
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .expect("a valid redirect route must reload warm");
         assert_eq!(rc.virtual_hosts.len(), 1);
         assert!(matches!(
             rc.virtual_hosts[0].routes[0].action,
             crate::RouteAction::Redirect(_)
+        ));
+    }
+
+    // 109.1 Task 5: an RDS body whose single route to `known_cluster` carries
+    // the given runtime_fraction yaml block (indented for the match map).
+    fn rds_gated_body(rf_lines: &str) -> String {
+        format!(
+            r#"resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: default
+    domains: ["*"]
+    routes:
+    - match:
+        prefix: "/"
+{rf_lines}      route: {{ cluster: known_cluster }}
+"#
+        )
+    }
+
+    // 109.1 Task 5: a one-layer snapshot built from a yaml static_layer body.
+    fn snapshot_from_layer(static_layer_yaml: &str) -> crate::runtime::RuntimeSnapshot {
+        let layer: crate::RuntimeLayer =
+            serde_yaml::from_str(&format!("name: l\nstatic_layer:\n{static_layer_yaml}"))
+                .expect("layer parses");
+        crate::runtime::RuntimeSnapshot::from_layers(vec!["l".to_string()], &[layer])
+    }
+
+    /// 109.1 Task 5: `reparse` returns each of the three snapshot-dependent
+    /// runtime_fraction rejects — the exact variants the rds_watcher
+    /// classifier's `update_rejected` arm must (and now does) match.
+    #[test]
+    fn reparse_rejects_nondeterministic_runtime_fraction_value() {
+        let (_dir, path) = write_temp(&rds_gated_body(
+            "        runtime_fraction:\n          default_value: { numerator: 100, denominator: HUNDRED }\n          runtime_key: gate.k\n",
+        ));
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|name| name == "known_cluster",
+            &snapshot_from_layer("  gate.k: 50\n"),
+        )
+        .expect_err("nondeterministic consulted value must warm-reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::UnsupportedNonDeterministicRuntimeFraction { .. }
+        ));
+    }
+
+    #[test]
+    fn reparse_rejects_map_shaped_runtime_key() {
+        let (_dir, path) = write_temp(&rds_gated_body(
+            "        runtime_fraction:\n          default_value: { numerator: 100, denominator: HUNDRED }\n          runtime_key: gate.k\n",
+        ));
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|name| name == "known_cluster",
+            &snapshot_from_layer("  gate.k:\n    numerator: 0\n    denominator: HUNDRED\n"),
+        )
+        .expect_err("map-shaped consulted key must warm-reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::UnsupportedMapShapedRuntimeKey { .. }
+        ));
+    }
+
+    #[test]
+    fn reparse_rejects_nondeterministic_runtime_fraction_default() {
+        let (_dir, path) = write_temp(&rds_gated_body(
+            "        runtime_fraction:\n          default_value: { numerator: 50, denominator: HUNDRED }\n",
+        ));
+        let err = reparse_and_select_route_config(
+            &path,
+            "local_route",
+            &|name| name == "known_cluster",
+            &crate::runtime::RuntimeSnapshot::default(),
+        )
+        .expect_err("nondeterministic default must warm-reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::UnsupportedNonDeterministicRuntimeFractionDefault { .. }
         ));
     }
 }
