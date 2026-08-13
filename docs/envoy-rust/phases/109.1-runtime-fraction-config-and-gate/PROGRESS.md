@@ -231,3 +231,123 @@ lib.rs-vs-bootstrap.rs LDS-test placement (T3), the serde_yaml-dev-dep
 adaptation (T5/T6), the W-1 http2-literal misclassification + the `Ok(Self {…})`
 constructor literal (T4), the trailing-comma call-site repair (T4).
 NEXT = the §5 state-4 verification, a SEPARATE session (§5.1; ADR-0127).
+
+## State-4 verification (§7.5 gate set — SEPARATE session per §5.1/ADR-0127; the verifier did NOT run the implementation)
+
+> Session start: `git fetch origin --prune`, `git status --porcelain` CLEAN,
+> branch `main`, HEAD `03961e0` (the state-3 CI-record commit). Detection rule
+> re-verified on disk: `109.1/` holds SPEC.md + PLAN.md + PROGRESS.md (7
+> complete task entries, no state-4 section); ROADMAP census 113 rows / 110
+> `done` / 1 `in-progress` / 2 `planned`; ADR head 0176 (max recipe), 0177
+> free. Docker daemon UP. `superpowers:verification-before-completion` invoked.
+
+### Gate (e) — build / clippy / fmt / deny
+
+- **Cached-no-op guard fired first:** from the freshly-pulled green tree, both
+  `cargo build --workspace --all-targets` and clippy returned exit 0 with
+  **ZERO** `Compiling`/`Checking` lines — non-evidence per the standing trap.
+  Applied the 108.2 recipe: `cargo clean -p envoy-admin -p envoy-bin
+  -p envoy-config -p envoy-filter -p envoy-http1 -p envoy-http2` (the six
+  crates the state-3 diff touched), then re-ran everything.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` →
+  exit **0** with **14 `Checking` lines** (non-cached; ends
+  `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 3.94s`).
+- `cargo build --workspace --all-targets` → exit **0** with **14 `Compiling`
+  lines** (`Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 12.41s`).
+- `cargo fmt --all -- --check` → exit **0**, zero output bytes.
+- `cargo deny check` → first attempt errored (`the directory …/docs/envoy-rust
+  doesn't contain a Cargo.toml file` — run from a subdirectory cwd; cargo-deny
+  does not walk up; recorded honestly); re-run from the repo root → exit **0**,
+  final line `advisories ok, bans ok, licenses ok, sources ok` (the 5
+  `license-not-encountered` warnings are the documented benign family).
+
+### Gates (a)+(b) — the differential surface (no new fixture in 109.1) + full sweep ×2
+
+`cargo test --workspace --no-fail-fast` run **TWICE**, full output redirected
+to files (never through `tail`), totals derived by the standing recipe
+(`grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed'`, awk
+fields 4/6, binary count asserted separately):
+
+- sweep 1: **binaries=164 passed=2188 failed=5 sum=2193** (exit 101 — non-zero
+  because failures are present, as expected)
+- sweep 2: **binaries=164 passed=2188 failed=5 sum=2193**
+- identity **2193 = 2180 + 13 new tests** closes on BOTH runs (CI-confirmed
+  2193/0 on `9331ce3`, recorded in `STATE.md ## Last commit`).
+- **Failing-SET diff: IDENTICAL across both sweeps** (`diff` of the sorted
+  `---- <name>` marker sets = empty): the four `access_log_*_upstream_reset`
+  (h2_rcd / h2_uc / rcd / rf) + `admin_config_dump_server_info` — exactly the
+  ADR-0164 five-member deterministic core, with **ZERO tail members in either
+  sweep** (first time measured with an empty tail; the tail's absence carries
+  no signal either way, per the standing rule).
+- **Isolation classification (ONLY isolation classifies):** each of the five
+  re-run alone → `test result: FAILED. 0 passed; 1 failed` all five —
+  **deterministic in isolation, which IS the core's environmental signature**
+  (ADR-0164). Failure TEXTS match the documented families byte-for-byte in
+  kind: `envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"`
+  (TcpCloseBackend IPv6-unreachable family) and `fixture green: admin body
+  rule: /clusters` (the 192.168.65.2 bridge-IP family). All five are
+  LOCAL-only: CI passes them (run `31572355578` on `9331ce3`, 2193/0).
+- Gate (a): 109.1 adds NO fixture (SPEC §5, the 108.1 foundation-slice
+  precedent) — vacuously green. Gate (b): all 87 differential test files ran
+  inside both sweeps; every RED is isolation-classified environmental above.
+  **No regression; no §5.2 re-entry.**
+
+### Gate (c) — conformance
+
+`cargo test -p h2spec-conformance -- --nocapture` → exit 0; the runner
+printed **`h2spec_runner: h2spec not found — skipping locally`** (the
+documented LOUD local self-skip; `which h2spec` absent on this host) and the
+two string-parser unit tests + gate reported `3 passed`. Per the ADR-0163
+posture: the LOCAL gate is recorded as SKIPPED-NOT-PASSED;
+`known-failures.txt` is UNCHANGED (**21 lines, exactly ONE real entry**,
+untouched by the whole 109.1 diff) and the CI gate — which genuinely runs
+h2spec — is green on this exact tree (`9331ce3` run `31572355578`).
+NEVER trimmed on local evidence.
+
+### Gate (d) — fuzz, all five targets at the CI 30s budget (`cargo +nightly fuzz run <t> -- -max_total_time=30`, each from its crate dir)
+
+- `parse_bootstrap` (envoy-config): `Done 35960 runs` — exit 0 (66 tracked corpus files incl. the T2 seed)
+- `jwt_parse` (envoy-jwt): `Done 4512071 runs` — exit 0
+- `cdn_loop_parse` (envoy-filter): `Done 10468273 runs` — exit 0
+- `accesslog_format_parse` (envoy-accesslog): `Done 3342055 runs` — exit 0
+- `grpc_health_decode` (envoy-http2): `Done 41558474 runs` — exit 0
+
+No crash, no sanitizer finding in any log. No new fuzz target in 109.1 ⇒ no
+`ci.yml` edit owed.
+
+### Disk-fact censuses (re-derived this session, not inherited)
+
+**134** `ConfigError` variants (enum spans `lib.rs:75-1105`; counted by
+`#[error` lines inside the enum span); fuzz `.gitignore` **69/66/66** with the
+T2 seed in `git ls-files`; `bootstrap.rs` **21943** lines; **87** fixture dirs
+(highest `0087`) / **87** differential test files / **164** test binaries;
+**14** crates; `#![forbid(unsafe_code)]` present in every crate root (zero
+missing); `known-failures.txt` 21 lines / 1 real entry; ADR head **0176**
+(next free 0177 — unreserved, nothing new decided this session).
+
+### Read-only recon (subagent evidence, re-verified on disk by the main session)
+
+All **13** new test fns exist at their claimed sites (the one name deviation —
+`reparse_rejects_map_shaped_runtime_key`, shorter than the handoff's spelling —
+was pre-flagged in the state-3 ledger); the 23-cell table pins EVERY SPEC §1.3
+cascade row (v==0 / v≥100 / 0<v<100 fatal / v<0→default / non-numeric→default /
+map-prefix fatal / nondeterministic-default fatal, each with an explicit
+assertion); the gate is LIVE in production (`route_matches` takes `runtime:`
+and evaluates `route_fraction_passes` FIRST; both `resolve_route_in` and
+`build_response_in` thread it; public wrappers pass `&config.runtime`); the
+classifier's `update_rejected` arm carries the 4 pre-existing + 3 new variants
+and its comment names the NINE-variant returnable set with the jwt exclusion
+justified. **Handed to state-5 (observation, not a defect):** the 23-cell
+table's `"empty runtime_key"` edge row (`runtime.rs:751-756`) is
+NON-DISCRIMINATING as written — snapshot `gate.k: 0` under `rf(0, Hundred,
+Some(""))` yields `Never` whether or not the empty key is consulted; a
+discriminating pin needs a diverging default (e.g. 100). The test passes; the
+pinned RULE is real; only this one row's witness power is weak.
+
+### Verdict
+
+Gates (a)-(e) **GREEN** (c local-skip documented, CI-authoritative). Gate (f)
+is state-5's (REVIEW.md — the NEXT session; NOT written here). Stop condition
+re-measured and FALSE on all three legs (113/110/1/2; 109.1 mid-family with
+states 5-6 + all of 109.2 ahead; h3=0 grpc=0 wasm=0 by heading-slice at
+ROADMAP lines 122/126/194). NO `stop` file created.
