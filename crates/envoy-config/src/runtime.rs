@@ -754,6 +754,28 @@ admin:
                 rf(0, Hundred, Some("")),
                 Never,
             ),
+            // 109.2: the three witness rows the 109.1 REVIEW banked (M-1/M-2/M-3).
+            // Each pins a cascade GUARD from the direction that EXPOSES it; the
+            // pre-existing rows above witness those guards only from their
+            // masked side.
+            (
+                "M-1: empty runtime_key is NOT consulted — a `.`-prefixed snapshot entry discriminates (the diverging-default remedy does NOT)",
+                snap(&["name: l\nstatic_layer:\n  .dotted: 1\n"]),
+                rf(100, Hundred, Some("")),
+                Always,
+            ),
+            (
+                "M-2: `inf` paired with default 0 — the non-masking direction of the is_finite guard",
+                one("inf"),
+                rf(0, Hundred, Some("gate.k")),
+                Never,
+            ),
+            (
+                "M-3: default 1_000_000/MILLION with no key pins the denominator.value() consultation",
+                empty.clone(),
+                rf(1_000_000, Million, None),
+                Always,
+            ),
         ];
         for (label, s, r, expected) in ok_cells {
             assert_eq!(s.route_fraction_gate(&r), Ok(expected), "{label}");
