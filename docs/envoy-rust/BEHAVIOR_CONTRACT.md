@@ -3196,6 +3196,119 @@ top-level keys:
 | query params | none exist; `?format=text` etc. silently ignored |
 | no pre-population | upstream does NOT surface its 89 built-in `envoy.reloadable_features.*` flags in `/runtime` (the pick-enabling measurement, ADR-0171 DECISION 3) |
 
+**The route `match.runtime_fraction` CONSUMER** (109.1; ADR-0175 pick, ADR-0176
+split) — the FIRST runtime key that influences the data plane. A route whose
+`match` carries a `runtime_fraction` is gated by
+`RuntimeSnapshot::route_fraction_gate` (`crates/envoy-config/src/runtime.rs`),
+evaluated inside `route_matches` at BOTH production call sites; the H2 crate
+reuses the H1 resolver, so one seam serves both protocols. Nothing in this tree
+mutates runtime state after boot (no RTDS, no `/runtime_modify`, no disk
+layer), so the verdict is decided ONCE per lookup and is
+**process-lifetime-constant** — which is what makes a differential fixture
+possible at all.
+
+**The 23 MEASURED cells.** Probe harness: one HCM listener; route 1 =
+`prefix: "/"` + `runtime_fraction { default_value { numerator: N, denominator:
+D }, runtime_key: "probe.frac" }` → `direct_response` 200 body `GATED`;
+route 2 = bare `prefix: "/"` → `direct_response` 200 body `FALLBACK`. Counts
+are over n independent requests against ONE unchanged process. Cells 1-13 were
+measured at the phase-109 pick (30 probes each; cells 1/3/9/13 RE-RUN at 40/40
+at the state-2 split); cells B1-S1 at the split session (40 probes each),
+closing parent PLAN-VERIFY V-8.
+
+| cell | `default_value` | consulted `probe.frac` | measured result | reading |
+|---|---|---|---|---|
+| 1 | 100/HUNDRED | (no `layered_runtime`) | GATED 30/30 (re-run 40/40) | absent key → `default_value`, deterministic |
+| 2 | 0/HUNDRED | (no `layered_runtime`) | FALLBACK 30/30 | default `0` honoured |
+| 3 | 100/HUNDRED | `0` (int) | FALLBACK 30/30 (re-run 40/40) | **a consulted key OVERRIDES the default** |
+| 4 | 0/HUNDRED | `100` (int) | GATED 30/30 | …and in the other direction |
+| 5 | 100/HUNDRED | `50` (int) | GATED 27 / FALLBACK 33 over n=60 | **`0 < v < 100` is per-request NONDETERMINISTIC** |
+| 6 | 100/HUNDRED | `"0"` (quoted numeric string) | FALLBACK 30/30 | a numeric string parses like the integer |
+| 7 | 100/HUNDRED | `{numerator: 0, denominator: HUNDRED}` (map) | FALLBACK 30/30 | a map-shaped `FractionalPercent` is HONOURED for routing |
+| 8 | 0/HUNDRED | `{numerator: 100, denominator: HUNDRED}` (map) | GATED 30/30 | …and in the other direction |
+| 9 | 0/**MILLION** | `100` (int) | GATED 40/40 | **an integer value is the numerator over HUNDRED, NOT over the default's denominator** |
+| 10 | 100/HUNDRED | `"abc"` (unparseable) | GATED 30/30 | unparseable → `default_value` |
+| 11 | 0/HUNDRED | `"abc"` | FALLBACK 30/30 | …confirming default-used in BOTH directions |
+| 12 | 0/HUNDRED | `200` (int) | GATED 30/30 | numerator ≥ denominator ⇒ always matches |
+| 13 | 100/HUNDRED | two static layers: base `100`, override `0` | FALLBACK 30/30 (re-run 40/40) | the consumer honours **last-layer-wins `final_value`** |
+| B1 | 100/HUNDRED | `true` (bool) | GATED 40/40 | bool → `default_value` |
+| B2 | 0/HUNDRED | `true` (bool) | FALLBACK 40/40 | bool → default, BOTH directions |
+| B3 | 100/HUNDRED | `false` (bool) | GATED 40/40 | `false` is NOT parsed as `0` — default used |
+| F1 | 100/HUNDRED | `0.0` (float) | FALLBACK 40/40 | **a float PARSES as 0 — NOT default** |
+| F2 | 0/HUNDRED | `100.0` (float) | GATED 40/40 | a float parses as 100 |
+| F3 | 100/HUNDRED | `0.5` (float) | FALLBACK 40/40 | parsed, not default (0.5% sampling and truncate-to-0 are indistinguishable at n=40) |
+| F4 | 0/HUNDRED | `1.5` (float) | GATED **1**/40 | **non-integral floats are per-request NONDETERMINISTIC** (a single GATED under a 0-default proves parse + sampling) |
+| N1 | 100/HUNDRED | `-7` (int) | GATED 40/40 | negative → `default_value` |
+| N2 | 0/HUNDRED | `-7` (int) | FALLBACK 40/40 | negative → default, BOTH directions |
+| S1 | 100/HUNDRED | `"0.5"` (quoted string) | FALLBACK 40/40 | numeric STRINGS parse like their float counterparts — NOT default |
+
+These 23 rows are the MEASURED contract and nothing else is. The landed unit
+table (`runtime.rs`) pins additional rows labelled `edge:` — those are DERIVED
+from the cascade below, are upstream-UNMEASURED, and must not be read as
+measurements.
+
+**The evaluation cascade** (109.1 SPEC §1.3, one row per measured cell). For a
+route whose `runtime_fraction.runtime_key` resolves to a snapshot entry with
+`final_value` string `S`:
+
+1. Parse `S` as `f64`. If it parses AND is finite:
+   - `v == 0` → the route **NEVER** matches (cells 3, 6, F1);
+   - `v >= 100` → the gate **ALWAYS** passes, and prefix/path/header matching
+     applies unchanged (cells 4, 9, 12, F2);
+   - `0 < v < 100` → **boot-fatal** here (CF-109-1; upstream samples per
+     request — cells 5, F3, F4, S1);
+   - `v < 0` → fall through to `default_value` (cells N1, N2).
+2. Otherwise — bools, non-numeric strings, the empty string, non-finite
+   spellings — → `default_value` (cells 10, 11, B1-B3).
+3. `default_value` itself must satisfy the house
+   `FractionalPercent::selects_deterministic` discipline: numerator `0` →
+   never; numerator `== denominator.value()` → always; anything else is
+   boot-fatal (upstream also accepts `>`, the recorded slightly-narrower
+   divergence).
+
+An empty `runtime_key` string is treated as NOT consulted (upstream-unmeasured;
+the absent-like reading, recorded). **Two readings are load-bearing and are the
+ones an implementer gets wrong:** an integer runtime value is the numerator
+over **HUNDRED**, not over the default's denominator (cell 9 — under the wrong
+reading a `100` against a `0/MILLION` default is a ~10⁻⁴ event per request,
+which no 0/100 fixture could catch); and an unparseable value falls back to
+`default_value` in **BOTH** directions (cells 10/11 — a single-direction probe
+is equally consistent with "unparseable → 0").
+
+**Three reject-direction carry-forwards, all OPEN.** 109.1 landed their REJECT
+sides ONLY; 109.2 lands no honouring side. Each is boot-fatal here where
+upstream accepts, so each is a recorded ADR-0049 reject-direction divergence
+rather than a silent one:
+
+- **CF-109-1 (WIDENED)** — an effective value strictly between 0 and 100 is
+  boot-fatal, and the class INCLUDES non-integral floats and float-shaped
+  strings (cells 5, F3, F4, S1), because upstream samples them per request
+  while envoy-rust is deterministic-only and has no PRNG anywhere in the tree.
+  *Unblocked by* a phase that lands per-request sampling.
+- **CF-109-2** — a map-shaped value at (or beside) a CONSULTED key is
+  boot-fatal, implemented as the **SNAPSHOT-PREFIX rule**: a consulted key `K`
+  is fatal iff any snapshot entry starts with `K.`. The store flattens map
+  values to dotted keys (`K.numerator`/`K.denominator`, so entry `K` never
+  exists), so a plain lookup would silently fall back to the default where
+  upstream HONOURS the map for routing (cells 7/8) — the CF-108-3 interlock,
+  and an unwitnessable divergence if left silent. *Unblocked by* a store that
+  preserves map-shaped values.
+- **CF-109-3** — `runtime_fraction` inside `jwt_authn.rules[].match` is
+  boot-fatal, because that surface is matched by the hand-copied
+  `route_match_matches` (the CF-76-1 second matcher), which never evaluates
+  runtime gates and would silently ignore the field. *Unblocked by* unifying
+  the two matchers.
+
+**Fixture pointer.** `tests/fixtures/0088-runtime-fraction-route-gating`
+witnesses the DETERMINISTIC subset cross-proxy: ten `Http1ProbeList` probes
+over a cluster-free, backend-free HCM listener with `direct_response` routes
+and a two-static-layer `layered_runtime`, with `envoy.yaml` and
+`envoy-rust.yaml` **byte-identical**. It pins cells 1, 2, 3, 4, 6, 9, 10, 12
+and 13 plus an ungated control. Every NONDETERMINISTIC cell (5, F3, F4, S1) and
+every reject-direction cell (7, 8 and the jwt surface) is witnessed IN-PROCESS
+by 109.1's unit and reject tests and **by construction cannot appear in any
+fixture** — a config that refuses to boot has no wire behaviour to compare.
+
 **The nine `runtime.*` stats** — registered unconditionally on both sides
 (all nine exist even with no `layered_runtime` block). Kinds per upstream's
 `/stats/prometheus` `# TYPE` lines: gauges `admin_overrides_active`,

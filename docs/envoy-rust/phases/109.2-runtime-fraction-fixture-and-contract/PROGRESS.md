@@ -191,3 +191,54 @@ future fixture-adding task that mutates its own fixture before committing it.
 - `cargo test -p differential --test runtime_fraction_route_gating` → `test result: ok. 1 passed; 0 failed`.
 - `tests/differential/src/lib.rs` was **NOT** modified — this fixture needs zero harness change, as
   PLAN-VERIFY X-1 predicted and as the untouched `git status` confirms.
+
+---
+
+## Task 3 — the `BEHAVIOR_CONTRACT.md` `## Runtime` consumer subsection ✅
+
+- **Section boundaries RE-MEASURED, not inherited:** `## Runtime` at `:3162`, next `## ` heading
+  `## xDS wire state machine` at `:3241` (the PLAN's figures, unmoved — Tasks 1 and 2 touched no
+  doc). The section carries **ZERO `### ` subheadings** — confirmed by reading it, it is organised
+  entirely as bold-lead paragraphs — so the new material uses a bold lead-in and adds no heading.
+- **Insertion point located by TEXT:** immediately BEFORE the paragraph
+  ``**The nine `runtime.*` stats** — registered unconditionally on both sides`` (whole-file count
+  of that anchor = **1**), i.e. directly after the `` **`GET /runtime`** `` shape table. The
+  insertion script asserted the anchor's uniqueness AND asserted that the block itself contains no
+  line starting `## ` or `### ` before writing.
+- **Transcribed from the SOURCES, per X-5 — not from `109.2/SPEC.md`'s summary:**
+  `docs/envoy-rust/phases/109-runtime-fraction-route-gating/SPEC.md` §1.1 (the **13**-cell pick
+  matrix, 30 probes each, cells 1/3/9/13 re-run 40/40 at the split) and
+  `docs/envoy-rust/phases/109.1-runtime-fraction-config-and-gate/SPEC.md` §1.2 (the **10**-cell V-8
+  closure matrix, 40 probes each) + §1.3 (the evaluation cascade). **13 + 10 = 23**, matching
+  `route_fraction_gate`'s own doc comment. The probe counts are carried verbatim, including
+  cell 5's `GATED 27 / FALLBACK 33 over n=60` and cell F4's `GATED 1/40`.
+- **The `edge:` rows were deliberately EXCLUDED and the exclusion is stated in the text.** The
+  landed unit table pins MORE than 23 tuples; the extras are SPEC §1.3-DERIVED, upstream-unmeasured,
+  and claiming them as measured would be precisely the "a doc claim is an inherited census" failure
+  this project keeps re-learning. The subsection says so explicitly so a later reader cannot
+  re-inflate the number.
+- **Content:** the five items the PLAN enumerates, in order — the bold lead-in naming the consumer
+  and its process-lifetime-constant property; the 23-cell table (verified: exactly **23** matching
+  rows by an id-anchored count); the §1.3 cascade with both load-bearing readings called out
+  (numerator over HUNDRED not over the default's denominator; unparseable → default in BOTH
+  directions); CF-109-1 (WIDENED) / CF-109-2 (the SNAPSHOT-PREFIX rule) / CF-109-3 each with its
+  **unblock condition**; and the fixture-`0088` pointer naming which cells it pins and why the
+  nondeterministic and reject-direction cells can never appear in a fixture.
+- **Step 2 structural verification (all three assertions PASS):** `## Runtime` still immediately
+  precedes `## xDS wire state machine` (now at `:3354`); the file's `## ` count is UNCHANGED at
+  **15** and its `### ` count UNCHANGED at **24**; `git diff --numstat` = **`113 0`** — insertions
+  only, **zero deletions**, so no existing contract text was overwritten. File **3927 → 4040** lines.
+- **LoC note:** `113` actual against the PLAN's ≈**80** estimate (**+41%**), consistent with the
+  standing calibration (76.1 +50%, 109.1 +46%). The overrun is entirely in the 23-row table, whose
+  `reading` column carries the verbatim source phrasing rather than a compressed paraphrase.
+
+### NOTE — the handoff's "T1/T3/T4 touch DISJOINT files" claim is FALSE for T3/T4
+
+`next-prompt.txt`'s parallelism block states that T1, T3 and T4 "touch DISJOINT files and can run as
+parallel implementation subagents in their OWN worktrees". **T3 and T4 both edit
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md`** (T3 inserts the consumer subsection; T4 rewrites two
+sentences in the same file, one of them at `:3181-3182`, INSIDE the same `## Runtime` section T3
+just extended). Running them as concurrent worktree subagents would have produced two divergent
+copies of that file and a merge the main session would have had to arbitrate by hand. They were
+therefore executed SEQUENTIALLY in the main session, T3 first — which also means T4's line-number
+anchors have drifted by T3's +113 lines and MUST be re-located by text (they were).
