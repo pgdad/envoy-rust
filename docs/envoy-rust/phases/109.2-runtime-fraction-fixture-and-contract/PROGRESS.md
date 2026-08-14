@@ -310,3 +310,141 @@ files in Python, (a) the `:1379` row's PREFIX before the corrected sentence is *
 ``POST → 405 `allow: GET` bilaterally.`` is present in the OLD row and **absent** from the new one,
 and (d) the standalone CF-108-2 paragraph line is **byte-identical** (single match, equal strings).
 Only the false sentence changed.
+
+---
+
+## Task 5 — state-3 exit gate ✅
+
+**This is the state-3 EXIT BAR, not the §7.5 adjudication.** State 4 owns the formal gate in a
+SEPARATE session (§5.1; ADR-0127) and must RE-RUN every command below rather than inherit these
+numbers.
+
+### Step 1 — the full gate set, run from the REPO ROOT
+
+| command | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo fmt --all -- --check` | exit 0, silent |
+| `cargo test --workspace --no-fail-fast` (×2) | see below |
+| `cargo deny check` | exit 0, `advisories ok, bans ok, licenses ok, sources ok` |
+
+`cargo deny` was run from the repo root (it does NOT walk up — a `docs/…` cwd errors with
+`the directory … doesn't contain a Cargo.toml file` while build/test/fmt/clippy all walk up
+happily). It was gated on the exit code PLUS the four-ok line, not on a loose `warning` grep, which
+false-positives on its `license-not-encountered` allowance warnings. Per-task boundaries had already
+gated build/clippy on non-zero `Compiling`/`Checking` counts (13/13 at T1 and T4, 1/1 at T2 — a
+`Checking` count measures the cache's DIRTY SET, so 1 is correct there and only 0 would be a
+cached no-op).
+
+### Step 2 — the sweep, run TWICE, failing SET diffed, classified BY ISOLATION ONLY
+
+Census recipe `grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed'` + awk fields
+**4**/**6**, with the binary count asserted separately (the `ok`-only form makes `failed=0`
+tautological, and fields `$5`/`$7` return a believable `passed=0`):
+
+| sweep | binaries | passed | failed | passed+failed |
+|---|---|---|---|---|
+| 1 | **165** | **2187** | **7** | **2194** |
+| 2 | **165** | **2188** | **6** | **2194** |
+
+**The identity closes exactly on both sweeps: `2194 = 2193 + 1`** — the CI-confirmed 2193 at
+`9331ce3`/`c3e6177`/`3861981` plus the ONE new test fn this slice adds. Binaries **164 → 165**.
+This is the PLAN's prediction met on the nose, and it is the mechanical proof that T1's three rows
+added no test function.
+
+Failing test names were enumerated from the `---- <name> stdout ----` markers (never by
+indentation, which invents phantom names from the failure BODY).
+
+**Set diff:** sweep 1 ∖ sweep 2 = `{cursor_bounds_on_shrinking_endpoint_set}`; sweep 2 ∖ sweep 1 = ∅.
+
+**Classification — by ISOLATION, which is the ONLY classifier:**
+
+| test | in sweeps | ISOLATION | class |
+|---|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** (ADR-0164) |
+| `access_log_h2_uc_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `access_log_rcd_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `access_log_rf_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `admin_config_dump_server_info` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` | 1, 2 | **`ok. 1 passed`** | **TAIL** |
+| `cursor_bounds_on_shrinking_endpoint_set` | 1 only | **`ok. 1 passed`** | **TAIL** |
+
+The five-member ADR-0164 deterministic core reproduced EXACTLY and unchanged — a changed member
+set, not a changed tail, is what would warrant investigation. Both tail members pass alone.
+
+**The two-sweep INTERSECTION is 6 and DISAGREES with isolation** — it contains
+`send_request_maps_h2_handshake_failure_to_typed_error`, which passes in isolation and is therefore
+TAIL. Using membership-in-both-sweeps as the rule would have silently promoted a tail member and
+redefined the documented core from five to six. This is the 108.1-state-4 finding reproducing
+exactly: **ADR-0164 leg (iii) is a SUFFICIENT flake signal, never a NECESSARY one; only isolation
+classifies.** The tail's SIZE (2, then 1) carries no signal in either direction.
+
+**Neither tail member sits on this phase's surface.** `git diff --name-only e458765 HEAD` lists ten
+files and NONE is `crates/envoy-bin/tests/xds_eds_hot_reload.rs` or anything in `envoy-http2`.
+`cursor_bounds_on_shrinking_endpoint_set`'s failure TEXT is
+`envoy-bin HCM ready: Os { code: 111, kind: ConnectionRefused, … }` — the **CF-75-6** ephemeral-port
+/ admin-ready STARTUP-RACE family, which is OPEN and whose documented remedy is to rerun the SAME
+SHA, never to weaken a test. Read by TEXT and by ISOLATION, not by name.
+
+### Step 3 — the new fixture in isolation
+
+`cargo test -p differential --test runtime_fraction_route_gating` → `test result: ok. 1 passed; 0
+failed` on every one of the six runs this session made. Timings: **1.34 s** wall after forcing a
+test-binary rebuild, **1.11 s** warm (in-test 0.98-1.28 s). It also passed INSIDE both full parallel
+sweeps, which is the stronger statement. A backend-free fixture in ~1-3 s is NORMAL — and this
+session PROVED it rather than asserting it, by catching the upstream container live in `docker ps`
+(see the Task 2 finding).
+
+### Step 4 — measured net LoC (MEASURED, not "≈ the projection")
+
+`git diff --numstat e458765 HEAD`: **+1001 / −9 = net +992** whole-tree; **+567 / −5 = net +562**
+excluding `docs/`. Against the PLAN's **≈745** projection that is **+33%**.
+
+| file | numstat |
+|---|---|
+| `tests/fixtures/0088-…/envoy.yaml` | `126 0` |
+| `tests/fixtures/0088-…/envoy-rust.yaml` | `126 0` |
+| `tests/fixtures/0088-…/expectations.yaml` | `124 0` |
+| `tests/fixtures/0088-…/README.md` | `111 0` |
+| `tests/differential/tests/runtime_fraction_route_gating.rs` | `40 0` |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | `122 4` |
+| `crates/envoy-config/src/runtime.rs` | `22 0` |
+| `crates/envoy-config/src/bootstrap.rs` | `10 3` |
+| `crates/envoy-admin/src/endpoint.rs` | `8 2` |
+| `109.2/PROGRESS.md` | (this file) |
+
+Writing "≈ the projection" without measuring is exactly the 109.1 REVIEW M-4 finding, so the figure
+is stated as a measurement with its command. **This is the fifth consecutive confirmation of the
+`calibrate-loc-estimate-against-landed-phases` memory** (76.1 +50%, 109.1 +46%, now 109.2 +33%) —
+and the first where the overrun lives in the DOCUMENTATION half (T3 `113 0` vs ≈80) rather than in a
+mechanical call-site fan-out, which is consistent with the PLAN's own §6.1 argument that this slice
+carries no T4-class fan-out.
+
+### Deviation ledger — COMPLETE (three entries, all above)
+
+1. **DEVIATION 1** (Task 1) — the mutation worktree was SEEDED rather than created at bare `HEAD`,
+   because at that point in the task order `HEAD` predates the rows under test.
+2. **DEVIATION 2** (Task 2) — the prescribed `git checkout --` revert check is a NO-OP on the
+   still-untracked fixture and its `git diff --stat` is empty for the wrong reason; reverts were
+   adjudicated by md5 equality instead.
+3. **DEVIATION 3** (Task 4) — the prescribed `runtime_modify` count check moved 3 → 4 because the
+   PLAN's own Step 1 requires adding the control citation; adjudicated by LINE, with byte-identity
+   of the CF-108-2 paragraph and of the corrected row's untouched clauses proven in Python.
+
+**No other deviation was taken.** The PLAN was not edited (D-3.5). Nothing outside the PLAN's named
+files was touched: `tests/differential/src/lib.rs` unmodified, no existing fixture edited,
+`HEADER_ALLOW_LIST` still 3 entries, `known-failures.txt` still 21 lines, no `ci.yml` edit (this
+slice adds no fuzz target), no ROADMAP status cell flipped, no ADR written (**ADR-0177 stays
+UNRESERVED**), no `REVIEW.md`.
+
+### Stop condition — RE-MEASURED, FALSE on all three legs (the FORTIETH consecutive)
+
+- **(i)** ROADMAP **113 rows / 111 `done` / 1 `in-progress` (parent `109`) / 1 `planned` (`109.2`)**
+  — a state-3 implementation flips no cell. **FALSE.**
+- **(ii)** `109.2` is implemented but NOT verified, NOT reviewed and NOT closed; parent `109` is
+  still open; `RuntimeUInt32`/CSRF consumers, RTDS and hot restart remain unbuilt. **FALSE.**
+- **(iii)** THREE family headings still carry ZERO rows (`### HTTP/3 + QUIC family`,
+  `### gRPC family`, `### WASM host family`), re-measured by heading-slice. **FALSE.**
+
+**No `stop` file was created and none exists.**
