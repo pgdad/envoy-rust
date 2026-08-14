@@ -242,3 +242,71 @@ just extended). Running them as concurrent worktree subagents would have produce
 copies of that file and a merge the main session would have had to arbitrate by hand. They were
 therefore executed SEQUENTIALLY in the main session, T3 first — which also means T4's line-number
 anchors have drifted by T3's +113 lines and MUST be re-located by text (they were).
+
+---
+
+## Task 4 — the decided-in 108.2-M-1 correction (three texts) + the stale `RuntimeFractionalPercent` doc ✅
+
+All four sites were located BY TEXT, each resolving to a whole-file count of exactly **1** before
+any edit. Two of the PLAN's four line-number citations had drifted (Task 3's +113 lines moved
+nothing above `:3197`, but the citations were re-derived rather than trusted):
+
+| # | site | PLAN's line | MEASURED line | anchor text (count) |
+|---|---|---|---|---|
+| 1 | `BEHAVIOR_CONTRACT.md` `## Admin endpoint body shapes` `/runtime` row | `:1379` | `:1379` | ``allow: GET` bilaterally`` (1) |
+| 2 | `BEHAVIOR_CONTRACT.md` `## Runtime` `GET /runtime` paragraph | `:3181-3182` | `:3181` | `GET-only (POST` (1) |
+| 3 | `crates/envoy-admin/src/endpoint.rs` test doc | `:3319-3320` | `:3319` | `GET-only on BOTH` (1) |
+| 4 | `crates/envoy-config/src/bootstrap.rs` `RuntimeFractionalPercent` doc | `:1497-1501` | `:1500` | ``a present `runtime_key` is rejected`` (1) |
+
+- **Sites 1-3** now record the TRUE **asymmetry** rather than a bilateral rule: envoy-rust answers
+  non-GET with 405 `allow: GET` (the deliberate 06.1/08 house convention), while upstream v1.33.0
+  serves `POST /runtime` and `DELETE /runtime` with **200 and the full body**, method-restricting
+  NO read-only admin endpoint (MEASURED at the 108.2 state-5 review; the discriminating control
+  `GET /runtime_modify` → 405 reproduces). Each states that the divergence is reject-direction,
+  tree-wide, PRE-EXISTING and fixture-unwitnessed — every fixture speaks the matching method, so
+  nothing goes red.
+- **Site 3's test body and assertions were NOT touched** — they pin envoy-rust's own dispatch and
+  are correct. Only the `///` doc above them was reworded, to say what the test actually proves.
+  `cargo test -p envoy-admin --lib runtime_post_is_method_not_allowed` → `test result: ok. 1 passed;
+  0 failed` (a doc-only edit changes no behaviour).
+- **Site 4 (the flagged ADDITION to SPEC D4)** narrows the stale claim rather than deleting it: the
+  doc now says the two consumers DIFFER — CSRF still rejects a present `runtime_key` (ADR-0061 L6),
+  the ROUTE consumer HONORS it under the deterministic 109.1 cascade. The CSRF validator, the test
+  `runtime_key_is_rtds_inert` and every other consumer are untouched.
+- **The near-miss was NOT edited.** The `/runtime_modify` sentence (CF-108-2: upstream POST-only,
+  405 on GET, envoy-rust 404s it) describes a DIFFERENT endpoint, is correct, and is explicitly
+  non-bilateral. Proved byte-identical, not merely eyeballed (below).
+- **Step 5 old-wording sweep:**
+  `git grep -n 'GET-only on BOTH\|GET-only (POST\|allow: GET` bilaterally' -- docs/envoy-rust/BEHAVIOR_CONTRACT.md crates/`
+  → **ZERO hits** (exit 1).
+- **Gate:** `cargo build --workspace --all-targets` exit 0 / **13** `Compiling`;
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0 / **13** `Checking`;
+  `cargo fmt --all -- --check` exit 0. `git diff --numstat`: `endpoint.rs` `8 2`,
+  `bootstrap.rs` `10 3`, `BEHAVIOR_CONTRACT.md` `9 4` — exactly the four named sites in three files.
+
+### DEVIATION 3 (RECORDED) — the PLAN's `runtime_modify` count check moved 3 → 4, and the count is the WRONG instrument
+
+PLAN Task 4 Step 5 expects "the `/runtime_modify` mentions are unchanged in count". **MEASURED
+3 → 4.** This is not a violation of the property the check guards, and the check as written cannot
+distinguish the two cases — it is the standing "a grep can legitimately return >0 because a record
+QUOTES the thing it supersedes; adjudicate by LINE and by FILE, never by COUNT" trap, firing on the
+PLAN's own recipe. The PLAN is in fact self-inconsistent here: Step 1 explicitly requires citing
+"control `GET /runtime_modify` → 405" as the measurement's discriminator, which ADDS a mention,
+while Step 5 expects the count not to move.
+
+**Adjudicated by line instead**, with the four current mentions enumerated:
+
+- `:1379` — the corrected row. It already carried a `/runtime_modify` clause; **contribution
+  unchanged**.
+- `:3186` — **the new one**, my Task-4 text naming the discriminating control. This is the entire
+  delta.
+- `:3210` — inside Task 3's own block ("no RTDS, no `/runtime_modify`, no disk layer").
+- `:3351` — the CF-108-2 paragraph, the one that must not move.
+
+And proved mechanically rather than by reading `+`/`-` diff lines (which the
+`fmt-only-check-needs-a-whole-file-compare` lesson says false-positive): comparing the old and new
+files in Python, (a) the `:1379` row's PREFIX before the corrected sentence is **byte-identical**,
+(b) its trailing CF-108-2 clause is **byte-identical**, (c) the false sentence
+``POST → 405 `allow: GET` bilaterally.`` is present in the OLD row and **absent** from the new one,
+and (d) the standalone CF-108-2 paragraph line is **byte-identical** (single match, equal strings).
+Only the false sentence changed.

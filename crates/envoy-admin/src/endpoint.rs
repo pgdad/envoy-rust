@@ -3316,8 +3316,14 @@ mod runtime_tests {
 
     /// CF-108-2 boundary: upstream serves `POST /runtime_modify` (405 on
     /// GET); envoy-rust has no `/runtime_modify` at all (404, unwitnessed
-    /// here — recorded divergence). `/runtime` itself is GET-only on BOTH
-    /// sides: POST answers 405 with `allow: GET`.
+    /// here — recorded divergence). What this test pins is envoy-rust's OWN
+    /// dispatch: `POST /runtime` answers 405 with `allow: GET`, the deliberate
+    /// 06.1/08 house convention. It is NOT a bilateral rule — upstream
+    /// v1.33.0 answers `POST /runtime` with 200 and the full body (and
+    /// likewise `DELETE /runtime`), method-restricting no read-only admin
+    /// endpoint (MEASURED at the 108.2 state-5 review, corrected here per
+    /// ADR-0176 DECISION 5). The 405 is ours, and the asymmetry is a recorded
+    /// reject-direction divergence no fixture witnesses.
     #[test]
     fn runtime_post_is_method_not_allowed() {
         assert_eq!(

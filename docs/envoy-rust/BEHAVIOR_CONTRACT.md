@@ -1376,7 +1376,7 @@ encode-side behavior (cdn_loop is request-only).
 | `/drain_listeners` | POST | empty | Status 200; empty body (`content-length: 0`); effect-only endpoint. Invokes `DrainState::drain()`. Sticky — repeat POSTs are idempotent. Both proxies emit 200 OK on first AND subsequent POSTs. |
 | `/healthcheck/fail` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::fail_healthcheck()`. Flips `/ready` to 503 (per parent-08 SPEC §5.5 wire-state mapping); `/server_info.state` stays `"LIVE"` (server-state is independent of healthcheck-failure). |
 | `/healthcheck/ok` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::ok_healthcheck()`. Restores from `HealthcheckFailing` → `Live`. Sticky-drain: `/healthcheck/ok` AFTER `/drain_listeners` does NOT un-drain (the `HealthcheckFailing → Live` compare_exchange fails silently against the `Draining` state). |
-| `/runtime` | GET | JSON object | Top-level shape exactly `{ "entries": {...}, "layers": [...] }` (see `## Runtime`). Value-equal after canonical re-parse on identical configs — the fixture-0087 disposition is EMPTY allow-lists on both sides; upstream's per-request key-order shuffle is absorbed by `JsonShape`'s `serde_json` re-parse (`Map` is a `BTreeMap`; `preserve_order` enabled nowhere). Both sides pretty-print with no `content-length` (`transfer-encoding` handling is transport-level and not compared). POST → 405 `allow: GET` bilaterally. `/runtime_modify` is NOT served by envoy-rust (404) vs upstream POST-only (405 on GET) — recorded divergence CF-108-2, unwitnessed by any fixture. |
+| `/runtime` | GET | JSON object | Top-level shape exactly `{ "entries": {...}, "layers": [...] }` (see `## Runtime`). Value-equal after canonical re-parse on identical configs — the fixture-0087 disposition is EMPTY allow-lists on both sides; upstream's per-request key-order shuffle is absorbed by `JsonShape`'s `serde_json` re-parse (`Map` is a `BTreeMap`; `preserve_order` enabled nowhere). Both sides pretty-print with no `content-length` (`transfer-encoding` handling is transport-level and not compared). Method handling is an ASYMMETRY, not a bilateral rule: envoy-rust answers non-GET with 405 `allow: GET` (the deliberate 06.1/08 house convention), while upstream v1.33.0 serves `POST /runtime` and `DELETE /runtime` with **200 and the full body** — it method-restricts NO read-only admin endpoint (MEASURED at the 108.2 state-5 review; control `GET /runtime_modify` → 405 reproduces, so the probe discriminates). Reject-direction, tree-wide, PRE-EXISTING and fixture-unwitnessed — every fixture speaks the matching method, so nothing goes red. `/runtime_modify` is NOT served by envoy-rust (404) vs upstream POST-only (405 on GET) — recorded divergence CF-108-2, unwitnessed by any fixture. |
 
 ---
 
@@ -3178,9 +3178,14 @@ loudly rejected (CF-108-1, ADR-0173 DECISION 4 — a recorded reject-direction
 divergence; upstream accepts all three). Duplicate layer names reject
 bilaterally.
 
-**`GET /runtime`** — the eleventh admin endpoint, GET-only (POST → 405
-`allow: GET` on both sides). 200 `application/json`; body is exactly two
-top-level keys:
+**`GET /runtime`** — the eleventh admin endpoint. Method handling is an
+ASYMMETRY, not a bilateral rule: envoy-rust answers non-GET with 405
+`allow: GET` (the 06.1/08 house convention), while upstream v1.33.0 serves
+`POST /runtime` and `DELETE /runtime` with 200 and the full body — it
+method-restricts NO read-only admin endpoint (MEASURED, 108.2 REVIEW M-1;
+control `GET /runtime_modify` → 405). A recorded, tree-wide, PRE-EXISTING
+reject-direction divergence, unwitnessed by any fixture. On `GET`, both sides
+answer 200 `application/json`; body is exactly two top-level keys:
 
 | Shape rule | Measured behaviour |
 |---|---|

@@ -1496,9 +1496,16 @@ pub enum PerFilterConfig {
 
 /// `envoy.config.core.v3.RuntimeFractionalPercent`. A `default_value`
 /// percentage plus an optional `runtime_key`. The csrf filter's `filter_enabled`
-/// is of this type (REQUIRED — §6.2/ADR-0061 L1). envoy-rust honors only the
-/// deterministic 0%/100% `default_value`; a present `runtime_key` is rejected
-/// (no RTDS runtime layer — ADR-0061 L6, the ADR-0049 all-fatal posture).
+/// is of this type (REQUIRED — §6.2/ADR-0061 L1), and so is
+/// `RouteMatch.runtime_fraction` (109.1). **The two consumers differ, so read
+/// the one you are using:** the CSRF consumer still honors only the
+/// deterministic 0%/100% `default_value` and REJECTS a present `runtime_key`
+/// at boot (ADR-0061 L6, the ADR-0049 all-fatal posture); the ROUTE consumer
+/// HONORS `runtime_key`, resolving it against the static-layer runtime
+/// snapshot through `RuntimeSnapshot::route_fraction_gate` under the
+/// deterministic 109.1 cascade (`v == 0` → never, `v >= 100` → always,
+/// `0 < v < 100` → boot-fatal per CF-109-1, everything else →
+/// `default_value`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeFractionalPercent {
