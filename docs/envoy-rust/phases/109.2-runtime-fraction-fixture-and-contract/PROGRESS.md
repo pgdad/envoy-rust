@@ -448,3 +448,332 @@ UNRESERVED**), no `REVIEW.md`.
   `### gRPC family`, `### WASM host family`), re-measured by heading-slice. **FALSE.**
 
 **No `stop` file was created and none exists.**
+
+---
+
+# §5 state-4 verification — the formal §7.5 gate adjudication
+
+> **A SEPARATE session from the state-3 implementation above** (§5.1; ADR-0127 — the context that
+> wrote the code must not be the one that grades it). This section is **APPEND-ONLY**: not one line
+> of the state-3 sections above was edited.
+>
+> Every figure below was **RE-RUN in this session**, from the **repo root**, at HEAD
+> `3982c89e3cd9bbe9fdabb9d2e82fd43db2178c10` — clean tree, branch `main`, level with `origin/main`
+> after `git fetch origin --prune`. **Nothing was inherited from the Task-5 exit gate**; where a
+> re-run disagrees with it, the disagreement is recorded as a finding rather than reconciled away.
+>
+> **This session GRADES and does not FIX** (ADR-0127 / ADR-0165). The twelve findings in the ledger
+> below are **BANKED** for the state-5 review or for a later §5.2 state-3 re-entry. Not one was
+> repaired here. No `REVIEW.md` was written (state 5's output) and no ROADMAP status cell was
+> flipped (state 6's).
+
+## Detection rule, re-verified on disk (not trusted from the handoff)
+
+`docs/envoy-rust/phases/109.2-runtime-fraction-fixture-and-contract/` holds **`SPEC.md` + `PLAN.md` +
+`PROGRESS.md` and NO `REVIEW.md`** — §5 state 4's unambiguous rule. Sibling `109.1/` holds all FOUR
+artifacts (closed); parent `109/` holds `SPEC.md` ONLY (split parent, §6.2 step 1 — no `PLAN.md`
+will ever exist for it). ROADMAP census **113 data rows / 111 `done` / 1 `in-progress` / 1
+`planned`**, the two non-`done` rows ENUMERATED BY ID rather than inferred from a count: `109` →
+`in-progress`, `109.2` → `planned`. ADR head **ADR-0176**; `grep -c '^## ADR-0177'` = **0**.
+
+## Gate (e) — the five workspace commands
+
+| # | command | exit | evidence gated on |
+|---|---|---|---|
+| e1 | `cargo build --workspace --all-targets` | **0** | **14** `Compiling` lines |
+| e2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **0** | **14** `Checking` lines; **0** `^warning`, **0** `^error` |
+| e3 | `cargo fmt --all -- --check` | **0** | zero bytes of output |
+| e4 | `cargo test --workspace --no-fail-fast` (×2) | 101 / 101 | see the sweep table |
+| e5 | `cargo deny check` | **0** | the line `advisories ok, bans ok, licenses ok, sources ok` |
+
+**The cached-no-op trap was defeated causally, not assumed away.** `target/` was already warm (21 GB)
+from the state-3 session, so a bare build would have returned exit 0 with **ZERO** `Compiling` lines —
+non-evidence per the standing trap, and the build cache and the clippy cache no-op *independently*.
+Before the gate chain ran, `crates/envoy-config/src/lib.rs` was `touch`ed (**mtime only** — the tree
+stayed clean; `git status --porcelain` is empty at this commit). Both counts then came back at
+**14**, and the 14 are exactly `envoy-config` plus its dependents — a real dirty set, not a number.
+The build finished in 3.02 s and clippy in 1.94 s because rustc's incremental cache saw *identical
+content* behind the refreshed mtime; the compiler demonstrably ran. **The cold, from-scratch
+compile is CI's, and CI is where that half of gate (e) is authoritative** (state-4 = CI's first real
+execution).
+
+`cargo deny` was run **from the repo root** — it does NOT walk up, unlike build/clippy/fmt/test. It
+emitted **5** `license-not-encountered` warnings (`0BSD`, `BSD-2-Clause`, `MPL-2.0`,
+`Unicode-DFS-2016`, `Zlib` — unmatched *allowances*, not findings), so it was gated on the exit code
+PLUS the four-ok line and never on a loose `warning` grep, which false-positives here.
+
+`cargo build -p envoy-bin` (DEBUG — the differential harness runs the debug binary, never the
+release one) → exit **0**, **11** `Compiling` lines, run before any local differential.
+
+## Gate (e4) — the sweep, run TWICE, censused by the standing recipe
+
+Recipe `grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed'` + awk fields **4**/**6**
+(the `ok`-only form makes `failed=0` tautological; fields `$5`/`$7` return a believable `passed=0`),
+with the binary count asserted **separately** and cross-checked against `grep -c 'test result:
+FAILED'`:
+
+| sweep | wall | binaries | passed | failed | passed+failed | `FAILED` cross-check |
+|---|---|---|---|---|---|---|
+| 1 | 5 m 57 s | **165** | **2184** | **10** | **2194** | 10 ✓ |
+| 2 | 5 m 32 s | **165** | **2187** | **7** | **2194** | 7 ✓ |
+
+**The identity closes exactly on BOTH sweeps: `passed + failed = 2194` over `165` binaries** — and
+`2194 = 2193 + 1`, the CI-confirmed 2193 at `9331ce3`/`c3e6177`/`3861981` plus the ONE test fn this
+slice adds. It also closes the cross-instrument check that matters: **local `passed + failed`
+(2194) == CI `passed` (2194)** at `39e9afc`. The new fixture's binary
+(`tests/runtime_fraction_route_gating.rs`) is present in both sweeps and in neither failing set —
+it PASSED inside both full parallel sweeps, which is a stronger statement than any isolated run.
+
+## Classification — BY ISOLATION ONLY, every RED, no exceptions
+
+Failing names were enumerated from the `---- <name> stdout ----` markers (never by indentation,
+which invents phantom names out of the failure BODY). Set arithmetic over the two sweeps:
+
+- sweep 1 ∖ sweep 2 = **5** — `access_log_file_sink`, `access_log_h2_uf_connect_failure`,
+  `access_log_or_filter`, `http_filter_rbac_fixture`, `set_metadata_dynamic_metadata`
+- sweep 2 ∖ sweep 1 = **2** — `access_log_and_filter`, `xds_file_based_eds_fixture`
+- intersection = **5**, union = **12**
+
+All **12** were then re-run ALONE, sequentially:
+
+| test | in sweeps | ISOLATION | class |
+|---|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** (ADR-0164) |
+| `access_log_h2_uc_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `access_log_rcd_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `access_log_rf_upstream_reset` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `admin_config_dump_server_info` | 1, 2 | `FAILED. 0 passed; 1 failed` | **CORE** |
+| `access_log_and_filter` | 2 | `ok. 1 passed; 0 failed` | TAIL |
+| `access_log_file_sink` | 1 | `ok. 1 passed; 0 failed` | TAIL |
+| `access_log_h2_uf_connect_failure` | 1 | `ok. 1 passed; 0 failed` | TAIL |
+| `access_log_or_filter` | 1 | `ok. 1 passed; 0 failed` | TAIL |
+| `http_filter_rbac_fixture` | 1 | `ok. 1 passed; 0 failed` | TAIL |
+| `set_metadata_dynamic_metadata` | 1 | `ok. 1 passed; 0 failed` | TAIL |
+| `xds_file_based_eds_fixture` | 2 | `ok. 1 passed; 0 failed` | TAIL |
+
+**The five-member ADR-0164 deterministic core reproduced EXACTLY and unchanged** — a changed member
+set, not a changed tail, is what would warrant investigation. These five are LOCAL-only; CI passes
+them (confirmed green at `39e9afc`, `failed=0`).
+
+**The tail is SEVEN this session — and its size carries no signal.** It was 2 at the state-3 exit
+gate and 7 here, on the same commit; membership moves run-to-run and neither number classifies
+anything. Every one of the seven passes alone. Six of the seven share ONE failure text —
+`fixture green: upstream Envoy never became accept-ready … Connection refused (os error 111)` —
+i.e. the upstream **container** missed its 10 s readiness budget while a dozen sibling containers
+were starting under full parallel load. That is the documented parallel-load differential family,
+not a product regression.
+
+**The intersection AGREED with isolation this session — and that is a coincidence, not a method.**
+At the state-3 exit gate the two-sweep intersection was 6 and *disagreed* with isolation
+(`send_request_maps_h2_handshake_failure_to_typed_error` sat in both sweeps yet passed alone). Both
+sessions are the same lesson: ADR-0164 leg (iii) is a SUFFICIENT flake signal, never a NECESSARY
+one. **Only isolation classifies**, and it was run on all 12 rather than on the 7 the intersection
+would have exempted.
+
+**No RED sits on this phase's surface.** `git diff --name-only e458765 3982c89` lists **12** files;
+none is a `crates/envoy-http2/` file, none is an existing fixture, and none is
+`tests/differential/src/lib.rs`.
+
+## Gates (a) and (b) — the differential surface
+
+**(a) the new fixture.** `cargo test -p differential --test runtime_fraction_route_gating`, run
+ALONE three times: `test result: ok. 1 passed; 0 failed` on all three, in **1.11 s / 1.07 s /
+1.10 s**. It ALSO passed inside both full parallel sweeps. The ~1 s figure is normal for a
+backend-free, CLUSTER-FREE fixture and matches the `0087` warm record (1.15–1.24 s).
+
+Re-derived independently of the state-3 claims: `envoy.yaml` and `envoy-rust.yaml` are
+**BYTE-IDENTICAL** — `cmp` silent, both **126** lines, both md5 **`d205936b0390260855f19258dd02f51a`**
+— and the fixture carries no `{{BACKEND_IP}}`, so it spawns no backend and is fully verifiable on
+this host (it is NOT in the `192.168.65.2` backend-routing host-RED class). `expectations.yaml`'s ten
+probes were read against the SPEC §1 table row-for-row: ten DISTINCT `path:` values (the §G
+attribution rule) and ten byte-exact bodies, `P1-GATED / CATCH / CATCH / P4-GATED / P5-GATED /
+CATCH / P7-GATED / CATCH / P9-GATED / CATCH`, matching the measured matrix.
+
+**(b) the 87 pre-existing fixtures.** Green under the isolation classification above: the only
+persistent REDs are the five documented LOCAL-only ADR-0164 core members, and every other RED passes
+alone. **PASS, under the documented local-flake carve-out — CI is authoritative for the five.**
+
+## Gate (c) — conformance
+
+The workspace contains exactly ONE conformance package: `h2spec-conformance` (at
+`tests/conformance/h2spec/`; the package name is NOT `conformance-h2spec`). h3spec, gRPC and
+proxy-wasm suites do not exist — their families are unbuilt, consistent with the three zero-row
+ROADMAP headings.
+
+`cargo test -p h2spec-conformance -- --nocapture` → exit **0**, `3 passed`. **Run with
+`--nocapture` precisely because the gate SELF-SKIPS SILENTLY**, and it did:
+
+```
+h2spec_runner: h2spec not found — skipping locally
+test h2spec_pass_rate_gate ... ok
+```
+
+So the local `3 passed` is two string-parser units plus a **no-op** gate. **Recorded
+SKIPPED-NOT-PASSED locally; CI is authoritative per ADR-0163** (in CI the gate cannot report `ok`
+without actually executing h2spec — the known-failures structural proof). `known-failures.txt` is
+**21** lines carrying exactly **ONE** real entry (`3.5/2`) and was **NOT touched** by this phase
+(`git diff --name-only e458765 3982c89 -- tests/conformance/` is empty), so the declared threshold is
+untouched. **This slice adds no conformance surface.**
+
+## Gate (d) — fuzzing
+
+**Vacuously met: this slice adds NO fuzz target.** Measured — **5** targets across **FIVE** crates
+(`envoy-accesslog`, `envoy-config`, `envoy-filter`, `envoy-http2`, `envoy-jwt`), unmoved; and
+`git diff --name-only e458765 3982c89 -- .github/` is **empty**, so no `ci.yml` step was needed or
+added (a new target is not auto-discovered — omitting the step is how gate (d) goes silently unmet).
+
+## §7.5 verdict
+
+| gate | verdict |
+|---|---|
+| (a) new/changed differential fixtures green | **PASS** — `0088` 3/3 alone + inside both sweeps |
+| (b) pre-existing differential fixtures green | **PASS** — under the documented ADR-0164 LOCAL-only carve-out; all other REDs pass in isolation |
+| (c) conformance at the declared threshold | **PASS, CI-AUTHORITATIVE** — h2spec self-skips locally (ADR-0163); threshold untouched |
+| (d) new fuzzer short-budget CI run | **VACUOUSLY MET** — no fuzz target added |
+| (e) build / clippy / fmt / test / deny | **PASS** — all exit 0, each gated on line counts or its own ok-line, not on an exit code alone |
+| (f) `REVIEW.md` approved | **NOT MET — and correctly so.** State 5 owns it; writing it here would chain 4→5 (§5.1; ADR-0127). |
+
+**Gates (a)–(e) are MET at `3982c89`. The implementation is VERIFIED.** Gate (f) is the next
+session's, by design.
+
+## Findings — BANKED, NOT FIXED (ADR-0127 / ADR-0165)
+
+Twelve findings. Every one was re-verified ON DISK by the main session before being written here (a
+subagent finding is a CLAIM). **None was repaired.** The graded work stands as landed.
+
+**V-1 (Minor) — the net-LoC citation is self-falsifying at the commit that carries it.** Task 5
+Step 4 above and `STATE.md` both state: ``Net LoC MEASURED by `git diff --numstat e458765 HEAD`:
++1001/−9 = 992``. MEASURED now: that pair is the range **`e458765..8644fa4`** (Task 4). At
+**`39e9afc`** — the commit whose `STATE.md` contains the sentence — the same command yields
+**+1200/−25 = 1175**; at HEAD `3982c89`, **+1202/−25 = 1177**. The figure was correct when taken and
+then re-attributed to a later SHA without re-running it. **The `excluding docs/` figure 562 IS
+correct** and is stable across `8644fa4`/`39e9afc`/`3982c89` (every commit after Task 4 is
+docs-only). Consequence: the "**+33%** over the PLAN's ≈745" verdict holds only for the nodocs
+comparison; whole-tree it is ≈+58%. This is the same class as the 109.1 REVIEW M-4 finding that this
+very section of `PROGRESS.md` cites — a session-summary arithmetic claim not re-derived at the commit
+that publishes it.
+
+**V-2 (Minor) — a PLAN byte-identity invariant was broken, and the break was not recorded.**
+`PLAN.md:586` (Task 4 Step 2) requires: "The `200 application/json; body is exactly two top-level
+keys` clause and the table that follows it **must be left byte-identical**." Measured
+`fcad066` → `8644fa4`: the clause was BOTH prefixed and REFLOWED —
+`` `allow: GET` on both sides). 200 `application/json`; body is exactly two`` + `top-level keys:`
+became `answer 200 `application/json`; body is exactly two top-level keys:`, i.e. the substring
+``200 `application/json`; body is exactly two\ntop-level keys:`` occurs **1×** in the old file and
+**0×** in the new. **The table half of the invariant HELD** (13 rows, byte-identical). The edit is
+editorially defensible — removing "on both sides" from the preceding sentence left "200 …" without a
+subject — which is exactly the shape of a reality-forced departure doctrine says must be LABELLED.
+It was not: the ledger describes sites 1–3 only as "now record the TRUE asymmetry". The executor
+demonstrably understood the invariant class, having proven Step 1's parallel byte-identity
+requirement mechanically in Python and written it up.
+
+**V-3 (Minor) — the deviation ledger's completeness claim is falsified by its own commit.** The
+ledger asserts "**No other deviation was taken.** … Nothing outside the PLAN's named files was
+touched". `39e9afc` touches `docs/envoy-rust/STATE.md` (`19 16`) and
+`docs/envoy-rust/STATE_HISTORY.md` (`42 0`), and **`grep -c 'STATE' PLAN.md` = 0** — the PLAN names
+neither file anywhere, and its Task-5 `git add` line lists `PROGRESS.md` alone. Stated fairly: the
+state-3 → state-4 advance is BOOTSTRAP_PROMPT §5 session protocol and sits outside the PLAN's
+authority, the commit message announces it, and an independent audit of the whole diff found the
+edits attributable to protocol rather than to scope creep. The defect is in the LEDGER, which both
+omits the departure and affirmatively denies it — and it is the ledger a later reviewer reconstructs
+from.
+
+**V-4 (Minor) — the contract asserts UNMEASURED upstream behaviour for CF-109-3.**
+`BEHAVIOR_CONTRACT.md:3284-3286`: "Each is boot-fatal here **where upstream accepts**" — universally
+quantified over CF-109-1/2/3. Upstream acceptance is measured for CF-109-1 (cell 5) and CF-109-2
+(cells 7/8); **neither source matrix contains a single jwt probe cell**, so the CF-109-3 leg of
+"each" has no measurement anywhere. Exactly the "a doc claim is an inherited census" class the
+subsection itself warns about elsewhere.
+
+**V-5 (Minor) — the cascade's step 2 folds upstream-unmeasured classes into a "one row per measured
+cell" enumeration.** `:3266-3267`: "Otherwise — bools, non-numeric strings, **the empty string,
+non-finite spellings** — → `default_value` (cells 10, 11, B1-B3)." Cells 10/11 are `"abc"` and
+B1-B3 are bools; **no cell covers the empty string or a non-finite spelling**, and `109.1/SPEC.md`
+explicitly excludes those as not-measured-upstream. The adjacent empty-`runtime_key` sentence models
+the correct treatment ("upstream-unmeasured; … recorded"); step 2 drops the marker.
+
+**V-6 (Minor) — the CF-109-1 bullet contradicts the contract's own F3/S1 rows.** `:3288-3291` says
+the class includes cells F3 and S1 "**because upstream samples them per request**". But row F3
+(`:3244`) records `FALLBACK 40/40` with the explicit hedge "0.5% sampling and truncate-to-0 are
+indistinguishable at n=40", and S1 (`:3248`) likewise records `FALLBACK 40/40` with no sampling
+claim. Per-request sampling is measured only for cells 5 (n=60) and F4 (GATED 1/40). The bullet
+asserts flatly what its own table hedges.
+
+**V-7 (Nit) — the probe-count preamble is wrong for cell 5.** `:3219-3221` says cells 1-13 were
+measured "**30 probes each** (cells 1/3/9/13 RE-RUN at 40/40 at the state-2 split)". Cell 5 was
+**n=60** (`GATED 27 / FALLBACK 33`) per `109/SPEC.md:43` and per the contract's own row `:3230`;
+cell 9 already read 40/40 at the pick. The table rows are right — only the preamble generalises.
+
+**V-8 (Nit) — the "`edge:`-only" characterisation of the unit table's remainder is incomplete, and
+incomplete about rows THIS phase added.** `:3250-3253` says the extras beyond the 23 are "labelled
+`edge:`". Measured in `route_fraction_gate_pins_every_measured_cell`: **11** `edge:`-labelled rows
+**plus the 3 `M-1`/`M-2`/`M-3` rows Task 1 landed**, which carry no `edge:` label and are equally
+upstream-unmeasured. A reader applying the stated rule would count the M-rows as measured. (The
+contract's *positive* claim — "these 23 rows are the MEASURED contract and nothing else is" — holds
+exactly.)
+
+**V-9 (Nit) — the fixture-partition paragraph reads as exhaustive but accounts for 15 of 23 cells.**
+`:3311-3316`: 9 pinned by `0088` + 4 nondeterministic + 2 reject-direction = **15**. Cells **11, B1,
+B2, B3, F1, F2, N1, N2** are deterministic, non-fatal, and simply absent — they COULD appear in a
+fixture, and a later reader will infer the partition is complete. Separately, "the jwt surface" is
+listed among "cells" but is not a cell in either matrix.
+
+**V-10 (Nit) — "upstream also accepts `>`" has no cell.** `:3271-3272` records that divergence for
+`default_value` numerator > denominator. Enumerated: **no probe in either source matrix sets a
+`default_value` numerator greater than its denominator** (cell 12 probes a runtime *value* of 200,
+a different quantity). Inherited from the fault/CSRF house discipline, not measured here.
+
+**V-11 (Nit) — CF-109-1's unblock condition is narrower than the ledger's.** `:3292` gives
+"*Unblocked by* a phase that lands per-request sampling"; `109/SPEC.md` §6 and ADR-0175 D5 both give
+it as **a PRNG ADR *plus* a §7.2 contract-relaxation ADR** (shared with the non-deterministic-LB
+candidate). Not contradictory — the second gate is simply dropped.
+
+**V-12 (Nit) — no task-boundary gate is recorded for Task 3.** `PLAN.md:19` (Global Constraint)
+requires every task boundary to run build / clippy / `fmt --check`. Tasks 1, 2 and 4 each record
+theirs above; the Task 3 section records only its structural verification. Task 3 is docs-only and
+Task 5's full gate covers the tree afterwards, so this is harmless in substance — but it is a
+prescribed check neither evidenced nor waived.
+
+### Two standing census recipes corrected forward
+
+- **`grep -c '^## ADR-'` returns 173, not 172.** The extra is the schema template
+  `## ADR-NNNN: <title>` at `DECISIONS.md:10`, which carries no 4-digit number. The numbered form
+  `grep -c '^## ADR-[0-9]\{4\}'` = **172**, with no duplicates, against a head of **ADR-0176** — the
+  numbering is sparse and 172-vs-176 needs no reconciling.
+- **`ADR-0177` DOES appear once in `DECISIONS.md`**, at `:2426`, as prose inside ADR-0176's
+  `**Consequences.**` paragraph ("next available **ADR-0177** (unreserved)"). The substantive claim
+  is intact — `grep -c '^## ADR-0177'` = **0**, so no ADR-0177 has fired — but "does not appear
+  anywhere" is false and a future session grepping the bare string will get a hit.
+
+## Censuses RE-DERIVED at this verification (every one measured, none inherited)
+
+**88** fixture dirs (highest `0088-runtime-fraction-route-gating`, so `0089` is next) / **88**
+differential test files — via `git ls-files 'tests/fixtures/**' | cut -d/ -f3 | sort -u | wc -l`,
+since `git ls-files 'tests/fixtures/*/'` is a vacuous glob returning a clean-looking ZERO. **165**
+test binaries; identity `passed + failed = 2194`. **134** `ConfigError` variants, the enum
+brace-matched to `lib.rs:75-1105` (a naive `grep -cP '^    [A-Z]'` over the whole file returns
+**162**). Fuzz `.gitignore` **69**/**66**/**66**, **envoy-config-SCOPED** — a workspace-wide
+`git ls-files 'crates/*/fuzz/corpus/**'` returns **78** and answers a DIFFERENT question, not a
+drift. **5** fuzz targets across FIVE crates. **21**-line `known-failures.txt` (ONE real entry).
+**14** crates (no `envoy-runtime` — ADR-0172 D8: the snapshot store is a MODULE in `envoy-config`).
+**117** phase directories. `runtime.rs` **910** lines; `bootstrap.rs` **21950**;
+`BEHAVIOR_CONTRACT.md` **4045** with **15** `## ` and **24** `### ` (both held constant by the
+phase); `STATE.md` **204** lines with **5** `## ` / **3** `### ` and its `**Standing traps**` line
+MEASURING **130784** CHARACTERS (**131902** bytes — `wc -c` reads ~1118 high on multi-byte glyphs);
+`STATE_HISTORY.md` **15885** by `wc -l` (a python `split("\n")` reads **15886**, one higher, for the
+trailing newline); `109.2/PLAN.md` **656**; `109.2/PROGRESS.md` **450** before this section.
+
+## Stop condition — RE-MEASURED, FALSE on all three legs (the FORTY-FIRST consecutive)
+
+- **(i)** ROADMAP **113 data rows / 111 `done` / 1 `in-progress` / 1 `planned`**, the two non-`done`
+  rows ENUMERATED BY ID (`109` → `in-progress`, `109.2` → `planned`) rather than inferred from a
+  count. A state-4 verification flips no cell. **FALSE.**
+- **(ii)** `109.2` is implemented and now VERIFIED, but NOT reviewed and NOT closed; parent `109` is
+  still open; `RuntimeUInt32`/CSRF consumers, RTDS and hot restart remain unbuilt. **FALSE.**
+- **(iii)** THREE family headings still carry ZERO rows — `### HTTP/3 + QUIC family`, `### gRPC
+  family`, `### WASM host family` — re-measured by a heading-slice census walking all **11** `### `
+  headings (10 / 5 / 3 / 14 / **0** / **0** / 6 / 29 / 6 / **0** / 13). **FALSE.**
+
+**No `stop` file was created and none exists.** The next session is the `109.2` §5 **state-5 code
+review** — a SEPARATE session (§5.1; ADR-0127), which must read `109.1/REVIEW.md` §8 BEFORE grading
+or it will re-derive that round's banked findings as if new.
