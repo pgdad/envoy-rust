@@ -99,3 +99,95 @@ equally sound but splits Task 1 across two commits.
   the clippy cache are independent and were measured BOTH cold-no-op at once at
   109.1 state-4, so both counts are gated separately).
 - `cargo fmt --all -- --check` → exit 0, silent.
+
+---
+
+## Task 2 — fixture `0088-runtime-fraction-route-gating` + its differential entrypoint ✅
+
+- **TDD RED first.** `tests/differential/tests/runtime_fraction_route_gating.rs` was written
+  BEFORE any fixture file existed. `cargo test -p differential --test runtime_fraction_route_gating`
+  → exit 101 with a real `test result: FAILED. 0 passed; 1 failed` line and the panic naming the
+  missing file: `fixture green: reading …/tests/fixtures/0088-runtime-fraction-route-gating/expectations.yaml`.
+  (A compile error would NOT have been a RED — the `test result:` line's existence was asserted.)
+- **Harness facts re-verified on disk before transcribing** (a pre-flight is a CLAIM, never an
+  inheritance): `driver_needs_admin_port` (`tests/differential/src/lib.rs:3066-3074`) matches only
+  `AdminScrape`/`Http1KeepAlive`/`Http2KeepAlive`/`TcpWithStats` — **`Http1ProbeList` is absent**,
+  confirming the PLAN's X-1 refutation of the SPEC's `{{ADMIN_PORT}}` spelling; `Http1ProbeList`
+  IS listed in `port_key_for` (`:3011`). Fixture census RE-DERIVED: **87** dirs
+  (`git ls-files 'tests/fixtures/**' | cut -d/ -f3 | sort -u | wc -l`), **87** differential test
+  files, highest `0087-runtime-static-layer` — so `0088` was still the next free number.
+  `docker image inspect` confirmed the local `envoyproxy/envoy:v1.33.0` digest is
+  `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`, byte-matching the
+  `ENVOY_TARGET.md` pin.
+- **Both YAMLs and `expectations.yaml` were EXTRACTED PROGRAMMATICALLY from `PLAN.md`'s fenced
+  blocks** rather than retyped, so transcription fidelity is structural rather than hopeful.
+  `envoy.yaml` = **126** lines (exactly the PLAN's MEASURED figure), `expectations.yaml` = 124
+  lines. `expectations.yaml` was PARSE-CHECKED with a YAML loader before any run (the 109.1 lesson
+  that a plan's YAML can omit a required field and land twice): 10 probes, `kind: http1_probe_list`,
+  every `path`/`expected_body`/`expected_status` matching the SPEC §1 table row-for-row.
+- **BYTE-IDENTICAL configs proved, not asserted:** `cmp` silent, both **126** lines, both md5
+  `d205936b0390260855f19258dd02f51a`.
+- **GREEN cross-proxy on first contact:** `test result: ok. 1 passed; 0 failed`, **1.28 s** cold in
+  this session's already-warm image cache, **1.02-1.07 s** warm across four further runs.
+
+### The byte-identical-pair census, RE-DERIVED (never inherited)
+
+Of the **87** pre-existing fixture pairs carrying both YAMLs, exactly **ONE** is byte-identical:
+`0027-xds-file-based-lds`. So `0088` is the **SECOND**, as the PLAN predicted — but the number was
+re-measured by `cmp`-ing all 87 pairs, not taken from the PLAN. `tests/fixtures/` now holds **88**
+directories.
+
+### FINDING — a suspiciously-fast green was audited, and THE PROBE WAS THE DEFECT
+
+A ~1 s cross-proxy green invites the "silent skip" suspicion, so `docker ps` was polled during a
+re-run. **The first poll reported ZERO containers** — which looked exactly like a fixture going
+green without ever starting upstream Envoy. It was not: the poll used
+`docker ps --format '{{.ID}} {{.ImageID}} …'`, and **`.ImageID` is not a valid `docker ps` field**,
+so every one of the 40 poll lines was `failed to execute template: … can't evaluate field ImageID`
+— the probe produced NOTHING and its emptiness read as a clean census. This is the
+`uniform-md5-can-be-the-EMPTY-file-md5` class in a new guise: **a probe that fails to execute
+returns a believable zero.**
+
+Re-run with a valid format, the upstream container is plainly there — **7 sightings** of
+`e3a0fb318032 envoyproxy/envoy:v1.33.0 Up Less than a second 0.0.0.0:55002->10000/tcp` — port-mapped
+(`-p`, never `--network host`) and resolved by container/image ID rather than by the first matching
+line. The ~1 s warm figure is consistent with the 108.2 record for `0087` (7.88 s cold /
+1.15-1.24 s warm). **The green is real; the alarm was an artifact of the instrument.**
+
+### Step 7 — the two vacuity mutations
+
+| # | mutation | measured result |
+|---|---|---|
+| V1 | `override_layer`'s `gate.layered: 0` → `100`, in BOTH yamls (targeted as the file's LAST non-empty line, asserted equal to the expected text before rewriting) | **RED** — `probe p8-two-layer-last-wins: upstream body != expected`, `expected: [67, 65, 84, 67, 72]` (= `CATCH`). The fixture witnesses last-layer-wins precedence, not merely the base layer. p8 is the 8th probe and the driver aborts at the FIRST failure, so p1-p7 necessarily passed under the mutation. |
+| V2a | p9's `denominator: MILLION` → `HUNDRED` | **GREEN**, exactly as the PLAN predicted — the cell stops discriminating the denominator reading while the probe still passes (the consulted `100` gates either way). Recorded because a GREEN mutation is a finding, not a non-event. |
+| V2b | p9's `runtime_key` → the ABSENT key `gate.absent.p9`, `MILLION` default restored, so the default decides | **RED** — `probe p9-integer-is-numerator-over-hundred`, `expected: [80, 57, 45, 71, 65, 84, 69, 68]` (= `P9-GATED`). Proves p9's witness comes from the CONSULTED value, not from the default. |
+
+### DEVIATION 2 (RECORDED) — the PLAN's revert check is a FALSE CLEAN on an uncommitted fixture
+
+PLAN Task 2 Step 7 prescribes reverting each mutation with
+`git checkout -- tests/fixtures/0088-runtime-fraction-route-gating/ && git diff --stat` "must be
+EMPTY". **At this point in the task order the fixture is still UNTRACKED** (it is created and
+committed in this same task), so `git checkout --` is a **NO-OP** — it silently leaves the mutated
+bytes in place — and `git diff --stat` is empty **for the wrong reason**: untracked files never
+appear in `git diff` at all. Measured live: after V1 the checkout ran, `git status --porcelain`
+still showed only `?? tests/fixtures/0088-runtime-fraction-route-gating/`, and the yamls' md5 was
+still the MUTATED `ddcc8e79f8ec612b8a2227960c82167c`.
+
+**What was done instead:** each mutation was reverted by RE-EXTRACTING the yaml from `PLAN.md`'s
+fenced block — the same byte source the files were created from — and the revert was adjudicated
+by **md5 equality with the pre-mutation value** (`d205936b0390260855f19258dd02f51a`), plus a fresh
+`cmp` byte-identity check and a re-run to GREEN. This is strictly stronger than the prescribed
+check and does not depend on the file's tracked/untracked state. The same trap applies to any
+future fixture-adding task that mutates its own fixture before committing it.
+
+### Task 2 gate
+
+- `cargo build --workspace --all-targets` → exit 0, **1** `Compiling` line (non-zero; the dirty set
+  is exactly the new differential test target).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0, **1** `Checking`
+  line (non-zero — a `Checking` count measures the cache's dirty set, and 1 is the correct dirty set
+  here, not a cached no-op which would be 0).
+- `cargo fmt --all -- --check` → exit 0, silent.
+- `cargo test -p differential --test runtime_fraction_route_gating` → `test result: ok. 1 passed; 0 failed`.
+- `tests/differential/src/lib.rs` was **NOT** modified — this fixture needs zero harness change, as
+  PLAN-VERIFY X-1 predicted and as the untouched `git status` confirms.

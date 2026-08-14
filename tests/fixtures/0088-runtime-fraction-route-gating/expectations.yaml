@@ -1,0 +1,124 @@
+# Sub-phase 109.2 (ADR-0175/0176): ten sequential HTTP/1.1 probes against a
+# backend-free, CLUSTER-FREE HCM listener (`clusters: []`, direct_response
+# only) whose routes carry `match.runtime_fraction`. A two-static-layer
+# `layered_runtime` block supplies the consulted values.
+#
+# This is the FIRST differential witness of `runtime_fraction` in the corpus
+# and the first fixture combining `Http1ProbeList` traffic with
+# `layered_runtime`.
+#
+# Each probe has a DISTINCT path (the attribution rule, BEHAVIOR_CONTRACT.md
+# "Why every probe carries a DISTINCT `path:`") and each gated route answers a
+# DISTINCT body `P<N>-GATED`. Nine routes are gated; the tenth is a bare
+# `prefix: "/"` catch-all answering `CATCH`. So the expected body IS the gate's
+# verdict: a gate that wrongly PASSES answers `P<N>-GATED` where `CATCH` is
+# expected, and a gate that wrongly BLOCKS answers `CATCH` where `P<N>-GATED`
+# is expected. Both directions are covered — five probes expect a gated body
+# and five expect `CATCH`.
+#
+# THE MEASURED CELLS (parent 109/SPEC.md §1.1 + 109.1/SPEC.md §1.2, measured
+# against envoyproxy/envoy:v1.33.0; re-measured cross-proxy at the 109.2
+# PLAN-write over three independent passes):
+#   absent key            -> default_value honoured, BOTH directions (p1, p2)
+#   consulted key         -> OVERRIDES the default                  (p3, p4)
+#   value >= 100          -> always passes                          (p5)
+#   quoted numeric string -> parses like the integer                (p6)
+#   unparseable value     -> falls back to default_value            (p7)
+#   two layers            -> last-layer-wins `final_value` honoured (p8)
+#   integer value         -> numerator over HUNDRED, NOT over the default's
+#                            denominator — a 0/MILLION default gated by the
+#                            value 100 (p9). Under the wrong reading this is a
+#                            ~10^-4 event per request; no 0/100 fixture could
+#                            ever catch it.
+#
+# NOT here, deliberately: every per-request-NONDETERMINISTIC cell
+# (0 < v < 100 — integer 50, floats 0.5/1.5, the quoted "0.5") is boot-fatal
+# under CF-109-1 and is witnessed by 109.1's in-process reject tests. Same for
+# the map-shaped consulted key (CF-109-2) and `runtime_fraction` inside jwt
+# rules (CF-109-3). A fixture cannot witness a config that refuses to boot.
+driver:
+  kind: http1_probe_list
+  probes:
+    # ---- p1: absent key, default 100/HUNDRED -> GATED --------------------
+    - name: p1-absent-key-default-on
+      method: get
+      path: "/p-default-on"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "P1-GATED" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p2: absent key, default 0/HUNDRED -> falls through --------------
+    - name: p2-absent-key-default-off
+      method: get
+      path: "/p-default-off"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "CATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p3: key 0 OVERRIDES default 100 -> falls through -----------------
+    - name: p3-key-zero-overrides-default-on
+      method: get
+      path: "/p-key-zero"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "CATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p4: key 100 OVERRIDES default 0 -> GATED -------------------------
+    - name: p4-key-hundred-overrides-default-off
+      method: get
+      path: "/p-key-hundred"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "P4-GATED" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p5: value 200 >= 100 -> GATED ------------------------------------
+    - name: p5-key-twohundred-always
+      method: get
+      path: "/p-key-twohundred"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "P5-GATED" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p6: quoted "0" parses like the integer -> falls through ----------
+    - name: p6-quoted-zero-parses-like-integer
+      method: get
+      path: "/p-quoted-zero"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "CATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p7: unparseable -> default 100 -> GATED --------------------------
+    - name: p7-unparseable-falls-back-to-default
+      method: get
+      path: "/p-unparseable"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "P7-GATED" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p8: two layers, override wins, final "0" -> falls through --------
+    - name: p8-two-layer-last-wins
+      method: get
+      path: "/p-two-layer"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "CATCH" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p9: integer value is numerator over HUNDRED, not MILLION -> GATED
+    - name: p9-integer-is-numerator-over-hundred
+      method: get
+      path: "/p-million"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "P9-GATED" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- p10: the bare catch-all itself, ungated ---------------------------
+    - name: p10-bare-catchall
+      method: get
+      path: "/p-catch"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "CATCH" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }
