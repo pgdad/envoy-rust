@@ -198,13 +198,22 @@ UPPERCASE. This is the gRPC spec's `Status-Message` percent-encoding, and the
 
 Recorded because each would otherwise propagate (a handed count is a claim):
 
-1. **The ROADMAP pipe-trap is overstated.** The `STATE.md` Standing-traps line
-   asserts "⚠ NINE ROADMAP rows still carry UNESCAPED PIPES (incl. `76` and
-   `108`)". MEASURED: **6** rows contain a pipe inside a cell, and only **2**
-   (lines 155 and 156, rows `38` and `39`) actually split to other than 6
-   cells. Rows `76` and `108` use **ESCAPED** `\|` and split cleanly to 6.
-   The operational rule is unaffected and was used here: split on `' | '`
-   WITH surrounding spaces, read status as FIELD 4.
+1. **The ROADMAP pipe-trap claim is part-right and part-wrong — and this
+   SPEC's first attempt to correct it was itself wrong, so the corrected
+   measurement is stated here in full.** MEASURED four ways over all 114
+   rows: **9** rows carry an in-cell pipe (raw `|` count != 7 — `36`, `38`,
+   `39`, `52`, `54`, `66`, `70`, `76`, `108`), so the inherited count of NINE
+   is CORRECT; **5** of them escape at least one as `\|` (`38`, `66`, `70`,
+   `76`, `108`), so the word UNESCAPED overstates it and "(incl. `76` and
+   `108`)" MISLABELS those two, which are escaped and split cleanly; only
+   **2** (`38`, `39`) actually mis-split on `' | '`; and **field 4 holds a
+   valid status on all 114 rows**. A raw-pipe census and a `' | '`-split
+   census answer DIFFERENT questions — filtering on "has `\|` OR mis-splits"
+   silently misses `36`/`52`/`54`, which is how the understated "6" arose.
+   ADR-0177's corresponding item carries that understated figure and is
+   superseded by this one; the ADR is append-only and was not rewritten.
+   The operational rule is unaffected: split on `' | '` WITH surrounding
+   spaces, read status as FIELD 4, and never "fix" the rows.
 2. **`Http1ProbeList` is used by 14 fixtures, not 13** (`109/SPEC.md:119`'s
    figure went stale when `0088` landed).
 3. A subagent reported `Http1ProbeList` usage as "1 fixture" by grepping the
