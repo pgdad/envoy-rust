@@ -70,6 +70,37 @@ pub(crate) fn http_to_grpc_status(status: u16) -> u8 {
     }
 }
 
+/// Percent-encode a local-reply body for the `grpc-message` header.
+///
+/// MEASURED rule against `envoyproxy/envoy:v1.33.0`: a byte passes through
+/// UNCHANGED iff it is in `0x20..=0x7D` AND is not `%` (0x25). Every other
+/// byte — every byte `< 0x20`, every byte `>= 0x7E`, and `%` itself — becomes
+/// `%` followed by TWO UPPERCASE hex digits. Multi-byte UTF-8 is encoded PER
+/// BYTE, so `é` (0xC3 0xA9) becomes `%C3%A9`.
+///
+/// Note the UPPER boundary: `}` (0x7D) passes through but `~` (0x7E) is
+/// ESCAPED to `%7E`. The parent phase-110 SPEC stated the range as
+/// `0x20..=0x7E`; that was MEASURED FALSE at the 110.1 PLAN-write.
+///
+/// The output is always ASCII, so building it as a `String` is sound: every
+/// pushed byte is either an ASCII pass-through or one of `%0123456789ABCDEF`.
+pub(crate) fn grpc_message_encode(body: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Most local-reply bodies are plain ASCII prose, so the common case is a
+    // 1:1 copy; reserving `body.len()` avoids a realloc for those.
+    let mut out = String::with_capacity(body.len());
+    for &byte in body {
+        if (0x20..=0x7D).contains(&byte) && byte != b'%' {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0F)] as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +182,81 @@ mod tests {
             "content-type",
             "application/grpc "
         )])));
+    }
+
+    /// The MEASURED encoder, on the exact nine bodies probed at the 110.1
+    /// PLAN-write. Bodies were supplied to upstream as `inline_bytes` (base64)
+    /// so the source bytes are exact, and each was probed WITH and WITHOUT the
+    /// gRPC content-type so the control gave the byte-exact original.
+    ///
+    /// The DISCRIMINATING cells, each of which a plausible hand-rolled encoder
+    /// gets wrong:
+    ///   * `~` (0x7E) IS ESCAPED to `%7E`. The parent phase-110 SPEC claimed
+    ///     `0x20..=0x7E` passes through; that was MEASURED FALSE.
+    ///   * `}` (0x7D) PASSES THROUGH — it is the true upper bound.
+    ///   * `%` becomes `%25`, so the input `%25` renders as `%2525`.
+    ///   * multi-byte UTF-8 is encoded PER BYTE (`é` -> `%C3%A9`).
+    ///   * hex digits are UPPERCASE.
+    #[test]
+    fn encoder_matches_upstream_on_every_measured_body() {
+        let cells: &[(&[u8], &str)] = &[
+            (
+                b"a b\ncontrol\ttab \xc3\xa9 %25 end",
+                "a b%0Acontrol%09tab %C3%A9 %2525 end",
+            ),
+            (b"q\"b s\\l t~t d\x7fd", "q\"b s\\l t%7Et d%7Fd"),
+            (
+                b"  ~ +,/:;=?@[]{}|^`<>#&*()",
+                "  %7E +,/:;=?@[]{}|^`<>#&*()",
+            ),
+            (b"~", "%7E"),
+            (b"\x7f", "%7F"),
+            (b"%25", "%2525"),
+            (b"\"\\", "\"\\"),
+            (b"}~", "}%7E"),
+            (b"\x1f ", "%1F "),
+        ];
+        for (input, expected) in cells {
+            assert_eq!(
+                grpc_message_encode(input),
+                *expected,
+                "encoding {input:?} must produce {expected:?}"
+            );
+        }
+    }
+
+    /// The rule as a property over EVERY single byte: pass through iff the byte
+    /// is in `0x20..=0x7D` AND is not `%` (0x25); otherwise `%` + two UPPERCASE
+    /// hex digits. Sweeping all 256 byte values pins both boundaries (0x1F/0x20
+    /// at the bottom, 0x7D/0x7E at the top) and the `%` carve-out, so an
+    /// off-by-one in either direction is impossible to land.
+    #[test]
+    fn encoder_rule_holds_for_every_byte_value() {
+        for byte in 0u8..=255u8 {
+            let got = grpc_message_encode(&[byte]);
+            let expected = if (0x20..=0x7D).contains(&byte) && byte != b'%' {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            };
+            assert_eq!(got, expected, "byte 0x{byte:02X} encoded wrongly");
+        }
+    }
+
+    /// An empty body encodes to an empty string. (Whether the HEADER is emitted
+    /// at all for an empty body is the transform's decision, pinned in Task 4 —
+    /// upstream OMITS it entirely rather than sending an empty value.)
+    #[test]
+    fn empty_body_encodes_to_empty_string() {
+        assert_eq!(grpc_message_encode(b""), "");
+    }
+
+    /// Hex digits are UPPERCASE, not lowercase — a `{:02x}` slip is the single
+    /// most likely encoder bug and it is invisible in the ASCII-only cells.
+    #[test]
+    fn hex_digits_are_uppercase() {
+        assert_eq!(grpc_message_encode(b"\xab\xcd\xef"), "%AB%CD%EF");
+        assert_eq!(grpc_message_encode(&[0x0a, 0x1b, 0x7f]), "%0A%1B%7F");
     }
 
     /// The MEASURED mapping matrix — a SPARSE EIGHT-ENTRY table over a DEFAULT
