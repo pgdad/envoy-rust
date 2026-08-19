@@ -13,6 +13,12 @@ pub const CONTENT_TYPE: &str = "content-type";
 /// value-exact by `diff_headers` — never add it there.
 pub const LOCATION: &str = "location";
 
+/// 110.1: the gRPC local-reply response headers and content-type value.
+/// MEASURED against `envoyproxy/envoy:v1.33.0` — lower-case on the wire.
+pub const GRPC_STATUS: &str = "grpc-status";
+pub const GRPC_MESSAGE: &str = "grpc-message";
+pub const GRPC_CONTENT_TYPE: &str = "application/grpc";
+
 /// Find a header by name using case-insensitive comparison per HTTP/1.1 §3.2.
 /// Returns the value of the first matching header, or `None`.
 pub fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

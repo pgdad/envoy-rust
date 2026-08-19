@@ -14,7 +14,11 @@
 pub mod client;
 pub mod codec;
 pub mod date;
+// 110.1: gRPC-aware local replies. DELIBERATELY `pub(crate)` — see the module
+// doc. Nothing outside this crate may reach it, because `envoy-http2` shares
+// this crate's `build_response` and must stay untransformed (CF-110-1).
 mod error;
+pub(crate) mod grpc;
 pub mod hcm;
 pub mod headers;
 pub mod pool; // 13.1 NEW (Task 3): per-cluster H1 connection pool.
