@@ -1409,6 +1409,71 @@ zero-row headings: ['### HTTP/3 + QUIC family', '### WASM host family']
 
 ---
 
+## CI confirmation — gate (c) settled, and the identity correctly did NOT move
+
+Recorded by the follow-up record commit `a1e2cdd` (numstat `2 0`), on the
+state-4 advance commit's FULL 40-char SHA interpolated from `git rev-parse HEAD`
+— never retyped, because a short or retyped SHA silently returns `[]`.
+
+```
+$ gh run list --commit e89d2786c2fce4ec5ac5de5fce8890a3566ef19a --json databaseId,status,conclusion,headSha
+[{"conclusion":"success","databaseId":32256633910,
+  "headSha":"e89d2786c2fce4ec5ac5de5fce8890a3566ef19a","status":"completed"}]
+
+$ gh api repos/pgdad/envoy-rust/actions/runs/32256633910/jobs \
+   --jq '.jobs[] | {name, id, conclusion, runner_name, steps: (.steps|length)}'
+{"conclusion":"success","id":96079736111,
+ "name":"fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse + grpc_health_decode,...",
+ "runner_name":"GitHub Actions 1000005381","steps":13}
+{"conclusion":"success","id":96079736277,"name":"build + test + lint",
+ "runner_name":"GitHub Actions 1000005380","steps":15}
+```
+
+**Attempt 1, no rerun needed. Steps 15/13, both jobs enumerated via the jobs API
+and selected BY NAME, both with REAL runner names — not the `runner_name:""` +
+`steps:0` starvation shape.**
+
+### The census — the `(ok|FAILED)` recipe, awk fields 4/6
+
+```
+$ wc -c ci_build.log
+682489 ci_build.log
+$ grep -oE 'test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed' ci_build.log \
+   | awk '{b++; p+=$4; f+=$6} END {print "binaries="b" passed="p" failed="f" sum="p+f}'
+binaries=165 passed=2227 failed=0 sum=2227
+$ grep -c 'test result: FAILED' ci_build.log
+0
+```
+
+**`binaries=165 passed=2227 failed=0`.** The identity **did NOT move** — 2227 →
+2227 — which is exactly what a DOCS-ONLY commit must show (and docs-only pushes
+DO build). The state-3 commit moved it 2194 → 2227 for the 33 tests added; this
+commit adds none, and it did not move. **The local `passed + failed = 2227`
+cross-checks against CI's `passed = 2227` with `failed = 0`, so every RED
+classified above as host-environmental is confirmed to pass in CI** — including
+all five ADR-0164 stable-core members and all 24 pass-alone names.
+
+### Gate (c) — settled here, and ONLY here
+
+```
+$ grep -c 'h2spec not found' ci_build.log
+0
+$ grep -o 'test h2spec_pass_rate_gate \.\.\. ok' ci_build.log
+test h2spec_pass_rate_gate ... ok
+```
+
+**Zero self-skip messages AND the gate reported `ok`, so h2spec genuinely
+EXECUTED — the EIGHTH consecutive commit (ADR-0163).** Contrast the local run
+reproduced earlier in this section, which printed `h2spec not found — skipping
+locally` and *still* reported `ok`. **Gate (c) is GREEN.**
+
+### Final gate ledger
+
+**(a) N/A · (b) GREEN · (c) GREEN · (d) GREEN · (e) GREEN · (f) state-5's.**
+Every §8 item is now green or correctly out of scope for a state-4.
+
+---
+
 ## Next state
 
 Sub-phase `110.1` now sits at §5 **state 4 complete** — `SPEC.md` + `PLAN.md` +
