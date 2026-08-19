@@ -7266,4 +7266,129 @@ static_resources:
             _other => panic!("expected BuildOutcome::Synth(301) from the shared seam"),
         }
     }
+
+    /// Config fixture for the 110.1 W-4 negative witness: an `Http1HCMConfig`
+    /// with ONE virtual host and ONE `prefix: "/"` route whose action is a
+    /// `direct_response`. The `direct_response` sibling of
+    /// `h2_redirect_h1_config`, modelled on it exactly.
+    async fn h2_direct_response_h1_config(status: u16, body: &str) -> Http1HCMConfig {
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test_h2_direct_response".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                            runtime_fraction: None,
+                        },
+                        action: RouteAction::DirectResponse(envoy_config::DirectResponse {
+                            status,
+                            body: envoy_config::DataSource {
+                                filename: None,
+                                inline_string: Some(body.to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Http1HCMConfig::from_config(
+            &cfg,
+            cluster_mgr,
+            registry,
+            None,
+            Arc::new(RuntimeSnapshot::default()),
+        )
+        .await
+        .expect("build HCMConfig")
+    }
+
+    /// 110.1 W-4 — THE NEGATIVE WITNESS THAT SHAPES THE WHOLE 110.1 DESIGN.
+    ///
+    /// HTTP/2 has no route-action dispatch of its own: it calls
+    /// `envoy_http1::build_response` (`crates/envoy-http2/src/hcm.rs:518-522`).
+    /// 110.1 makes envoy-rust rewrite LOCALLY GENERATED HTTP/1.1 replies into
+    /// upstream's gRPC shape when the request carries a gRPC `content-type` —
+    /// and it must do so at the H1 WIRE FUNNELS only, NEVER inside
+    /// `synth_with`, any `synth_*` wrapper, or `build_response`.
+    ///
+    /// If anyone ever "simplifies" the transform down onto the shared path,
+    /// this test goes RED. Without it, that refactor would silently transform
+    /// H2's route-decision replies (direct_response / 400 / 404 / redirect)
+    /// while leaving H2's own `synth_h2_*` upstream-failure family untouched —
+    /// a PARTIALLY covered family on the H2 wire, exactly the ADR-0049
+    /// silent-divergence class.
+    ///
+    /// HTTP/2 gRPC-aware local replies are CF-110-1 and are OUT OF SCOPE for
+    /// 110.1. Their upstream shape IS measured (headers-only, no trailers,
+    /// `content-length` OMITTED rather than `0`), so this test asserts
+    /// envoy-rust's CURRENT untransformed H2 behaviour, not upstream parity.
+    #[tokio::test]
+    async fn h2_route_decision_reply_is_not_grpc_transformed() {
+        let h1cfg = h2_direct_response_h1_config(404, "B404").await;
+        let mut req = Request {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            version: envoy_http1::HttpVersion::Http11,
+            headers: vec![
+                ("host".to_string(), "envoy-rust.test".to_string()),
+                ("content-type".to_string(), "application/grpc".to_string()),
+            ],
+            bytes_consumed: 0,
+            body: None,
+        };
+        match build_response(&h1cfg, &mut req, false) {
+            BuildOutcome::Synth(resp, _details) => {
+                assert_eq!(
+                    resp.status, 404,
+                    "H2 must keep the CONFIGURED status — 110.1's transform must not reach the shared path"
+                );
+                assert_eq!(
+                    resp.headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.as_str()),
+                    Some("text/plain"),
+                    "H2 must keep text/plain, not application/grpc"
+                );
+                assert!(
+                    !resp
+                        .headers
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case("grpc-status")),
+                    "H2 must carry NO grpc-status: {:?}",
+                    resp.headers
+                );
+                assert!(
+                    !resp
+                        .headers
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case("grpc-message")),
+                    "H2 must carry NO grpc-message: {:?}",
+                    resp.headers
+                );
+                assert_eq!(&resp.body[..], b"B404", "H2 must keep the body");
+            }
+            _other => panic!("expected BuildOutcome::Synth from the shared seam"),
+        }
+    }
 }
