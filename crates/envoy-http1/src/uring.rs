@@ -288,8 +288,8 @@ async fn serve_conn(config: Arc<HCMConfig>, mut down: TcpStream) -> Result<(), H
         };
 
         match outcome {
-            BuildOutcome::Synth(resp, _details) => {
-                write_owned(&mut down, &resp, &mut write_buf).await?;
+            BuildOutcome::Synth(mut resp, _details) => {
+                write_owned(&mut down, &mut resp, &req.headers, &mut write_buf).await?;
                 tick_class(&config, resp.status);
             }
             BuildOutcome::Proxy {
@@ -309,8 +309,8 @@ async fn serve_conn(config: Arc<HCMConfig>, mut down: TcpStream) -> Result<(), H
 
                 let Some(endpoint) = cluster.pick_endpoint(request_hash_key, subset_match.as_ref())
                 else {
-                    let resp = synth_no_healthy_upstream(close);
-                    write_owned(&mut down, &resp, &mut write_buf).await?;
+                    let mut resp = synth_no_healthy_upstream(close);
+                    write_owned(&mut down, &mut resp, &req.headers, &mut write_buf).await?;
                     tick_class(&config, resp.status);
                     if close {
                         return Ok(());
@@ -333,9 +333,9 @@ async fn serve_conn(config: Arc<HCMConfig>, mut down: TcpStream) -> Result<(), H
                             error = ?source,
                             "uring upstream connect failed — returning 503",
                         );
-                        let resp = synth_status(503, close);
+                        let mut resp = synth_status(503, close);
                         cluster.record_response(endpoint, resp.status);
-                        write_owned(&mut down, &resp, &mut write_buf).await?;
+                        write_owned(&mut down, &mut resp, &req.headers, &mut write_buf).await?;
                         tick_class(&config, resp.status);
                         if close {
                             return Ok(());
@@ -384,9 +384,9 @@ async fn serve_conn(config: Arc<HCMConfig>, mut down: TcpStream) -> Result<(), H
                             error = ?source,
                             "uring upstream request failed — returning 503",
                         );
-                        let resp = synth_status(503, close);
+                        let mut resp = synth_status(503, close);
                         cluster.record_response(endpoint, resp.status);
-                        write_owned(&mut down, &resp, &mut write_buf).await?;
+                        write_owned(&mut down, &mut resp, &req.headers, &mut write_buf).await?;
                         tick_class(&config, resp.status);
                     }
                 }
@@ -500,11 +500,29 @@ async fn write_head_body(
 
 /// Serialize + write an owned synth `Response` (same head serializer and
 /// coalescing rule as `Http1Response::write_to_buf`).
+///
+/// 110.1: this is the io_uring worker's LOCAL-REPLY WIRE FUNNEL, and the
+/// gRPC transform lives INSIDE it deliberately. All four call sites write a
+/// synthetic local reply; the proxied path uses `write_head_body` instead.
+/// Installing the transform here rather than at the call sites makes the
+/// coverage structural — a fifth local-reply site added later cannot forget it.
+///
+/// The tokio path has its OWN funnel in `hcm.rs`'s `serve_connection`, which
+/// bypasses this function entirely; a transform installed at only one of the
+/// two silently misses the other.
+///
+/// `resp` is `&mut` because the transform rewrites it in place. Every caller
+/// therefore ticks `tick_class` AFTER this returns, so the per-class counter
+/// sees the TRANSFORMED status (measurement N-2), while
+/// `cluster.record_response` stays BEFORE it so outlier detection still
+/// records the ORIGINAL upstream-health status.
 async fn write_owned(
     down: &mut TcpStream,
-    resp: &Response,
+    resp: &mut Response,
+    req_headers: &[(String, String)],
     buf: &mut Vec<u8>,
 ) -> Result<(), Http1Error> {
+    crate::grpc::apply_grpc_local_reply(resp, req_headers);
     serialize_response_head(resp, buf);
     write_head_body(down, buf, &resp.body).await
 }
