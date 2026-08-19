@@ -11380,4 +11380,254 @@ static_resources:
             "MEASURED upstream order: {s}"
         );
     }
+
+    /// Helper: assert the standard gRPC local-reply wire shape on a raw
+    /// response buffer, with the mapped code and an optional expected
+    /// `grpc-message`. Keeps the family tests below to one line of intent each,
+    /// so a missing family member is visible at a glance.
+    fn assert_grpc_shape(resp: &[u8], grpc_status: &str, grpc_message: Option<&str>) {
+        let s = String::from_utf8_lossy(resp);
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status: {s}");
+        assert!(s.contains("content-type: application/grpc\r\n"), "ct: {s}");
+        assert!(
+            s.contains(&format!("grpc-status: {grpc_status}\r\n")),
+            "gs: {s}"
+        );
+        assert!(s.contains("content-length: 0\r\n"), "cl: {s}");
+        assert!(s.ends_with("\r\n\r\n"), "body must be empty: {s}");
+        match grpc_message {
+            Some(m) => assert!(s.contains(&format!("grpc-message: {m}\r\n")), "gm: {s}"),
+            None => assert!(!s.contains("grpc-message"), "gm must be absent: {s}"),
+        }
+    }
+
+    /// 110.1 family coverage: a route to a cluster whose subset selector misses
+    /// (`cluster_mgr_no_fallback_subset` + a `metadata_match` naming a
+    /// non-existent subset) — the `run_attempt` `synth_no_healthy_upstream`
+    /// path, a local reply with a NON-EMPTY body. MEASURED upstream: 503 -> 14,
+    /// and `grpc-message` DOES appear carrying the encoded body.
+    async fn grpc_no_healthy_upstream_config() -> Arc<HCMConfig> {
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "nonexistent".to_string());
+        hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "subset_cluster".into(),
+                retry_policy: None,
+                hash_policy: vec![],
+                metadata_match: Some(LbMetadata { envoy_lb }),
+            }),
+            cluster_mgr_no_fallback_subset().await,
+        )
+    }
+
+    /// `synth_400` — a request with a missing/empty Host. MEASURED mapping:
+    /// 400 -> 13.
+    #[tokio::test]
+    async fn grpc_transforms_synth_400_bad_host() {
+        let config = hcm_config_single_route("/", 200, "ok").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: \r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        assert_grpc_shape(&resp, "13", None);
+    }
+
+    /// `synth_redirect` — the one route-decision synth that deliberately does
+    /// NOT reuse `synth_with`. MEASURED upstream: the transform DOES fire, the
+    /// `location` header SURVIVES, `grpc-status` is 2 (301 is not special), and
+    /// there is no `grpc-message` (the redirect body is empty).
+    ///
+    /// Reuses the existing `redirect_placeholder_config` builder
+    /// (`https_redirect: true`, prefix `/`).
+    #[tokio::test]
+    async fn grpc_transforms_synth_redirect_and_keeps_location() {
+        let config = Arc::new(redirect_placeholder_config().await);
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert_grpc_shape(&resp, "2", None);
+        assert!(
+            s.contains("location: https://h/x\r\n"),
+            "location must survive: {s}"
+        );
+    }
+
+    /// `synth_501` — the chunked-request rejection in `serve_connection`,
+    /// which builds its `BuildOutcome::Synth` BEFORE `build_response_in` is
+    /// ever called. MEASURED mapping: 501 is NOT special -> 2.
+    #[tokio::test]
+    async fn grpc_transforms_synth_501_chunked_rejection() {
+        let config = hcm_config_single_route("/", 200, "ok").await;
+        let req = b"POST /x HTTP/1.1\r\nHost: h\r\ntransfer-encoding: chunked\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        assert_grpc_shape(&resp, "2", None);
+    }
+
+    /// `synth_no_healthy_upstream` — a `run_attempt` local reply with a
+    /// NON-EMPTY body. MEASURED upstream: 503 -> 14, and `grpc-message` DOES
+    /// appear, carrying the encoded body.
+    #[tokio::test]
+    async fn grpc_transforms_synth_no_healthy_upstream_with_message() {
+        let config = grpc_no_healthy_upstream_config().await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        assert_grpc_shape(&resp, "14", Some("no healthy upstream"));
+    }
+
+    /// A decode-side filter's `StopAndSend`. MEASURED upstream on an RBAC deny:
+    /// the filter-generated local reply IS transformed. Reuses the existing
+    /// `test_stop_and_send_on_decode` stub + `hcm_config_with_pipeline`.
+    #[tokio::test]
+    async fn grpc_transforms_filter_stop_and_send_on_decode() {
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 429,
+            reason: None,
+            headers: vec![("content-length".to_string(), "10".to_string())],
+            body: Bytes::from_static(b"over limit"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        // 429 maps to 14; the body is plain ASCII so it encodes to itself.
+        assert_grpc_shape(&resp, "14", Some("over limit"));
+    }
+
+    /// The ENCODE-side `StopAndSend` arm — the second of the two filter arms
+    /// that `110.1/SPEC.md` §1.5's family list omits. This is the arm whose
+    /// `outgoing_local = true` re-assert matters: it can replace a PROXIED
+    /// response, which would have cleared the bit.
+    #[tokio::test]
+    async fn grpc_transforms_filter_stop_and_send_on_encode() {
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 418,
+            reason: None,
+            headers: vec![("content-length".to_string(), "7".to_string())],
+            body: Bytes::from_static(b"teapot\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        // 418 is not special -> 2; the body encodes with its trailing newline.
+        assert_grpc_shape(&resp, "2", Some("teapot%0A"));
+    }
+
+    /// THE NEGATIVE WITNESS for non-goal 4 / CF-110-2: a PROXIED upstream
+    /// response is NOT transformed, even when the request carried a gRPC
+    /// content-type. Without this, an `outgoing_local` that was simply always
+    /// true would pass every other test in this file.
+    #[tokio::test]
+    async fn grpc_does_not_transform_a_proxied_upstream_response() {
+        let port = spawn_in_process_upstream(
+            b"HTTP/1.1 201 Created\r\ncontent-length: 8\r\ncontent-type: text/plain\r\n\r\nUPSTREAM",
+        )
+        .await;
+        let config = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "c1".into(),
+                retry_policy: None,
+                hash_policy: vec![],
+                metadata_match: None,
+            }),
+            cluster_mgr_with_endpoint("c1", port).await,
+        );
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 201 "),
+            "proxied status must survive: {s}"
+        );
+        assert!(
+            !s.contains("grpc-status"),
+            "no grpc-status on a proxied reply: {s}"
+        );
+        assert!(
+            !s.contains("grpc-message"),
+            "no grpc-message on a proxied reply: {s}"
+        );
+        assert!(s.ends_with("UPSTREAM"), "proxied body must survive: {s}");
+    }
+
+    /// MEASUREMENT N-2, the placement witness: the access-log record must carry
+    /// the TRANSFORMED status (200) and a zero body length, not the original.
+    /// This is the ONLY test that catches the transform being installed at the
+    /// wire write instead of before the log locals — the wire-shape tests are
+    /// blind to it.
+    ///
+    /// Also pins that `%RESPONSE_CODE_DETAILS%` is UNCHANGED by the transform
+    /// (MEASURED upstream: still `direct_response`).
+    #[tokio::test]
+    async fn grpc_transform_is_visible_to_the_access_log() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "bytes".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%BYTES_SENT%".to_string()),
+        );
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
+                .await
+                .expect("open FileSink"),
+        );
+        let base = hcm_config_single_route("/", 404, "B404").await;
+        let config = Arc::new(HCMConfig {
+            stat_prefix: base.stat_prefix.clone(),
+            cluster_mgr: Arc::clone(&base.cluster_mgr),
+            http2_protocol_options: None,
+            stats: Arc::clone(&base.stats),
+            access_log: vec![sink],
+            filter_pipeline: Arc::clone(&base.filter_pipeline),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::clone(&base.route_config.read().unwrap())),
+            runtime: Arc::clone(&base.runtime),
+        });
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"bytes\":0,\"rc\":200,\"rcd\":\"direct_response\"}\n",
+            "MEASURED upstream logs %RESPONSE_CODE% = 200 and %BYTES_SENT% = 0 \
+             for a transformed local reply, with %RESPONSE_CODE_DETAILS% \
+             UNCHANGED: {logged:?}"
+        );
+    }
+
+    /// MEASUREMENT N-2, the stats half: the per-class counter must tick
+    /// `downstream_rq_2xx`, not `downstream_rq_4xx`.
+    #[tokio::test]
+    async fn grpc_transform_ticks_the_2xx_response_class() {
+        let config = hcm_config_single_route("/", 404, "B404").await;
+        let stats = Arc::clone(&config.stats);
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        assert_eq!(
+            stats.downstream_rq_2xx.value(),
+            1,
+            "transformed reply is a 2xx"
+        );
+        assert_eq!(
+            stats.downstream_rq_4xx.value(),
+            0,
+            "the original 404 must NOT tick"
+        );
+    }
 }
