@@ -995,6 +995,14 @@ async fn serve_connection(
         // is already serialized in `direct_head_buf` and `outgoing.headers`
         // is intentionally empty. Reset per request; synth paths leave false.
         let mut outgoing_direct = false;
+        // 110.1: true when `outgoing` is a LOCALLY GENERATED reply rather than
+        // a real upstream response. Every writer arm below is local EXCEPT the
+        // proxy arm's completing upstream response, which clears it from
+        // `completing_upstream_response`. Gates the gRPC local-reply transform
+        // — a proxied response must NEVER be transformed (non-goal 4 /
+        // CF-110-2). Defaults to `true` so a newly added synth arm is covered
+        // by omission rather than silently skipped.
+        let mut outgoing_local = true;
 
         // 8. Dispatch the request_path to the wire. 07.1 Task 6 wraps the
         // Task 5 writer-arm match inside `RequestPath::Match(outcome)`; the
@@ -1366,6 +1374,13 @@ async fn serve_connection(
 
                         outgoing = final_response;
                         outgoing_direct = final_direct;
+                        // 110.1: `upstream_response` is the tree's existing
+                        // "a real upstream RESPONSE was received" bit
+                        // (`AttemptResult` doc). Its complement is exactly
+                        // "this is a local reply": `synth_no_healthy_upstream`,
+                        // `synth_status(503)` and `synth_overflow` from
+                        // `run_attempt` all leave it false.
+                        outgoing_local = !completing_upstream_response;
 
                         // L6: x-envoy-attempt-count on the downstream response, ONLY
                         // when the vhost flag is set. Emitted on ALL outcomes that
@@ -1420,6 +1435,11 @@ async fn serve_connection(
             envoy_filter::Decision::StopAndSend(replacement) => {
                 // Replace outgoing entirely with the filter's substitute response.
                 outgoing_direct = false;
+                // 110.1: a filter's substitute response IS a local reply, even
+                // when it replaced a proxied one. MEASURED upstream: an RBAC
+                // deny with a gRPC content-type returns 200 + `grpc-status: 7`
+                // + `grpc-message: RBAC: access denied`.
+                outgoing_local = true;
                 outgoing = Response {
                     status: replacement.status,
                     reason: replacement.reason,
@@ -1444,6 +1464,33 @@ async fn serve_connection(
         // `construct_proxied_response` output which already includes the
         // `x-envoy-upstream-service-time` header that the pre-Task-5 code
         // explicitly pushed into `response_headers_for_log`.
+        // 110.1: the gRPC local-reply transform, at the FIRST of the two H1
+        // wire funnels (the io_uring worker has its own — `uring.rs`'s
+        // `write_owned`).
+        //
+        // PLACEMENT IS LOAD-BEARING. This must run BEFORE
+        // `response_status_for_log` / `response_body_len` are derived below,
+        // because those two drive the access-log record AND the per-class
+        // counter dispatch. MEASURED upstream: a transformed local reply logs
+        // `%RESPONSE_CODE%` = 200 and `%BYTES_SENT%` = 0, and ticks
+        // `downstream_rq_2xx` — NOT the original status's class.
+        // `%RESPONSE_CODE_DETAILS%` is unchanged by the transform.
+        //
+        // NOT installed in `synth_with` / any `synth_*` / `build_response`:
+        // `envoy-http2` calls `envoy_http1::build_response`, so a transform
+        // there would rewrite H2 route-decision replies while missing H2's own
+        // `synth_h2_*` family (CF-110-1; the ADR-0049 class).
+        if outgoing_local {
+            // A local reply never takes the zero-copy direct-head path:
+            // `direct_head: true` is set at exactly one site, the successful
+            // proxied attempt, which also sets `upstream_response: true`.
+            debug_assert!(
+                !outgoing_direct,
+                "a local reply must never carry a pre-serialized direct head"
+            );
+            crate::grpc::apply_grpc_local_reply(&mut outgoing, &req.headers);
+        }
+
         let response_status_for_log: u16 = outgoing.status;
         let response_body_len: u64 = outgoing.body.len() as u64;
         // `outgoing` stays owned and alive through the access-log block below, so
@@ -11200,6 +11247,137 @@ static_resources:
         assert_eq!(
             plan.location, "http://h.test/replaced/sub?k=v",
             "and the location keeps it too (strip_query defaults false)"
+        );
+    }
+
+    /// 110.1 seam: a gRPC `content-type` on a request that hits a
+    /// `direct_response` route must produce upstream's MEASURED wire shape —
+    /// `200`, `content-type: application/grpc`, `grpc-status`, `grpc-message`,
+    /// `content-length: 0`, no body — end to end through the real tokio
+    /// `serve_connection` funnel, not just through the pure transform.
+    #[tokio::test]
+    async fn grpc_local_reply_transforms_direct_response() {
+        let config = hcm_config_single_route("/", 404, "B404").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {s}");
+        assert!(s.contains("content-type: application/grpc\r\n"), "ct: {s}");
+        assert!(s.contains("grpc-status: 12\r\n"), "grpc-status: {s}");
+        assert!(s.contains("grpc-message: B404\r\n"), "grpc-message: {s}");
+        assert!(s.contains("content-length: 0\r\n"), "cl: {s}");
+        assert!(s.ends_with("\r\n\r\n"), "body must be empty: {s}");
+        assert!(
+            !s.contains("text/plain"),
+            "old content-type must be gone: {s}"
+        );
+    }
+
+    /// The paired NON-gRPC control on the SAME route: nothing changes. Without
+    /// this, a transform that fired unconditionally would still pass the test
+    /// above.
+    #[tokio::test]
+    async fn non_grpc_request_leaves_direct_response_untouched() {
+        let config = hcm_config_single_route("/", 404, "B404").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/json\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+
+        assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"), "status: {s}");
+        assert!(s.contains("content-type: text/plain\r\n"), "ct: {s}");
+        assert!(s.contains("content-length: 4\r\n"), "cl: {s}");
+        assert!(!s.contains("grpc-status"), "no grpc-status: {s}");
+        assert!(!s.contains("grpc-message"), "no grpc-message: {s}");
+        assert!(s.ends_with("\r\nB404"), "body preserved: {s}");
+    }
+
+    /// The HCM's OWN unmatched-path 404 — an empty-body local reply that does
+    /// NOT come from a `direct_response`. MEASURED upstream: `grpc-status: 12`
+    /// and NO `grpc-message` header at all.
+    #[tokio::test]
+    async fn grpc_local_reply_transforms_route_not_found_without_grpc_message() {
+        let config = hcm_config_single_route("/only-this", 200, "ok").await;
+        let req = b"GET /nope HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status: {s}");
+        assert!(s.contains("grpc-status: 12\r\n"), "grpc-status: {s}");
+        assert!(
+            !s.contains("grpc-message"),
+            "grpc-message must be ABSENT: {s}"
+        );
+        assert!(s.contains("content-length: 0\r\n"), "cl: {s}");
+    }
+
+    /// The detection edges, driven through the REAL funnel rather than the pure
+    /// function, so a seam that (say) lower-cased the value before matching
+    /// would be caught here even though Task 1's unit tests pass.
+    #[tokio::test]
+    async fn grpc_detection_edges_hold_through_the_seam() {
+        for (ct, transformed) in [
+            ("application/grpc", true),
+            ("application/grpc+proto", true),
+            ("application/grpc+", true),
+            ("application/grpc; charset=utf-8", false),
+            ("APPLICATION/GRPC", false),
+            ("application/grpc-web", false),
+            ("application/grpcfoo", false),
+        ] {
+            let config = hcm_config_single_route("/", 404, "B404").await;
+            let req = format!(
+                "GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: {ct}\r\nConnection: close\r\n\r\n"
+            );
+            let resp = drive(config, req.as_bytes()).await;
+            let s = String::from_utf8_lossy(&resp);
+            if transformed {
+                assert!(
+                    s.starts_with("HTTP/1.1 200 OK\r\n"),
+                    "{ct} must transform: {s}"
+                );
+                assert!(s.contains("grpc-status: 12\r\n"), "{ct}: {s}");
+            } else {
+                assert!(
+                    s.starts_with("HTTP/1.1 404 Not Found\r\n"),
+                    "{ct} must NOT transform: {s}"
+                );
+                assert!(!s.contains("grpc-status"), "{ct}: {s}");
+            }
+        }
+    }
+
+    /// The MEASURED header ORDER, through the real funnel, byte-exact.
+    ///
+    /// Order is a HOUSE-CONVENTION concern, not a differential one: the
+    /// harness's `diff_headers` compares a `BTreeSet` of lower-cased header
+    /// NAMES plus exact VALUES outside the 3-entry `HEADER_ALLOW_LIST`, and
+    /// never reads order. A wrong order therefore fails THIS test, not a
+    /// fixture — which is exactly why this test has to exist.
+    #[tokio::test]
+    async fn grpc_local_reply_header_order_matches_upstream() {
+        let config = hcm_config_single_route("/", 503, "B503").await;
+        let req = b"GET /x HTTP/1.1\r\nHost: h\r\ncontent-type: application/grpc\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        let head = s.split("\r\n\r\n").next().unwrap_or_default();
+        let order: Vec<&str> = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split(':').next())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "content-type",
+                "grpc-status",
+                "grpc-message",
+                "date",
+                "server",
+                "connection",
+                "content-length",
+            ],
+            "MEASURED upstream order: {s}"
         );
     }
 }
