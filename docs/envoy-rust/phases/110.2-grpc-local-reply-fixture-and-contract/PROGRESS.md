@@ -149,3 +149,87 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 Both directions of the causal experiment therefore hold: RED with the
 asymmetry, GREEN without it. A one-direction result would have proven nothing.
+
+---
+
+## Task 2 — the eight §1.2 detection cells — **COMPLETE**
+
+**Built:** probes **16–23** appended to `expectations.yaml` (probe count
+**15 → 23**). The two config yamls were NOT touched — their md5 stayed
+`216e712c14b1ca1dd8fcd0a4c277f8ab` at 6561 bytes across the whole task, because
+Task 1 landed all 24 routes precisely so later tasks add probes only.
+
+Three POSITIVE cells (`application/grpc`, `application/grpc+proto`,
+`application/grpc+` bare) and five NEGATIVE (`application/grpc; charset=utf-8`,
+`APPLICATION/GRPC`, `application/grpc-web`, `application/grpcfoo`, header
+absent). The two `-web`/`foo` cells are the traps a naive
+`starts_with("application/grpc")` falls into; the `APPLICATION/GRPC` cell is a
+real witness only because `drive_http1` interpolates `extra_headers` RAW,
+re-verified on disk this session (X-5).
+
+**Run — GREEN:**
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+```
+
+**Mutation V2 — correctly aimed, unlike V1.** V2 mutates what is SENT
+(lower-casing the `APPLICATION/GRPC` value), and its witness is
+`expected_status`, which is an ABSOLUTE fixture-declared assertion checked
+against BOTH proxies — not the cross-proxy `diff_headers`. So it does not have
+V1's symmetry defect. Guard first: `grep -c '"APPLICATION/GRPC"'` = **1**.
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+---- grpc_aware_local_replies stdout ----
+thread 'grpc_aware_local_replies' panicked at tests/differential/tests/grpc_aware_local_replies.rs:42:10:
+fixture green: probe d-upper-negative: upstream status 200 != expected 404
+```
+
+The negative cell is live: lower-case the value and upstream transforms.
+
+### DEVIATION D-2 (METHOD) — `PLAN.md`'s V2 revert step is UNSAFE, and the `md5sum -c` is what caught it
+
+`PLAN.md` Task 2 Step 3 reverts with
+`git checkout -- expectations.yaml   # SAFE: the file is TRACKED as of Task 1`.
+**Tracked is not sufficient.** `git checkout --` restores the file to its
+**COMMITTED** state, and at that moment the committed state was Task 1's
+**15-probe** version — so it silently destroyed the eight detection probes Task
+2 had just added and had not yet committed:
+
+```
+$ md5sum -c /tmp/v2.md5
+expectations.yaml: FAILED
+md5sum: WARNING: 1 computed checksum did NOT match
+$ grep -c '^    - name:' expectations.yaml
+15                      <- Task 1's state, not Task 2's 23
+$ grep -c 'd-exact-positive\|d-upper-negative\|d-foo-negative' expectations.yaml
+0                       <- the whole task's work, gone
+```
+
+**The control run immediately after that revert returned GREEN — a FALSE GREEN
+on the WRONG FILE**, and by eye it was indistinguishable from a correct one.
+Only the md5 comparison exposed it, which is exactly the standing rule that a
+mutation revert is adjudicated by md5 and never by eye. The recorded 23-probe
+md5 was `c7bb67c1380ee0b6527b00356e9ab528`; the post-checkout file computed
+`1581969acb4ad8d13f74add97e141119`.
+
+**The generalised trap, worth carrying forward:** `git checkout --` is a no-op
+on an UNTRACKED file (the already-known hazard) *and* a DESTRUCTIVE no-op-looking
+revert on a TRACKED file that carries uncommitted work. It is safe only when the
+mutated file's non-mutation content is identical to `HEAD`. Task 3's V3 mutates
+`envoy.yaml`, which Task 3 does not otherwise modify, so `git checkout --` is
+genuinely safe there — but this session used an explicit backup and md5
+adjudication regardless.
+
+**Recovery:** Task 2's block was re-applied and adjudicated byte-exactly against
+the pre-mutation md5, then the control was re-run on the CORRECT file:
+
+```
+$ md5sum -c /tmp/v2.md5
+expectations.yaml: OK
+$ grep -c '^    - name:' expectations.yaml
+23
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+```

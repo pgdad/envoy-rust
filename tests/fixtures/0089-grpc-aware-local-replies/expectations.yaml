@@ -170,6 +170,84 @@ driver:
       expected_status: 503
       expected_body: { kind: byte_exact, body: "B503" }
       expected_headers: set_equal_modulo_allow_list
+    # ---- §1.2 detection: EXACT `application/grpc` or the prefix
+    # ---- `application/grpc+`, and NOTHING else. Header VALUE case matters;
+    # ---- `drive_http1` interpolates `extra_headers` RAW (no lower-casing),
+    # ---- which is what makes the `APPLICATION/GRPC` cell a real witness.
+    - name: d-exact-positive
+      method: get
+      path: "/d-exact"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: d-plus-proto-positive
+      method: get
+      path: "/d-plus-proto"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc+proto"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: d-plus-bare-positive
+      method: get
+      path: "/d-plus-bare"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc+"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # A PARAMETER defeats detection — with or without the space.
+    - name: d-param-negative
+      method: get
+      path: "/d-param"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc; charset=utf-8"]
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "DPARAM" }
+      expected_headers: set_equal_modulo_allow_list
+    # CASE-SENSITIVE on the VALUE.
+    - name: d-upper-negative
+      method: get
+      path: "/d-upper"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "APPLICATION/GRPC"]
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "DUPPER" }
+      expected_headers: set_equal_modulo_allow_list
+    # Trap 1 for a naive `starts_with("application/grpc")`.
+    - name: d-web-negative
+      method: get
+      path: "/d-web"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc-web"]
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "DWEB" }
+      expected_headers: set_equal_modulo_allow_list
+    # Trap 2 for the same naive prefix match.
+    - name: d-foo-negative
+      method: get
+      path: "/d-foo"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpcfoo"]
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "DFOO" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: d-absent-negative
+      method: get
+      path: "/d-absent"
+      host: "envoy-rust.test"
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "DABSENT" }
+      expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
   response_body: { kind: byte_exact }
