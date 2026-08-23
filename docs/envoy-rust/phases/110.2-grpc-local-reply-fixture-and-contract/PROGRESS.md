@@ -539,3 +539,175 @@ cross-proxy, and **a mutation intended to witness a header cell must be
 ONE-SIDED**. That is the D-1 finding, promoted into the canonical contract so
 the next author of a header fixture meets it before writing a two-sided
 mutation.
+
+---
+
+# Sub-phase 110.2 — §5 state-3 IMPLEMENTATION — SUMMARY
+
+**All SEVEN `PLAN.md` tasks are COMPLETE.** Seven task commits, each with its own
+fixture run.
+
+## What was BUILT (not what a table promised)
+
+| deliverable | disposition |
+|---|---|
+| `tests/fixtures/0089-grpc-aware-local-replies/envoy.yaml` | NEW, 103 lines, 24 routes |
+| `tests/fixtures/0089-grpc-aware-local-replies/envoy-rust.yaml` | NEW, BYTE-IDENTICAL to the above |
+| `tests/fixtures/0089-grpc-aware-local-replies/expectations.yaml` | NEW, **32** probes |
+| `tests/fixtures/0089-grpc-aware-local-replies/README.md` | NEW, 209 lines |
+| `tests/differential/tests/grpc_aware_local_replies.rs` | NEW, 43 lines, cargo AUTO-DISCOVERED |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | `## gRPC` section, PURE INSERTION `260 0` |
+
+**Exactly the 32 probes of `PLAN.md`'s frozen table — no more, no fewer.** The
+coverage claim and the probe list are the SAME artifact here: `grep -c
+'^    - name:' expectations.yaml` = **32**, and every one appears in the README's
+32-row table. This is deliberate, per the `110.1` M-3 lesson.
+
+## Standing censuses re-derived at this state
+
+| census | before | after |
+|---|---:|---:|
+| fixture directories | 88 | **89** |
+| differential test files | 88 | **89** |
+| `^## ` in `BEHAVIOR_CONTRACT.md` | 15 | **16** |
+| `^## gRPC` in `BEHAVIOR_CONTRACT.md` | 0 | **1** |
+| `HEADER_ALLOW_LIST` entries | 3 | **3** (unchanged; `location` count still **0**) |
+| `known-failures.txt` lines | 21 | **21** (untouched) |
+| ADR head | ADR-0180 | **ADR-0180** (no ADR fired; ADR-0181 still UNRESERVED) |
+| ROADMAP rows / `done` / `in-progress` / `planned` | 116/114/1/1 | **116/114/1/1** (NOT touched — rows flip at state 6) |
+
+## Scope discipline — verified, not asserted
+
+```
+$ git diff --name-only 0b6f2f6 HEAD -- crates/ '*Cargo.toml' Cargo.lock .github/ \
+    deny.toml docs/envoy-rust/ROADMAP.md 'docs/envoy-rust/phases/110-*' \
+    'docs/envoy-rust/phases/110.1-*' .../110.2/SPEC.md .../110.2/PLAN.md | wc -l
+0
+```
+
+**NO crate source change** (Global Constraint 1 / SPEC §5), no `Cargo.toml` or
+`Cargo.lock`, no `ci.yml`, no `deny.toml`, no `ROADMAP.md`, and **no landed
+artifact edited**. **NOT ONE banked finding was fixed** (§6.3; ADR-0165) —
+CF-110-6, CF-110-7, CF-110-8 and CF-110-9 are all still open, and the
+`110.1` REVIEW's M-1…M-9 + N-1…N-10 are untouched. `0089`'s `/no-such-route`
+probe drives one of M-3's undriven sites, but as a free structural side effect
+of having no catch-all route, not as scheduled work.
+
+## Size — measured, at the CARRYING commit rather than a moving `HEAD`
+
+```
+$ git diff --numstat 0b6f2f6 HEAD -- . ':(exclude)docs/' | awk '{a+=$1;d+=$2} END{print a,d,a-d}'
+817 0 817
+```
+
+**Net 817**, docs-excluded, `added − deleted` — the metric every landed
+calibration phase was measured under. `BEHAVIOR_CONTRACT.md` is under `docs/`
+and is correctly excluded. Against `PLAN.md`'s ≈615 that is a ratio of **1.33**,
+inside the eight-phase distribution the state-2 measured (median **1.19**, worst
+**1.50**) and well under the ~1500 §6.1 gate. The range is cited explicitly as
+`0b6f2f6 HEAD` rather than as a bare `HEAD` claim, because a numstat citation
+goes false the instant its own carrying commit lands (`110.1/REVIEW.md` M-9).
+
+## Vacuity proofs — FOUR mutations, all with unmutated controls
+
+| mutation | sides mutated | probe RED'd | evidence |
+|---|---|---|---|
+| **V1** (corrected, D-1) | upstream only | `g-403-maps-to-7` | `header 'grpc-status': envoy='2' envoy-rust='7'` |
+| **V2** | `expectations.yaml` | `d-upper-negative` | `upstream status 200 != expected 404` |
+| **V3** | upstream only | `e-empty-no-grpc-message` | `header name sets differ: only-in-envoy=["grpc-message"]` |
+| **V4** (added, D-3) | upstream only | `enc-main-percent-encoded` | `header 'grpc-message': envoy='…%2525 END' envoy-rust='…%2525 end'` |
+
+Each was guarded by an exactly-once anchor count before mutating, reverted
+byte-exactly, adjudicated by **md5** rather than by eye, and paired with an
+unmutated control run from the same tree. Every RED carried a real
+`test result: FAILED` line — a compile error is not a mutation RED.
+
+## The four DEVIATIONS, in order of consequence
+
+- **D-1 (SUBSTANTIVE)** — `PLAN.md`'s mutation **V1 is misaimed and returns a
+  FALSE GREEN**: it mutates both yamls, and `diff_headers` is purely
+  cross-proxy, so both proxies move in lockstep. Corrected to a one-sided
+  mutation. **A PLAN's own code is a claim — this one was run, and it failed.**
+- **D-2 (METHOD)** — `PLAN.md`'s V2 revert uses `git checkout --` on the grounds
+  the file is TRACKED. Tracked is not sufficient: it restored the file to its
+  COMMITTED state and destroyed Task 2's eight uncommitted probes, producing a
+  false-green control on the wrong file. Caught by `md5sum -c`.
+- **D-3 (ADDITION)** — mutation **V4**, because no mutation in the plan proved
+  the `grpc-message` VALUE — the whole §1.3 encoding witness — is compared.
+- **D-4 (METHOD)** — the Task-7 contract section was subagent-DRAFTED and then
+  GRADED, not pasted; three of its claims were wrong (a wrong section
+  cross-reference, an unverifiable ADR provenance, and an overstated
+  "four methods").
+
+## X-item ledger — all re-confirmed FRESH at this state
+
+X-8 (debug `envoy-bin` rebuilt before every run), X-1 (digest verified by
+`docker image inspect` BEFORE probing, matching `ENVOY_TARGET.md` exactly), X-2
+(the fixture run IS the dry-run at this state — green probe by probe, task by
+task), X-3 (md5 **AND** byte count: `216e712c14b1ca1dd8fcd0a4c277f8ab`, **6561**
+bytes each), X-4 (census 88 → 89, no `0089` beforehand), X-5 (all four harness
+facts on disk), X-7 (the ~1 s green audited with a VALID `docker ps` format
+field plus a negative control).
+
+## PREDICTION for state 4 — NOT a measurement
+
+**This session did NOT run the state-4 gate** (§5.1; ADR-0127 — that is the next
+session's product, and it is CI's first real execution of this code). The
+workspace identity is `passed + failed = **2227**` today at `binaries=165` (the
+plain `cargo test --workspace` form CI runs; `--all-targets` yields 149, the
+16-binary gap being the doc-test harnesses).
+
+`0089` adds **exactly ONE test binary containing exactly ONE test**, by cargo
+auto-discovery. **PREDICTED: `binaries=166 passed=2228 failed=0`. Any other
+movement is a signal.** This figure is a PREDICTION and is labelled as one; the
+state-4 session must derive it, not inherit it.
+
+## One RED observed at session close — CLASSIFIED AS A KNOWN FLAKE BY ISOLATION, not by text
+
+Recorded because a session that hides a red teaches the next reader nothing. The
+final confirmation run — on a tree whose only change since the previous GREEN
+was `docs/`-only — came back RED:
+
+```
+thread 'grpc_aware_local_replies' panicked at tests/differential/tests/grpc_aware_local_replies.rs:42:10:
+fixture green: upstream Envoy never became accept-ready
+
+Caused by:
+    127.0.0.1:55000 not accept-ready within 10s: Connection refused (os error 111)
+
+test result: FAILED. 0 passed; 1 failed; ... finished in 18.16s
+```
+
+**It is the documented upstream-container readiness family** — `upstream Envoy
+never became accept-ready … Connection refused`, whose root cause is the
+ephemeral-port startup race in `reserve_port()` (CF-75-6). Two facts settle it,
+and neither is the error text:
+
+1. **The tree was byte-identical to the green run.** `git status --porcelain
+   tests/` was empty, `md5sum` on both yamls still `216e712c14b1ca1dd8fcd0a4c277f8ab`
+   at 6561 bytes, and the probe count still 32. The only files modified were
+   `STATE.md`, `STATE_HISTORY.md` and this `PROGRESS.md`.
+2. **It PASSES IN ISOLATION, three times, with a settle gap.** The 18.16 s
+   duration is itself the signature: 10 s of accept-ready wait plus teardown,
+   rather than the ~1 s a real probe comparison takes.
+
+```
+run 1: exit=0 | test result: ok. 1 passed; 0 failed; ... finished in 1.19s
+run 2: exit=0 | test result: ok. 1 passed; 0 failed; ... finished in 1.19s
+run 3: exit=0 | test result: ok. 1 passed; 0 failed; ... finished in 1.16s
+```
+
+**A 20-25 s SETTLE GAP separated each run**, because back-to-back Docker-spawning
+runs manufacture a false `FAILS-IN-ISOLATION` verdict — the trap that produced a
+wrong classification at the `110.1` state-4. **ONLY ISOLATION CLASSIFIES, never
+the error text.** This family is CI-authoritative and is never a regression; the
+state-4 session should expect it under a full parallel `cargo test --workspace`
+and must not read it as one.
+
+## Next state
+
+**§5 state 4 — verification**, a SEPARATE session (§5.1; ADR-0127).
+`superpowers:verification-before-completion` runs the full §7.5 gate at
+WORKSPACE scope. `ROADMAP.md` is NOT touched until state 6, where rows `110.2`
+**and parent `110`** flip `done` TOGETHER (the `76.2`/`108.2`/`109.2` two-row
+precedent, unlike the `110.1` close-out which flipped one row only).
