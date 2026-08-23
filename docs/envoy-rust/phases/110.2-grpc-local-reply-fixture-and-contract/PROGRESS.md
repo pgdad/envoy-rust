@@ -370,3 +370,58 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 This makes **four** in-place mutations against SPEC §3 F6's "at least two", each
 reverted byte-exactly and md5-verified, each with an unmutated control from the
 same tree.
+
+---
+
+## Task 5 — the redirect cells; the 32-probe set is COMPLETE — **COMPLETE**
+
+**Built:** probes **31–32** (probe count **30 → 32**, matching `PLAN.md`'s
+frozen probe table exactly). Yamls untouched.
+
+A `redirect:` route is the ONLY safe way to get a `location` header into this
+fixture. Upstream also emits `location` on a `201`/`3xx` `direct_response` and
+envoy-rust does not (CF-110-3, re-measured and WIDENED to `302` at the
+state-2), so no such cell may appear — but `synth_redirect` already emits
+`location` on both proxies. `location` is NOT on the `HEADER_ALLOW_LIST`
+(re-derived this session: 3 entries, `location` count **0**), so its VALUE is
+compared byte-exact, and that comparison IS the cell's witness: the gRPC probe
+proves `location` SURVIVES the transform alongside `grpc-status: 2`.
+
+**Full 32-probe run — GREEN:**
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+$ grep -c '^    - name:' expectations.yaml
+32
+```
+
+**X-3 re-asserted at the finished fixture** — both the md5 AND the byte count,
+because a uniform md5 can be the empty-file md5:
+
+```
+216e712c14b1ca1dd8fcd0a4c277f8ab  envoy-rust.yaml
+216e712c14b1ca1dd8fcd0a4c277f8ab  envoy.yaml
+ 6561 envoy-rust.yaml
+ 6561 envoy.yaml
+```
+
+### X-7 — the fast green AUDITED, in both directions
+
+A backend-free fixture finishing in ~1 s is NORMAL, but "normal" is not
+evidence. Proven with a **VALID** `docker ps` format field
+(`{{.ID}} {{.Image}} {{.Names}}` — `{{.ImageID}}` is INVALID and turns every
+poll line into a template error that reads as "no containers ran"):
+
+```
+NEGATIVE CONTROL (poll with no test running):
+  0 lines matching envoyproxy/envoy
+
+POSITIVE (poll while the fixture runs):
+  ab8b9cbd2a1f envoyproxy/envoy:v1.33.0 keen_poincare
+
+  4 poll lines captured; 0 template errors
+  test result: ok. 1 passed; 0 failed; ... finished in 1.08s
+```
+
+The reference container genuinely ran, the poll genuinely executed, and the
+negative control makes the positive non-vacuous.

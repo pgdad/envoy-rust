@@ -331,6 +331,29 @@ driver:
       expected_status: 400
       expected_body: { kind: byte_exact, body: "q\"b s\\l t~t dd" }
       expected_headers: set_equal_modulo_allow_list
+    # ---- `location` SURVIVES the transform and stays FIRST in wire order.
+    # ---- A `redirect:` route is the ONLY safe way to get a `location` header
+    # ---- into this fixture: upstream also emits `location` on a 201/3xx
+    # ---- `direct_response` and envoy-rust does not (CF-110-3), so no such
+    # ---- cell may appear here. `synth_redirect` already emits it.
+    # ---- `location` is NOT on the HEADER_ALLOW_LIST, so its VALUE is
+    # ---- compared byte-exact — and that comparison IS this cell's witness.
+    - name: r-redirect-grpc-keeps-location
+      method: get
+      path: "/r-redir"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: r-redirect-control
+      method: get
+      path: "/r-redir"
+      host: "envoy-rust.test"
+      expected_status: 301
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
   response_body: { kind: byte_exact }
