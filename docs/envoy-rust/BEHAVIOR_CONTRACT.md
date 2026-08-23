@@ -641,6 +641,266 @@ the implementation asserts only what is measured (D-3.3).
 
 ---
 
+## gRPC
+
+Sub-phase 110.1 built the behaviour (ADR-0179); sub-phase 110.2 is its
+differential witness (ADR-0180). The phase-110 split that produced the two
+siblings is ADR-0178. **Every cell below was MEASURED against the pinned
+reference image `envoyproxy/envoy:v1.33.0`** (`docs/envoy-rust/ENVOY_TARGET.md`,
+digest `sha256:56da5afd…70c2`, verified by `docker image inspect` BEFORE any
+probe), using a raw-socket HTTP/1.1 client mirroring the harness's `drive_http1`
+— one connection per probe, `Host:` first, extra headers interpolated verbatim,
+`Connection: close` last. A header-dict client is not usable here: it destroys
+the response header ORDER and CASE that §D turns on.
+
+Differential witness: fixture `tests/fixtures/0089-grpc-aware-local-replies` —
+**32** HTTP/1.1 probes over a cluster-free, backend-free HCM listener, with
+`envoy.yaml` and `envoy-rust.yaml` **BYTE-IDENTICAL** (md5
+`216e712c14b1ca1dd8fcd0a4c277f8ab`, **6561 bytes** each). It is the first
+fixture in the corpus that sends `content-type: application/grpc` at all.
+
+### §A — the HTTP status → `grpc-status` mapping
+
+A **SPARSE EIGHT-ENTRY table over an explicit default of `2` (UNKNOWN)**:
+
+| HTTP status | `grpc-status` | gRPC code name |
+|---|---|---|
+| `400` | `13` | `INTERNAL` |
+| `401` | `16` | `UNAUTHENTICATED` |
+| `403` | `7` | `PERMISSION_DENIED` |
+| `404` | `12` | `UNIMPLEMENTED` |
+| `429` | `14` | `UNAVAILABLE` |
+| `502` | `14` | `UNAVAILABLE` |
+| `503` | `14` | `UNAVAILABLE` |
+| `504` | `14` | `UNAVAILABLE` |
+| **everything else** | `2` | `UNKNOWN` |
+
+**"Everything else" means everything else.** The whole 2xx range and the whole
+3xx range map to `2`, and so — counter-intuitively — do `500`, `501`, `405`,
+`408`, `409`, `412`, `413` and `499`. A `500` does **NOT** map to `13`, and a
+`5xx` range arm is the single most likely way to get this wrong. Do not
+"improve" the table with `500..=599 => 13`; the measurement says otherwise.
+Fixture `0089` probes `500` and `405` specifically as default-arm witnesses.
+
+### §B — detection: which requests are gRPC
+
+The transform fires **iff the REQUEST `content-type` is EXACTLY
+`application/grpc` or BEGINS WITH `application/grpc+`**, and on nothing else:
+
+| request `content-type` | detected? | reading |
+|---|---|---|
+| `application/grpc` | **YES** | the exact form |
+| `application/grpc+proto` | **YES** | the `application/grpc+` prefix |
+| `application/grpc+json` | **YES** | any suffix after the `+` |
+| `application/grpc+` | **YES** | a bare trailing `+` still matches the prefix |
+| `application/grpc; charset=utf-8` | NO | **a parameter DEFEATS detection** |
+| `application/grpc;charset=utf-8` | NO | with or without the space |
+| `APPLICATION/GRPC` | NO | the VALUE comparison is **CASE-SENSITIVE** |
+| `Application/Grpc` | NO | in mixed case too |
+| `application/grpc-web` | NO | **trap 1** for a naive `starts_with` |
+| `application/grpc-web+proto` | NO | its `+`-bearing sibling |
+| `application/grpcfoo` | NO | **trap 2** for a naive `starts_with` |
+| `application/json` | NO | control |
+| *(header absent)* | NO | control |
+
+**The two traps are the point of the rule.** `starts_with("application/grpc")`
+— the obvious implementation — accepts `application/grpc-web` and
+`application/grpcfoo`, both of which upstream REJECTS. The rule is
+`== "application/grpc" || starts_with("application/grpc+")`, exactly that.
+
+Detection is **METHOD-INSENSITIVE** (measured with `GET`, `POST` and `PUT`,
+which transform identically) and **INDEPENDENT of `te: trailers`**, measured in
+both directions. Neither signal participates.
+
+> **The trailing-space cell, and why it is NOT a matcher rule.** The value
+> `application/grpc ` **WITH A TRAILING SPACE IS detected** upstream. That is
+> the HTTP codec stripping optional trailing whitespace (OWS) **before the
+> matcher ever sees the value** — it is NOT matcher tolerance. **Trailing-space
+> tolerance must therefore NOT be built into any comparison.** An
+> implementation that adds a `.trim()` to the matcher reproduces this one cell
+> for the wrong reason and will diverge wherever the codec's OWS handling and a
+> `trim()` disagree.
+
+### §C — `grpc-message` percent-encoding
+
+**A byte passes through UNCHANGED iff it is in `0x20..=0x7D` AND is not `%`
+(0x25).** Every other byte — every byte `< 0x20`, every byte `>= 0x7E`, and `%`
+itself — becomes `%` followed by **TWO UPPERCASE hex digits**. Multi-byte UTF-8
+is encoded **PER BYTE**.
+
+| source body | measured `grpc-message` |
+|---|---|
+| `a b\ncontrol\ttab é %25 end` | `a b%0Acontrol%09tab %C3%A9 %2525 end` |
+| `q"b s\l t~t dd` | `q"b s\l t%7Et dd` |
+| a single `0x7F` byte | `%7F` |
+
+Reading the cells: `\n` → `%0A` and `\t` → `%09`; `é` (0xC3 0xA9) → `%C3%A9`
+(per BYTE, not per code point); the literal three characters `%25` → `%2525`
+(the `%` is escaped, the `2` and `5` pass through — which is why double
+application is a standing hazard); `"` (0x22) and `\` (0x5C) **pass through
+unchanged**; the hex digits are UPPERCASE (`%0A`, never `%0a`). The output is
+ASCII by construction.
+
+> **The parent phase-110 SPEC's claimed rule of `0x20..=0x7E` was MEASURED
+> FALSE.** `~` (0x7E) **IS escaped** — it becomes `%7E` — while `}` (0x7D) is
+> not. The upper boundary of the pass-through range is `0x7D`, INCLUSIVE. The
+> correction is recorded at `110.1/SPEC.md` §1.3. A one-byte error at the top of
+> the range is invisible to any body that happens not to contain a `~`, which is
+> why fixture `0089` carries a dedicated `~` cell.
+
+### §D — the transformed wire shape, and the header ORDER
+
+On a **detected request** (§B), a **LOCALLY GENERATED** reply becomes:
+
+| cell | measured value |
+|---|---|
+| status | **`200`** — always, whatever the original status was |
+| `content-type` | **`application/grpc`** — replacing whatever the reply carried |
+| body | **DROPPED** (zero bytes) |
+| `content-length` | **`0`** |
+| `grpc-status` | the §A mapping of the **ORIGINAL** status |
+| `grpc-message` | the §C encoding of the **ORIGINAL** body — **only when that body was non-empty**; **ABSENT ENTIRELY, not empty, otherwise** |
+| `location` | **SURVIVES** — a pass-through header, value unchanged |
+
+The `grpc-message` rule is a PRESENCE rule, not a value rule: on an empty
+original body the header name does not appear on the wire at all. Emitting
+`grpc-message:` with an empty value is a NAME-SET divergence and reds
+`diff_headers` (§E).
+
+**The MEASURED header order:**
+
+```
+[location,] content-type, grpc-status, [grpc-message,] date, server, connection, content-length
+```
+
+Stated as the single rule that reproduces every measured order: **pass-through
+headers first, in their ORIGINAL relative order** (everything that is not
+`content-type`, `content-length`, `date`, `server` or `connection`); **then
+`content-type`; then `grpc-status`; then `grpc-message` if the original body was
+non-empty; then `date`, `server`, `connection`; then `content-length` LAST.**
+The rule is GENERAL rather than a `location` special case — it was measured on
+three independent pass-through cases: a bodied `direct_response`, a `redirect:`
+route, and a circuit-breaker overflow whose `x-envoy-overloaded` header also
+survives in its original leading position.
+
+> **The differential harness does NOT compare header order.** `diff_headers`
+> compares a `BTreeSet` of lower-cased header NAMES and then per-name VALUES; it
+> never reads position. This order is recorded here **for the contract, not as a
+> fixture gate**. A wrong order therefore fails an **in-process unit test**,
+> never fixture `0089`. Do not assume `0089` is protecting it.
+
+### §E — the harness disposition, stated as a STANDING PROHIBITION
+
+`grpc-status`, `grpc-message`, `content-type`, `content-length` and `location`
+are **ALL outside** the harness's 3-entry `HEADER_ALLOW_LIST` (`server`, `date`,
+`x-envoy-upstream-service-time`, at `tests/differential/src/lib.rs:1189-1193`),
+so `diff_headers` compares all five **VALUE-EXACT cross-proxy**. **That
+comparison IS fixture `0089`'s entire mapping and encoding witness** — the §A
+table and the §C encoder are pinned by nothing else at the differential layer.
+
+> **NEVER add `location` — or `content-type`, or any of the other three — to
+> `HEADER_ALLOW_LIST`.** Allow-listing a name to make one fixture pass silently
+> vacates that name's assertion across the **whole corpus** while leaving every
+> fixture green. It is the most dangerous failure mode available here, because
+> it looks like success.
+
+Two properties of `diff_headers` bound what §D can actually witness:
+
+- It compares a **SET** of lower-cased names, **not a multiset** — so a
+  **DUPLICATED `grpc-status`** would be **INVISIBLE** to it.
+- On a duplicated name, **only the FIRST occurrence's value is compared** (both
+  sides use a `find`, not a collect). A second, differing value is never read.
+
+A third property bounds what a fixture MUTATION can prove: `diff_headers` takes
+only the two proxies' header vectors and no fixture-declared expected value, so
+it is **purely cross-proxy**. A config mutation applied to BOTH `envoy.yaml` and
+`envoy-rust.yaml` moves both proxies in lockstep and returns a GREEN that reads
+as "these cells are vacuous". **A mutation intended to witness a header cell
+must be ONE-SIDED.**
+
+### §F — scope
+
+- **HTTP/1.1 LOCAL replies only.** "Local" means every reply the proxy generates
+  itself — `direct_response`, `redirect:`, the route-decision synths, the
+  pool/attempt synths, the request-budget overflow, the chunked-501, and
+  filter-generated local replies.
+- **HTTP/2 is UNBUILT** — carry-forward **CF-110-1**. Its upstream shape IS
+  measured: the **same transform, but headers-only**, with **`content-length`
+  OMITTED** rather than set to `0`. That is a measurement of upstream alone, not
+  an implementation; nothing in this tree performs it.
+- **PROXIED (upstream-origin) responses are NOT transformed** — carry-forward
+  **CF-110-2**. Only replies the proxy itself generates enter the transform.
+
+### §G — a pre-existing `grpc-status` response header: MEASURED, and a DIVERGENCE (CF-110-8)
+
+Measured on **BOTH** proxies with a chain-level
+`envoy.filters.http.header_mutation` adding `grpc-status: 99` to responses, in
+front of a `direct_response` **404** route whose body is `MUTGS`:
+
+| direction | upstream `envoyproxy/envoy:v1.33.0` | envoy-rust |
+|---|---|---|
+| **gRPC** | **STILL TRANSFORMS** — `200`, `content-type: application/grpc`, body DROPPED, `content-length: 0`, `grpc-message: MUTGS` — and merely lets the operator's `grpc-status: 99` **WIN** instead of overwriting it with the mapped `12` | **NO transform at all** — `404`, body `MUTGS`, `content-type: text/plain`, `grpc-status: 99` |
+| **non-gRPC** (control) | untransformed | untransformed — **the two AGREE** |
+
+The envoy-rust side is the **idempotence sentinel** at
+`crates/envoy-http1/src/grpc.rs:158-160`, which returns early on any pre-existing
+`grpc-status` and therefore suppresses the *entire* transform, not merely the one
+header. The sentinel is correct for its stated purpose — preventing a double
+application from appending a SECOND `grpc-status` and from double-encoding
+`grpc-message` — but its BLAST RADIUS is wider than that purpose, and that is
+where the two proxies part company.
+
+> **Fixture `0089` deliberately carries NO such cell.** This is a **genuine
+> divergence**, so a fixture cell would go RED for a real reason rather than a
+> fixture-shape accident — and a RED fixture is not a way to record a
+> divergence. It is recorded here, and as **CF-110-8**, instead. Do not "fix"
+> `0089` by adding the cell, and do not weaken the sentinel to make one pass
+> without first settling §H item 3.
+
+### §H — NOT MEASURED — do not treat these as settled
+
+1. **The transform over TLS.** Every probe used a plaintext HTTP/1.1 listener.
+   Detection reads a request header and should be transport-agnostic, but that
+   is the natural reading, not a measurement.
+2. **The interaction with a response `grpc-message` header injected by an
+   operator.** §G measured an injected `grpc-status` only. Whether upstream
+   preserves, overwrites or duplicates an operator-supplied `grpc-message` is
+   unknown — and the §E multiset gap means a duplicate would be invisible to the
+   harness even if it occurred.
+3. **Whether upstream's `grpc-status` preservation in §G is an add-if-absent
+   rule or a filter-ordering artifact.** The **OBSERVABLE is measured**; the
+   **MECHANISM is NOT established**. The two hypotheses are indistinguishable
+   from a single filter-chain position and predict different behaviour for a
+   `grpc-status` injected on the encode side downstream of the transform.
+   Nothing here licenses implementing either.
+4. **The HTTP/2 cells.** §F records upstream's measured H2 shape; envoy-rust
+   performs no H2 transform, so **no cross-proxy comparison of it exists**.
+
+**Two ADJACENT recorded divergences, both ORTHOGONAL to gRPC.** Both were
+surfaced by the 110.2 end-to-end dry-run of the exact fixture-`0089` YAML against
+both proxies, and each would have landed the fixture RED for a reason unrelated
+to this surface — which is why `0089`'s config avoids both shapes rather than
+asserting on them:
+
+- **CF-110-6** — envoy-rust emits `content-type` on an **EMPTY-body local
+  reply** where upstream emits none. The upstream rule is recorded in the
+  `## Stat-name mapping` section's ADR-0059 entry
+  (`BEHAVIOR_CONTRACT.md:1131-1137`), but the decorators implementing it — H1
+  `decorate_filter_synth_response` and H2 `decorate_filter_synth_response_h2` —
+  cover only **FILTER** local replies, so the rest of the local-reply family
+  does not obey it. No other fixture in the corpus uses an empty-body
+  `direct_response`, which is why it went uncaught.
+- **CF-110-7** — `direct_response.body` is **MANDATORY** in envoy-rust
+  (`crates/envoy-config/src/bootstrap.rs:2923-2926`: `pub body: DataSource`, no
+  `#[serde(default)]` and not an `Option`) and **OPTIONAL** upstream, so a
+  bodiless `direct_response` is **boot-fatal here and accepted there** — an
+  ADR-0049 reject-direction divergence.
+
+Neither is caused by the gRPC transform and neither is fixed by it. A later
+session touching either must not read this section as evidence about them.
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**

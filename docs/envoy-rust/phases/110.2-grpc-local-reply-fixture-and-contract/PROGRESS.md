@@ -458,3 +458,84 @@ of them must be ONE-SIDED: `diff_headers` is purely cross-proxy, so a two-sided
 mutation moves both proxies in lockstep and returns a false green. That is the
 D-1 lesson, recorded where the next reader of the fixture will find it rather
 than only in this PROGRESS file.
+
+---
+
+## Task 7 — the `BEHAVIOR_CONTRACT.md` `## gRPC` section — **COMPLETE**
+
+**Built:** a new `## gRPC` section, **260 lines**, with `###` subsections
+**§A–§H** plus the fixture pointer and the two adjacent-divergence notes.
+
+**Step 1 — the insertion point re-derived BY TEXT, not by `PLAN.md`'s line
+numbers.** `## Active gRPC health check` at **574** and `## Header allow-list`
+at **644** (matching the PLAN's figures, but re-derived rather than trusted),
+with `grep -c '^## gRPC'` = **0** beforehand. The section went immediately
+BEFORE `## Header allow-list`, keeping all gRPC content contiguous. Sections in
+this file are INSERTED TOPICALLY, never appended at EOF.
+
+**Step 3 — verified structurally, with the FULL pathspec** (a bare
+`-- BEHAVIOR_CONTRACT.md` matches nothing and returns a believable EMPTY forever
+— `110.1/REVIEW.md` N-5):
+
+```
+$ grep -c '^## gRPC' docs/envoy-rust/BEHAVIOR_CONTRACT.md
+1
+$ grep -c '^## ' docs/envoy-rust/BEHAVIOR_CONTRACT.md
+16                                  <- 15 -> 16
+$ grep -n '^## ' … | sed -n '5,9p'
+522:## Active TCP health check (`tcp_health_check`)
+574:## Active gRPC health check (`grpc_health_check`)
+644:## gRPC
+904:## Header allow-list
+$ git diff --numstat -- docs/envoy-rust/BEHAVIOR_CONTRACT.md
+260	0                               <- PURE INSERTION
+```
+
+Pure insertion proven the stronger way as well — the pre-edit file is a
+SUBSEQUENCE of the post-edit file (`SUBSEQUENCE: True`, 4046 → 4306 lines,
+delta **260**), so no existing line was altered or reordered.
+
+**Step 4 — the fixture is still GREEN** after the docs edit:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.85s
+```
+
+### DEVIATION D-4 (METHOD) — the section was DRAFTED by a subagent, and THREE of its claims were WRONG and had to be corrected before the main session wrote the file
+
+Per the handoff, Task 7 is the one task genuinely independent of Tasks 1–6, so
+it was drafted by a read-only subagent (told not to write and not to run
+`cargo`) while the main session wrote Task 6. **The main session wrote the file,
+and graded the draft rather than pasting it.** Three claims did not survive:
+
+1. **A WRONG cross-reference.** The draft linked the ADR-0059 empty-body rule as
+   `[recorded above](#header-allow-list)`. Lines 1131-1137 are NOT in
+   `## Header allow-list` — an `awk` scan for the enclosing `^## ` heading puts
+   them in **`## Stat-name mapping`** (line 674). Corrected to name that section
+   explicitly, with no anchor.
+2. **UNVERIFIABLE provenance.** The draft attributed the `~`→`%7E` correction to
+   "ADR-0178 V-8" and claimed it was "re-confirmed on nine bodies supplied as
+   `inline_bytes`". `grep -c 'V-8' docs/envoy-rust/DECISIONS.md` = 22, none
+   confirmable as that specific finding, and the nine-body figure is nowhere on
+   disk. Replaced with the citation this session actually read: `110.1/SPEC.md`
+   §1.3.
+3. **AN OVERSTATED MEASUREMENT.** The draft said detection was measured
+   "over four methods". `110.1/SPEC.md` §1.2 records `GET`, `POST` and `PUT` —
+   **three**. Corrected to name them.
+
+Two of the draft's riskier-looking claims DID survive verification and were
+kept: `decorate_filter_synth_response_h2` genuinely exists (referenced at
+`crates/envoy-http1/src/hcm.rs:2491` and `crates/envoy-filter/src/jwt_authn.rs:13`),
+and the filter local-reply list (rbac 403 / fault / jwt_authn 401 /
+local_ratelimit 429 / overflow 503) is quoted VERBATIM from
+`BEHAVIOR_CONTRACT.md:1136-1137`. The lesson is the standing one, and it cut
+both ways here: **a subagent finding is a CLAIM — re-verify on disk**, including
+the ones that look safe and excluding none that look authoritative.
+
+**One addition beyond `PLAN.md`'s content list.** §E records a THIRD property of
+`diff_headers` alongside the two the PLAN names: it takes only the two proxies'
+header vectors and no fixture-declared expected value, so it is purely
+cross-proxy, and **a mutation intended to witness a header cell must be
+ONE-SIDED**. That is the D-1 finding, promoted into the canonical contract so
+the next author of a header fixture meets it before writing a two-sided
+mutation.
