@@ -289,6 +289,48 @@ driver:
       expected_status: 200
       expected_body: { kind: byte_exact, body: "" }
       expected_headers: set_equal_modulo_allow_list
+    # ---- §1.3 percent-encoding. A byte passes through UNCHANGED iff it is in
+    # ---- `0x20..=0x7D` AND is not `%` (0x25). Everything else becomes `%` plus
+    # ---- TWO UPPERCASE hex digits; multi-byte UTF-8 is encoded PER BYTE.
+    # ---- MEASURED: `a b\ncontrol\ttab é %25 end`
+    # ----        -> `a b%0Acontrol%09tab %C3%A9 %2525 end`
+    # ---- The `%25` -> `%2525` cell is the discriminating one for a
+    # ---- hand-rolled encoder that forgets to escape `%` itself.
+    - name: enc-main-percent-encoded
+      method: get
+      path: "/enc-main"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: enc-main-control
+      method: get
+      path: "/enc-main"
+      host: "envoy-rust.test"
+      expected_status: 400
+      expected_body: { kind: byte_exact, body: "a b\ncontrol\ttab é %25 end" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- the BOUNDARY cell the parent SPEC got wrong: `~` (0x7E) IS ESCAPED
+    # ---- (`%7E`), while `"` (0x22) and `\` (0x5C) pass through unchanged.
+    # ---- MEASURED: `q"b s\l t~t dd` -> `q"b s\l t%7Et dd`
+    - name: enc-edge-tilde-escaped
+      method: get
+      path: "/enc-edge"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: enc-edge-control
+      method: get
+      path: "/enc-edge"
+      host: "envoy-rust.test"
+      expected_status: 400
+      expected_body: { kind: byte_exact, body: "q\"b s\\l t~t dd" }
+      expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
   response_body: { kind: byte_exact }

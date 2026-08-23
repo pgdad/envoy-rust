@@ -305,3 +305,68 @@ Unmutated control from the same tree — **GREEN**:
 ```
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
 ```
+
+---
+
+## Task 4 — the four §1.3 percent-encoding cells — **COMPLETE**
+
+**Built:** probes **27–30** (probe count **26 → 30**). Yamls untouched
+(`216e712c…`, 6561 bytes).
+
+Two encoded cells and their two byte-exact untransformed controls. The controls
+are load-bearing rather than decorative: without them a wrong ENCODING and a
+wrong SOURCE BODY are indistinguishable. Both controls assert the original body
+byte-exactly and both PASSED, which also establishes that upstream's YAML 1.1
+parser and `serde_yaml`'s YAML 1.2 parser resolved the `\n`, `\t`, `é`, `%25`,
+`\"` and `\\` escapes IDENTICALLY — a real risk given the two parsers differ
+elsewhere in the tree.
+
+**Run — GREEN:**
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+```
+
+### DEVIATION D-3 (ADDITION) — mutation **V4**, not in `PLAN.md`, because nothing else in the plan proves the `grpc-message` VALUE is compared at all
+
+`PLAN.md` specifies no mutation for Task 4. V1 proves the cross-proxy VALUE
+comparison is live for **`grpc-status`**, and V3 proves the **name-set** half
+catches `grpc-message`'s ABSENCE — but no mutation in the plan establishes that
+`grpc-message`'s VALUE is compared, which is the entire §1.3 encoding witness.
+Left as planned, a broken encoder that produced the same header NAME would be
+invisible to this fixture's own vacuity proofs.
+
+One-sided upstream-only mutation (the D-1 shape), changing `/enc-main`'s trailing
+`end` to `END` in `envoy.yaml` only. Guard: anchor count **1**.
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+---- grpc_aware_local_replies stdout ----
+thread 'grpc_aware_local_replies' panicked at tests/differential/tests/grpc_aware_local_replies.rs:42:10:
+fixture green: probe enc-main-percent-encoded: diff_headers
+
+Caused by:
+    header `grpc-message`: envoy=`a b%0Acontrol%09tab %C3%A9 %2525 END` envoy-rust=`a b%0Acontrol%09tab %C3%A9 %2525 end`
+```
+
+Two things fall out of that one line. First, the `grpc-message` VALUE is
+genuinely compared byte-exact cross-proxy — the encoding cells are not vacuous.
+Second, the failure text DISPLAYS both proxies' full encodings, which
+independently re-confirms the §1.3 rule cell by cell at this state rather than
+on the state-2's authority: `\n`→**`%0A`**, `\t`→**`%09`**, `é`→**`%C3%A9`**
+(UTF-8 encoded PER BYTE), `%25`→**`%2525`** (the discriminating cell for an
+encoder that forgets to escape `%` itself), and the space PRESERVED. Both
+proxies agree on every one.
+
+Reverted from an explicit backup and adjudicated by md5 (`envoy.yaml: OK`,
+`envoy-rust.yaml: OK`, 6561 bytes each, probe count still 30); unmutated control
+**GREEN**:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+```
+
+This makes **four** in-place mutations against SPEC §3 F6's "at least two", each
+reverted byte-exactly and md5-verified, each with an unmutated control from the
+same tree.
