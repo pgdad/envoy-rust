@@ -1,0 +1,175 @@
+# Sub-phase 110.2: the FIRST differential witness of gRPC-aware local replies
+# in the corpus, and the first fixture in the tree that sends
+# `content-type: application/grpc` at all.
+#
+# Sibling 110.1 landed the transform: a request whose `content-type` is
+# EXACTLY `application/grpc` or begins with `application/grpc+` turns any
+# LOCALLY GENERATED reply into HTTP 200 + `content-type: application/grpc`
+# + `content-length: 0`, body DROPPED, with a `grpc-status` header and — only
+# when the original body was non-empty — a `grpc-message` header carrying that
+# body percent-encoded. 110.1 proved it IN-PROCESS; this fixture proves it
+# CROSS-PROXY.
+#
+# WHAT PINS WHAT. `expected_status` and `expected_body` are ABSOLUTE (asserted
+# against BOTH proxies). `expected_headers: set_equal_modulo_allow_list` is
+# CROSS-PROXY: `diff_headers` compares the lower-cased header NAME SET and then
+# the VALUE of every name outside the 3-entry HEADER_ALLOW_LIST
+# (`server`, `date`, `x-envoy-upstream-service-time`). `grpc-status`,
+# `grpc-message`, `content-type`, `content-length` and `location` are NOT on
+# that list, so all five are compared byte-exact. THAT comparison is the entire
+# mapping and encoding witness.
+#
+# THREE CELLS ARE DELIBERATELY ABSENT, each a MEASURED divergence unrelated to
+# gRPC that would RED this fixture for the wrong reason:
+#   * no 201/3xx `direct_response` — upstream emits `location` on those and
+#     envoy-rust does not (CF-110-3, re-measured at the 110.2 PLAN-write on
+#     201/301/302; 204 gets none).
+#   * no empty-body CONTROL probe — envoy-rust's `synth_with` emits
+#     `content-type` on an empty-body local reply and upstream does not
+#     (CF-110-6, found by the PLAN-write dry-run). Both empty-body cells are
+#     probed in the gRPC direction, where the two proxies AGREE.
+#   * no `header_mutation`-injected `grpc-status` cell — envoy-rust's
+#     idempotence sentinel SUPPRESSES the whole transform there while upstream
+#     transforms anyway and lets the operator's value win (CF-110-8, MEASURED
+#     on both proxies at the 110.2 PLAN-write).
+#
+# The driver ABORTS AT THE FIRST FAILING PROBE, so one red run names exactly
+# ONE probe; never infer a second cell's state from a single red run.
+driver:
+  kind: http1_probe_list
+  probes:
+    # ---- §1.1 the SPARSE EIGHT-ENTRY mapping over a DEFAULT of 2 -----------
+    - name: g-200-maps-to-unknown
+      method: get
+      path: "/m-200"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-400-maps-to-13
+      method: get
+      path: "/m-400"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-401-maps-to-16
+      method: get
+      path: "/m-401"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-403-maps-to-7
+      method: get
+      path: "/m-403"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-404-maps-to-12
+      method: get
+      path: "/m-404"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # `405` is one of the two counter-intuitive default-arm witnesses: it looks
+    # like it should be special and is NOT.
+    - name: g-405-falls-to-unknown
+      method: get
+      path: "/m-405"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-429-maps-to-14
+      method: get
+      path: "/m-429"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # `500` is the sharpest default-arm cell — a 5xx that is NOT 14.
+    - name: g-500-falls-to-unknown
+      method: get
+      path: "/m-500"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-502-maps-to-14
+      method: get
+      path: "/m-502"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-503-maps-to-14
+      method: get
+      path: "/m-503"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: g-504-maps-to-14
+      method: get
+      path: "/m-504"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- paired non-gRPC CONTROLS: the transform must NOT fire -------------
+    - name: c-200-untransformed
+      method: get
+      path: "/m-200"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "B200" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: c-400-untransformed
+      method: get
+      path: "/m-400"
+      host: "envoy-rust.test"
+      expected_status: 400
+      expected_body: { kind: byte_exact, body: "B400" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: c-404-untransformed
+      method: get
+      path: "/m-404"
+      host: "envoy-rust.test"
+      expected_status: 404
+      expected_body: { kind: byte_exact, body: "B404" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: c-503-untransformed
+      method: get
+      path: "/m-503"
+      host: "envoy-rust.test"
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "B503" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }

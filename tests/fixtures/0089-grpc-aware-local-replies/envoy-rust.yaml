@@ -1,0 +1,103 @@
+# Sub-phase 110.2: the differential witness for gRPC-aware LOCAL REPLIES over
+# HTTP/1.1 (the transform sibling 110.1 landed and proved only in-process).
+# Backend-free and CLUSTER-FREE (`clusters: []`) — every response is a LOCAL
+# reply, which is the whole surface under test. No `node:` block: upstream
+# parses YAML 1.1, so an unquoted `y`/`n`/`on`/`off` scalar would booleanize
+# there and not here — omitting it is what lets ONE file serve both proxies
+# byte-identically. Admin `port_value` is a LITERAL 0: `{{ADMIN_PORT}}` is
+# driver-gated and `Http1ProbeList` is not one of the four drivers that get it.
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address:
+        socket_address: { address: 0.0.0.0, port_value: {{PORT}} }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        # --- §1.1 mapping: one route per configured status, each
+                        # --- at its OWN path with its OWN body (the §G attribution
+                        # --- rule). NO 201 and NO 3xx: upstream emits `location`
+                        # --- on those and envoy-rust does not (CF-110-3).
+                        - match: { prefix: "/m-200" }
+                          direct_response: { status: 200, body: { inline_string: "B200" } }
+                        - match: { prefix: "/m-400" }
+                          direct_response: { status: 400, body: { inline_string: "B400" } }
+                        - match: { prefix: "/m-401" }
+                          direct_response: { status: 401, body: { inline_string: "B401" } }
+                        - match: { prefix: "/m-403" }
+                          direct_response: { status: 403, body: { inline_string: "B403" } }
+                        - match: { prefix: "/m-404" }
+                          direct_response: { status: 404, body: { inline_string: "B404" } }
+                        - match: { prefix: "/m-405" }
+                          direct_response: { status: 405, body: { inline_string: "B405" } }
+                        - match: { prefix: "/m-429" }
+                          direct_response: { status: 429, body: { inline_string: "B429" } }
+                        - match: { prefix: "/m-500" }
+                          direct_response: { status: 500, body: { inline_string: "B500" } }
+                        - match: { prefix: "/m-502" }
+                          direct_response: { status: 502, body: { inline_string: "B502" } }
+                        - match: { prefix: "/m-503" }
+                          direct_response: { status: 503, body: { inline_string: "B503" } }
+                        - match: { prefix: "/m-504" }
+                          direct_response: { status: 504, body: { inline_string: "B504" } }
+                        # --- §1.2 detection: all land on 404 (grpc-status 12) so a
+                        # --- transform is discriminable from a non-transform by
+                        # --- BOTH the status and the body.
+                        - match: { prefix: "/d-exact" }
+                          direct_response: { status: 404, body: { inline_string: "DEXACT" } }
+                        - match: { prefix: "/d-plus-proto" }
+                          direct_response: { status: 404, body: { inline_string: "DPROTO" } }
+                        - match: { prefix: "/d-plus-bare" }
+                          direct_response: { status: 404, body: { inline_string: "DBARE" } }
+                        - match: { prefix: "/d-param" }
+                          direct_response: { status: 404, body: { inline_string: "DPARAM" } }
+                        - match: { prefix: "/d-upper" }
+                          direct_response: { status: 404, body: { inline_string: "DUPPER" } }
+                        - match: { prefix: "/d-web" }
+                          direct_response: { status: 404, body: { inline_string: "DWEB" } }
+                        - match: { prefix: "/d-foo" }
+                          direct_response: { status: 404, body: { inline_string: "DFOO" } }
+                        - match: { prefix: "/d-absent" }
+                          direct_response: { status: 404, body: { inline_string: "DABSENT" } }
+                        # --- detection is METHOD-INSENSITIVE
+                        - match: { prefix: "/x-post" }
+                          direct_response: { status: 403, body: { inline_string: "XPOST" } }
+                        # --- empty body -> `grpc-message` ABSENT ENTIRELY. `body:`
+                        # --- is MANDATORY in envoy-rust (CF-110-7), so the empty
+                        # --- body is spelled explicitly.
+                        - match: { prefix: "/e-empty" }
+                          direct_response: { status: 404, body: { inline_string: "" } }
+                        # --- §1.3 percent-encoding
+                        - match: { prefix: "/enc-main" }
+                          direct_response:
+                            status: 400
+                            body: { inline_string: "a b\ncontrol\ttab é %25 end" }
+                        - match: { prefix: "/enc-edge" }
+                          direct_response:
+                            status: 400
+                            body: { inline_string: "q\"b s\\l t~t dd" }
+                        # --- `location` must SURVIVE the transform. A `redirect:`
+                        # --- route is safe where a 3xx `direct_response` is not:
+                        # --- `synth_redirect` already emits `location`.
+                        - match: { prefix: "/r-redir" }
+                          redirect: { host_redirect: "h", path_redirect: "/x" }
+                        # --- NO catch-all: `/no-such-route` must reach the HCM's
+                        # --- OWN route-not-found 404, a second empty-body cell.
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 0 }
