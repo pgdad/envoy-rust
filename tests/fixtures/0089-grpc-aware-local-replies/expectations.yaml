@@ -248,6 +248,47 @@ driver:
       expected_status: 404
       expected_body: { kind: byte_exact, body: "DABSENT" }
       expected_headers: set_equal_modulo_allow_list
+    # ---- detection is METHOD-INSENSITIVE. `Http1Method` offers only
+    # ---- get/options/post — there is no `put` or `delete` — so `post` is the
+    # ---- available second method.
+    - name: x-post-method-insensitive
+      method: post
+      path: "/x-post"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- an EMPTY original body means `grpc-message` is ABSENT ENTIRELY, not
+    # ---- empty. The name-set half of `diff_headers` is what catches a
+    # ---- spurious empty header, so this cell needs no value assertion.
+    # ---- NOTE: there is deliberately no non-gRPC twin — envoy-rust's
+    # ---- `synth_with` emits `content-type` on an empty-body local reply where
+    # ---- upstream emits none (CF-110-6). In the gRPC direction both proxies
+    # ---- emit `content-type: application/grpc` and AGREE.
+    - name: e-empty-no-grpc-message
+      method: get
+      path: "/e-empty"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    # ---- the SECOND empty-body cell, and a different local-reply SITE: this
+    # ---- path matches no route, so the reply is the HCM's OWN
+    # ---- route-not-found 404 (`synth_404` via `build_response_in`) rather
+    # ---- than a `direct_response`.
+    - name: nomatch-404-no-grpc-message
+      method: get
+      path: "/no-such-route"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
   response_body: { kind: byte_exact }

@@ -233,3 +233,75 @@ $ grep -c '^    - name:' expectations.yaml
 23
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
 ```
+
+---
+
+## Task 3 — method-insensitivity and the two empty-body cells — **COMPLETE**
+
+**Built:** probes **24–26** (probe count **23 → 26**). The yamls were again
+untouched (`216e712c…`, 6561 bytes).
+
+- `x-post-method-insensitive` — a `post` probe at `/x-post` (a `403` route, so
+  it also re-witnesses the `403`→`7` cell under a second method). `post` is the
+  available second method because `Http1Method` has exactly three variants
+  `get`/`options`/`post` — **there is no `put` and no `delete`** (re-verified on
+  disk, X-5).
+- `e-empty-no-grpc-message` — the `inline_string: ""` route.
+- `nomatch-404-no-grpc-message` — `/no-such-route`, which matches NO route
+  because `0089` deliberately has no catch-all. This drives a DIFFERENT
+  local-reply site: the HCM's own route-not-found 404 (`synth_404` via
+  `build_response_in`) rather than a `direct_response`. Per ADR-0180 DECISION 6
+  this narrows `110.1/REVIEW.md` M-3 by one site **as a free side effect, not as
+  scheduled work** — no banked finding is being fixed here (§6.3; ADR-0165).
+
+**Neither empty-body cell has a non-gRPC twin**, and that is deliberate:
+CF-110-6 records that envoy-rust's `synth_with` emits `content-type` on an
+empty-body local reply where upstream emits none. In the gRPC direction both
+proxies emit `content-type: application/grpc` and AGREE, so SPEC §3 F3's
+requirement — `grpc-message` ABSENT ENTIRELY — is met twice over.
+
+**Run — GREEN:**
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+```
+
+**Mutation V3 — as specified in `PLAN.md`, which gets this one right.** V3
+mutates only the UPSTREAM side, the same symmetry-breaking shape D-1 had to
+introduce into V1. Guard: `grep -c 'inline_string: ""' envoy.yaml` = **1**.
+Giving upstream's `/e-empty` route the body `EMPTYNOW` makes upstream emit a
+`grpc-message` header that envoy-rust does not:
+
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+---- grpc_aware_local_replies stdout ----
+thread 'grpc_aware_local_replies' panicked at tests/differential/tests/grpc_aware_local_replies.rs:42:10:
+fixture green: probe e-empty-no-grpc-message: diff_headers
+
+Caused by:
+    header name sets differ: only-in-envoy=["grpc-message"], only-in-envoy-rust=[]
+```
+
+That is the **name-set** half of `diff_headers` firing, which is the direct
+proof that `grpc-message` **ABSENCE** — not merely its value — is pinned. A
+value-only comparison could not have produced this failure.
+
+Reverted from an explicit backup copy rather than by `git checkout` (per D-2),
+and adjudicated by md5:
+
+```
+$ md5sum -c /tmp/v3.md5
+envoy.yaml: OK
+envoy-rust.yaml: OK
+ 6561 envoy.yaml
+ 6561 envoy-rust.yaml
+$ grep -c '^    - name:' expectations.yaml
+26                      <- Task 3's own work confirmed intact, the D-2 lesson applied
+```
+
+Unmutated control from the same tree — **GREEN**:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+```
