@@ -425,3 +425,36 @@ POSITIVE (poll while the fixture runs):
 
 The reference container genuinely ran, the poll genuinely executed, and the
 negative control makes the positive non-vacuous.
+
+---
+
+## Task 6 — the fixture README — **COMPLETE**
+
+**Built:** `tests/fixtures/0089-grpc-aware-local-replies/README.md`, **209
+lines**. No code reads it; it is convention (85 of the 88 pre-existing fixtures
+carry one). It contains all seven items `PLAN.md` Task 6 Step 1 requires:
+title and provenance with the pinned digest; the full 32-row witness table;
+"what actually pins what"; the three deliberately-absent cells each with its
+measurement; the two shape decisions; how to run it (including the
+`cargo build -p envoy-bin` precondition and the X-7 audit recipe with the VALID
+`docker ps` format field); and the mutation table.
+
+**Step 2 — no stray byte-identity claim.** The file makes exactly ONE
+byte-identity claim (line 144) and it is immediately backed by both the md5 and
+the byte count:
+
+```
+216e712c14b1ca1dd8fcd0a4c277f8ab  envoy.yaml
+216e712c14b1ca1dd8fcd0a4c277f8ab  envoy-rust.yaml
+ 6561 envoy.yaml
+ 6561 envoy-rust.yaml
+```
+
+The README states explicitly that byte-identity is a **PER-FIXTURE** claim to be
+re-derived and never a tree property.
+
+The mutation table records all **four** mutations, and states the reason three
+of them must be ONE-SIDED: `diff_headers` is purely cross-proxy, so a two-sided
+mutation moves both proxies in lockstep and returns a false green. That is the
+D-1 lesson, recorded where the next reader of the fixture will find it rather
+than only in this PROGRESS file.
