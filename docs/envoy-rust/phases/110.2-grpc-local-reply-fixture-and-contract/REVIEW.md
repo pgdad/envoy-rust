@@ -283,7 +283,7 @@ other and stale against the tree. The *substance* of D-4 #1 is correct; only the
 
 The claim, in three landed artifacts:
 
-- `expectations.yaml:26-29` — "no empty-body CONTROL probe — envoy-rust's `synth_with` emits
+- `expectations.yaml:27-30` — "no empty-body CONTROL probe — envoy-rust's `synth_with` emits
   `content-type` on an empty-body local reply and upstream does not"
 - `README.md:106-107` — same wording
 - `BEHAVIOR_CONTRACT.md:885` — "**CF-110-6** — envoy-rust emits `content-type` on an **EMPTY-body
@@ -365,9 +365,9 @@ attribution rule", inherited verbatim from `110.2/SPEC.md:203` and originally fr
 
 1. **The phrase does not exist in the file.** `grep -c 'one-path-per-probe'
    docs/envoy-rust/BEHAVIOR_CONTRACT.md` = **0**.
-2. **The rule it gestures at does not bind this driver.** The real text is at `:3186-3202`, under a
-   *different* section's "§G Authoritative fixtures", and states its own scope at `:3196`: "**The
-   rule binds EVERY `http1_access_log_byte_exact` fixture**". Its rationale (`:3186-3190`) is that
+2. **The rule it gestures at does not bind this driver.** The real text is at `:3186-3199`, under a
+   *different* section's "§G Authoritative fixtures", and states its own scope at `:3199`: "**The
+   rule binds EVERY `http1_access_log_byte_exact` fixture**". Its rationale (`:3186-3197`) is that
    the access-log driver "asserts only (a) a per-side line COUNT and (b) whole-line cross-proxy
    equality; there is no per-probe assertion". The same paragraph says why `http1_probe_list` is
    exempt (`:3169-3171`): "**because `http1_probe_list` names and asserts every probe individually —
@@ -516,7 +516,7 @@ reader does not rediscover it as a defect.
 
 **N-2 — five §1.2 detection cells are unwitnessed cross-proxy; none is F3-required.**
 `application/grpc+json`, `application/grpc;charset=utf-8` (no space), `Application/Grpc`,
-`application/grpc-web+proto`, `application/json`. All are pinned in-process at `grpc.rs:255-263`.
+`application/grpc-web+proto`, `application/json`. All are pinned in-process at `grpc.rs:243-256`.
 Only **`application/grpc-web+proto`** tests an equivalence class the fixture does not otherwise
 cover: an implementation shaped `starts_with("application/grpc") && (len == 16 || contains('+'))`
 passes all five shipped negatives and wrongly accepts it. If one cell is ever added, that is the one.
@@ -528,7 +528,7 @@ measured-once claim with nothing defending it.
 
 **N-4 — `0x7F` → `%7F` is unwitnessed cross-proxy but is EXPRESSIBLE.** Recorded because "not
 witnessed" and "not witnessable" are different findings. `inline_bytes` is closed (boot-fatal here,
-`bootstrap.rs:1207-1220`), but a YAML double-quoted `"\x7F"` escape in `inline_string` is accepted
+`bootstrap.rs:1216-1220`), but a YAML double-quoted `"\x7F"` escape in `inline_string` is accepted
 by both loaders and `0x7F` is valid single-byte UTF-8. F3 made the second encoding probe optional
 and the fixture shipped it anyway, so this is an omission, not a shortfall.
 
@@ -542,12 +542,12 @@ by this fixture**, and a reader should not infer otherwise from "the differentia
 
 **N-6 — the contract's "whole 2xx / whole 3xx range" is a derived rule presented under a blanket
 MEASURED banner.** `:648` says "Every cell below was MEASURED against the pinned reference image";
-`:678-680` then generalizes to entire ranges. `110.1/SPEC.md:41-44` measured four points in those
+`:678-680` then generalizes to entire ranges. `110.1/SPEC.md:42-45` measured four points in those
 ranges (`200`, `201`, `204`, `301`). envoy-rust's exhaustive `u16` sweep pins **envoy-rust**, not
 upstream. The rule is almost certainly right; it is a derivation, and the banner does not say so.
 
 **N-7 — §C's second encoding row is a lossy transcription of its own source.** The contract row
-reads `` q"b s\l t~t dd `` → `` q"b s\l t%7Et dd ``; the measured probe at `110.1/SPEC.md:113` is
+reads `` q"b s\l t~t dd `` → `` q"b s\l t%7Et dd ``; the measured probe at `110.1/SPEC.md:115` is
 `q"b s\l t~t d<0x7F>d` → `q"b s\l t%7Et d%7Fd`. The raw `0x7F` byte was dropped in transcription,
 leaving `dd`. Nothing is factually wrong — the literal string as written does encode as shown, and
 `:735` restores the `0x7F` cell on its own row — but the row no longer corresponds to the
@@ -632,7 +632,7 @@ correction.
 **DOWNGRADED: "`application/grpc-web+proto` is a coverage gap" — Minor → Note (N-2).** The
 constructed counterexample implementation is sound and I accept it as the reason this is the one
 cell worth adding if any ever is. But F3 does not require it, and it is pinned in-process at
-`grpc.rs:262`. Note.
+`grpc.rs:252`. Note.
 
 **REFRAMED: CF-110-6's absence bullet.** Two reviewers reached the same place from opposite
 directions — one asked whether the absence was forced (it is), the other whether the probe set
