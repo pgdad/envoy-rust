@@ -1,0 +1,27 @@
+# Phase 111 fixture 0090 — HTTP/2 response TRAILER forwarding.
+#
+# `expected_trailers` is NEW at phase 111 and this is its first and only user:
+# it compares the two proxies' response trailer blocks with the SAME
+# set-equality-modulo-allow-list discipline `expected_headers` applies to
+# headers, which is literally what BEHAVIOR_CONTRACT.md's equivalence matrix
+# specifies for the `Response trailers` row.
+#
+# Deliberately NO per-driver `expected_body`: fixture 0010 pins the echo body
+# byte-for-byte in its own expectations, and hard-coding the echoed request
+# shape a second time here would make this fixture fail on any unrelated
+# request-header change. The cross-proxy `equivalence.response_body:
+# byte_exact` is what matters, and it is what this fixture asserts.
+
+driver:
+  kind: http2
+  method: get
+  path: /
+  host: envoy-rust.test
+  expected_status: 200
+  expected_headers: set_equal_modulo_allow_list
+  expected_trailers: set_equal_modulo_allow_list
+
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact

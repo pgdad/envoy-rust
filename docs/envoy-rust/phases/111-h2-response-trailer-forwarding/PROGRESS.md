@@ -623,3 +623,126 @@ test result: ok. 171 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 Unchanged at 171 — this task adds no test, and nothing regressed.
 `cargo fmt --all -- --check` and `cargo clippy -p differential --all-targets
 --all-features -- -D warnings` clean.
+
+---
+
+## Task 9 — Fixture `0090-h2-response-trailers` — the differential witness ✅
+
+**Files created:** `tests/fixtures/0090-h2-response-trailers/{envoy.yaml,envoy-rust.yaml,expectations.yaml,README.md}`,
+`tests/differential/tests/h2_response_trailers.rs`. No `inputs/` (the H2 driver
+reads none). Fixture census **89 → 90**; differential test files **89 → 90**.
+
+**Steps 1/2 — the YAMLs were DERIVED from fixture `0010`'s files on disk, not
+transcribed from the plan**, then the derivation was proved by diff:
+
+```
+$ diff <(sed -n '/^node: {/,$p' …0010…/envoy.yaml) <(sed -n '/^node: {/,$p' …0090…/envoy.yaml)
+1c1   node.id / cluster labels
+47c47 {{HTTP2_BACKEND_PORT}} -> {{HTTP2_TRAILERS_BACKEND_PORT}}
+$ diff … envoy-rust.yaml …
+1c1, 34c34   (the same two lines)
+```
+
+**Exactly two lines differ per side.** That is the strongest available statement
+of D-PLAN-7's requirement that `generate_request_id: false` and the six-entry
+`request_headers_to_remove` list carry over intact — they are load-bearing for
+the byte-exact echoed body, and a hand-transcribed YAML could have dropped one
+silently.
+
+**Step 3 — `expectations.yaml`** carries `expected_trailers:
+set_equal_modulo_allow_list` and deliberately NO per-driver `expected_body`
+(the cross-proxy `equivalence.response_body: byte_exact` is the real assertion;
+hard-coding the echoed request shape a second time would make the fixture fail
+on any unrelated request-header change).
+
+**Step 6 — GREEN cross-proxy on the first run:**
+
+```
+$ cargo build -p envoy-bin        # the harness runs the DEBUG binary
+$ cargo test -p differential --test h2_response_trailers -- --nocapture
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.81s
+```
+
+**Step 7 — the vacuity proof, and it took THREE runs to get right.** Recorded in
+full, because two of the three are instructive failures.
+
+**(a) The control failed for a BOOKKEEPING reason first** — the exact trap the
+traps ledger records. The scratch worktree was built with `cargo build -p
+envoy-bin`, and the fixture died in 0.00s:
+
+```
+fixture green: spawning Http2TrailersBackend
+Caused by: 1: http2-echo-server not found at …/mut-111-t9/target/debug/http2-echo-server
+```
+
+An assertion NEVER REACHED. Had this been the MUTATED run it would have "confirmed"
+the mutation for entirely the wrong reason. **A control worktree needs
+`cargo build --workspace --all-targets`**, because the harness spawns helper
+BACKEND binaries that `-p envoy-bin` does not build. Rebuilt properly, the
+control is green:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.68s
+```
+
+**(b) The ~2.7s green was AUDITED rather than trusted.** This fixture is not
+backend-free, so a fast green deserves proof that an upstream Envoy container
+genuinely ran. A `docker ps` poll (with a VALID `--format`, since an invalid
+field prints template errors that read as "no containers") ran alongside the
+control:
+
+```
+$ docker ps --format '{{.Image}} {{.Status}}'
+envoyproxy/envoy:v1.33.0 Up Less than a second
+```
+
+The pinned image, up, during the run. The green is real.
+
+**(c) The plan's mutation was MISAIMED — it went RED for the wrong reason.** The
+plan mutates the emit seam's `if let Some(map) = trailer_map {` into a
+never-taken branch. That does go RED, but with:
+
+```
+fixture green: envoy-rust http2 drive
+Caused by: 0: H2 body data / 1: stream error received: stream no longer needed
+```
+
+— a FRAMING failure, not a trailer failure. The reason is structural: that
+mutation removes the `send_trailers` call while leaving
+`send_data(body, trailer_map.is_none())` computing `false`, so END_STREAM rides
+no frame at all and the stream is simply never closed. It proves the fixture is
+sensitive to *something* on the emit path; it does not prove the fixture asserts
+the TRAILER block.
+
+**Re-aimed at the forward itself** — reproducing exactly the pre-phase behaviour
+(trailers read and threaded, then dropped at the emit call, which is literally
+Task 1's placeholder):
+
+```
+$ grep -c 'let send_result = send_envoy_response(send_response, resp, trailers).await;'  # EXACTLY once
+1
+$ sed -i 's/…, resp, trailers).await;/…, resp, None).await;/'   # original 0, mutant 1
+$ touch crates/envoy-http2/src/lib.rs && cargo build --workspace --all-targets
+   Compiling envoy-http2 v0.0.0 (…/mut-111-t9/crates/envoy-http2)
+$ cargo test -p differential --test h2_response_trailers
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+
+fixture green: diff_trailers (set_equal_modulo_allow_list)
+Caused by:
+    header name sets differ: only-in-envoy=["x-trail-a", "x-trail-b"], only-in-envoy-rust=[]
+```
+
+**That failure text is the whole witness of this phase, stated by the harness
+itself.** It proves four things at once, none of which the green run alone
+proves: upstream Envoy really does emit both trailers; the harness really
+observes them on the Envoy side; the assertion bites on the TRAILER axis
+specifically (the `diff_trailers` context string names it, distinguishing it
+from the header diff); and it is envoy-rust's forwarding — nothing else — that
+makes the fixture green. **The fixture is not vacuous, and it is not passing
+because both sides return zero trailers.**
+
+All the mutation-hygiene gates hold: a `Compiling envoy-http2` line (no stale
+binary), a `test result:` line (it RAN — a compile error is not a mutation RED),
+FAILED, and a GREEN control from the same worktree. The scratch worktree was
+removed — only that one; the four sibling `.claude/worktrees/agent-*` belong to a
+parallel workstream. Main tree re-verified unmutated afterwards.
