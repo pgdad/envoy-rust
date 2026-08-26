@@ -515,3 +515,70 @@ test result: ok. 165 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 driver that fabricates entries. `cargo build --workspace --all-targets`,
 `cargo fmt --all -- --check` and `cargo clippy -p differential --all-targets
 --all-features -- -D warnings` all clean.
+
+---
+
+## Task 7 — The differential harness COMPARES trailers ✅
+
+**Files:** `tests/differential/src/lib.rs`.
+
+**Step 1 — the plan's YAML tests needed adapting, as it warned.**
+`load_expectations` takes a **`&Path`**, not a `&str` (`lib.rs:1261`), so the
+plan's two YAML-string round-trip tests cannot call it. They parse via
+`serde_yaml::from_str::<Expectations>(yaml)` instead — the same type, the same
+`deny_unknown_fields` surface, the same assertion. A **sixth** test was added
+beyond the plan's five: `fixture_0010_expectations_still_parse_without_expected_trailers`
+loads the LANDED fixture `0010`'s file through the real `load_expectations`, so
+the "89 pre-existing fixtures keep deserializing" claim is witnessed against a
+file on disk rather than only against a hand-written string.
+
+**Step 2 — RED:**
+
+```
+$ cargo test -p differential --lib expected_trailers
+error[E0026]: variant `Driver::Http2` does not have a field named `expected_trailers`  (×3)
+error[E0433]: cannot find type `Http1TrailerRule` in this scope
+EXIT=101
+```
+
+**Steps 3/4 — the rule, the field, the dispatch, the comparison.**
+`Http1TrailerRule` is an externally-tagged unit variant copying
+`Http1HeaderRule`'s shape; `Driver::Http2` gains `#[serde(default)]
+expected_trailers`. The comparison at the end of `run_http2_arm` **reuses
+`diff_headers` verbatim** (PV-4) — no `diff_trailers` — because
+`BEHAVIOR_CONTRACT.md`'s matrix row for response trailers literally says
+"Set-equal under the same allow-list discipline". Its `.context(…)` string says
+`diff_trailers` so a failure names the trailer axis rather than the header one.
+
+**`deny_unknown_fields` ordering honoured:** the Rust field lands HERE, before
+any fixture YAML mentions the key — which is why Task 9 comes after this task.
+
+**Steps 5/6 — GREEN, after adjudicating one RED that is NOT this phase's.**
+The first full-suite run failed one test:
+
+```
+---- tests::wait_accept_ready_times_out_for_closed_socket stdout ----
+panicked at tests/differential/src/lib.rs:8639:9: assertion failed: result.is_err()
+test result: FAILED. 170 passed; 1 failed; 2 ignored
+```
+
+**Classified by ISOLATION, which is the only thing that classifies** — never by
+the failure text:
+
+```
+$ cargo test -p differential --lib wait_accept_ready_times_out_for_closed_socket
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 172 filtered out
+$ cargo test -p differential --lib --no-fail-fast          # re-run of the WHOLE suite
+test result: ok. 171 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+```
+
+It passes alone and was absent from the very next sweep of the same tree — the
+ADR-0164 startup-race tail signature. It is the known `wait_accept_ready`
+closed-socket **port-reuse** flake: the test drops a listener and asserts the
+port then refuses, and a parallel test re-binds the freed port. Its surface
+(`reserve_port`/`wait_accept_ready`) is untouched by this phase. **Not a
+regression, and no test was weakened.**
+
+171 = 165 (post-Task-6) + the 6 new tests. `cargo build --workspace
+--all-targets`, `cargo fmt --all -- --check` and `cargo clippy -p differential
+--all-targets --all-features -- -D warnings` all clean.

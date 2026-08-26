@@ -191,6 +191,12 @@ pub enum Driver {
         expected_body: Option<Http1BodyRule>,
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
+        /// Phase 111 NEW: compare the response TRAILER blocks. Omitted by every
+        /// pre-111 fixture, hence `#[serde(default)]` — this variant carries
+        /// `deny_unknown_fields`, so the field must exist in Rust before any
+        /// fixture YAML may mention it.
+        #[serde(default)]
+        expected_trailers: Option<Http1TrailerRule>,
     },
     /// 11 NEW: drive a sequence of HTTP/2 probes against a single listener
     /// address. Each probe runs an independent H2 request/response cycle and
@@ -1081,6 +1087,23 @@ pub enum Http1BodyRule {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Http1HeaderRule {
+    SetEqualModuloAllowList,
+}
+
+/// Phase 111 NEW: trailer equivalence rule for `Driver::Http2`. Externally-
+/// tagged unit variant, the same shape as `Http1HeaderRule`, so the fixture
+/// YAML reads `expected_trailers: set_equal_modulo_allow_list`.
+///
+/// Trailer comparison deliberately reuses `diff_headers` and
+/// `HEADER_ALLOW_LIST` rather than growing a `diff_trailers`:
+/// `BEHAVIOR_CONTRACT.md`'s equivalence matrix specifies "Set-equal under the
+/// same allow-list discipline" for response trailers, and `diff_headers` IS
+/// that discipline (phase 111, PV-4). The consequence is that duplicate
+/// trailer-name multiplicity is NOT asserted (CF-111-8) and trailer ORDER is
+/// NOT asserted (CF-111-9); fixture `0090` avoids both cells.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Http1TrailerRule {
     SetEqualModuloAllowList,
 }
 
@@ -4469,6 +4492,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_status,
             expected_body,
             expected_headers,
+            expected_trailers,
         } => {
             run_http2_arm(
                 &ctx,
@@ -4480,6 +4504,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 expected_status,
                 expected_body,
                 expected_headers,
+                expected_trailers,
             )
             .await?;
         }
@@ -6647,6 +6672,7 @@ async fn run_http2_arm(
     expected_status: &Option<u16>,
     expected_body: &Option<Http1BodyRule>,
     expected_headers: &Option<Http1HeaderRule>,
+    expected_trailers: &Option<Http1TrailerRule>,
 ) -> Result<()> {
     let FixtureCtx {
         expectations,
@@ -6726,6 +6752,23 @@ async fn run_http2_arm(
             HEADER_ALLOW_LIST,
         )
         .context("diff_headers (set_equal_modulo_allow_list)")?;
+    }
+
+    // Trailers: per-driver allow-list diff between envoy <-> envoy-rust.
+    // Phase 111 — the FIRST exercise of the `Response trailers` row of the
+    // equivalence matrix, unwitnessed since phase 00 seeded it. Reuses
+    // `diff_headers` verbatim, because that row's own wording is "Set-equal
+    // under the same allow-list discipline" (PV-4).
+    if matches!(
+        expected_trailers,
+        Some(Http1TrailerRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.trailers,
+            &subject_resp.trailers,
+            HEADER_ALLOW_LIST,
+        )
+        .context("diff_trailers (set_equal_modulo_allow_list)")?;
     }
     Ok(())
 }
@@ -9212,6 +9255,119 @@ server_key: {{SERVER_KEY_PATH}}
             ("connection".to_string(), "keep-alive".to_string()),
         ];
         diff_headers(&envoy, &envoy_rust, HEADER_ALLOW_LIST).expect("server+date allow-listed");
+    }
+
+    // ── Phase 111: trailer comparison ───────────────────────────────────
+    //
+    // PV-4 decided that trailer comparison REUSES `diff_headers` verbatim:
+    // `BEHAVIOR_CONTRACT.md`'s equivalence matrix specifies "Set-equal under
+    // the same allow-list discipline" for response trailers, and `diff_headers`
+    // IS that discipline. These tests pin that it behaves as the contract row
+    // says on trailer-shaped input. The cost — duplicate trailer-name
+    // multiplicity is unassertable — is banked as CF-111-8.
+
+    #[test]
+    fn diff_headers_accepts_equal_trailer_sets() {
+        let envoy = vec![
+            ("x-trail-a".to_string(), "alpha".to_string()),
+            ("x-trail-b".to_string(), "beta".to_string()),
+        ];
+        let rust = vec![
+            ("x-trail-b".to_string(), "beta".to_string()),
+            ("x-trail-a".to_string(), "alpha".to_string()),
+        ];
+        diff_headers(&envoy, &rust, HEADER_ALLOW_LIST).expect("order must not matter");
+    }
+
+    #[test]
+    fn diff_headers_rejects_a_missing_trailer() {
+        let envoy = vec![
+            ("x-trail-a".to_string(), "alpha".to_string()),
+            ("x-trail-b".to_string(), "beta".to_string()),
+        ];
+        let rust = vec![("x-trail-a".to_string(), "alpha".to_string())];
+        let err = diff_headers(&envoy, &rust, HEADER_ALLOW_LIST)
+            .expect_err("a dropped trailer must fail the diff");
+        assert!(format!("{err}").contains("x-trail-b"), "got {err}");
+    }
+
+    #[test]
+    fn diff_headers_rejects_a_differing_trailer_value() {
+        let envoy = vec![("x-trail-a".to_string(), "alpha".to_string())];
+        let rust = vec![("x-trail-a".to_string(), "WRONG".to_string())];
+        diff_headers(&envoy, &rust, HEADER_ALLOW_LIST)
+            .expect_err("a differing trailer value must fail the diff");
+    }
+
+    /// `load_expectations` takes a `&Path`, so this parses the YAML directly —
+    /// same `Expectations` type, same `deny_unknown_fields` surface.
+    #[test]
+    fn parses_http2_expectations_with_expected_trailers() {
+        let yaml = r#"
+driver:
+  kind: http2
+  method: get
+  path: /
+  host: envoy-rust.test
+  expected_status: 200
+  expected_headers: set_equal_modulo_allow_list
+  expected_trailers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+"#;
+        let parsed: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match parsed.driver {
+            Driver::Http2 {
+                ref expected_trailers,
+                ..
+            } => assert_eq!(
+                *expected_trailers,
+                Some(Http1TrailerRule::SetEqualModuloAllowList)
+            ),
+            ref other => panic!("wrong driver: {other:?}"),
+        }
+    }
+
+    /// Every one of the 89 pre-existing fixtures omits the key; it must
+    /// deserialize to `None` rather than failing `deny_unknown_fields`.
+    #[test]
+    fn http2_expectations_without_expected_trailers_default_to_none() {
+        let yaml = r#"
+driver:
+  kind: http2
+  method: get
+  path: /
+  host: envoy-rust.test
+  expected_status: 200
+equivalence:
+  response_status: exact
+"#;
+        let parsed: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match parsed.driver {
+            Driver::Http2 {
+                ref expected_trailers,
+                ..
+            } => assert!(expected_trailers.is_none()),
+            ref other => panic!("wrong driver: {other:?}"),
+        }
+    }
+
+    /// The landed fixture `0010-http2-router-upstream` is the no-trailers
+    /// regression witness and must keep deserializing untouched.
+    #[test]
+    fn fixture_0010_expectations_still_parse_without_expected_trailers() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests/fixtures/0010-http2-router-upstream/expectations.yaml");
+        let e = load_expectations(&path).expect("parses");
+        match e.driver {
+            Driver::Http2 {
+                ref expected_trailers,
+                ..
+            } => assert!(expected_trailers.is_none()),
+            ref other => panic!("wrong driver: {other:?}"),
+        }
     }
 
     #[test]
