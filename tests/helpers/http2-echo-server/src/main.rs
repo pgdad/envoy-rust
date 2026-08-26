@@ -43,6 +43,9 @@ use tokio::task::JoinSet;
 struct Args {
     port: u16,
     close_before_response: bool,
+    /// Phase 111: emit a response TRAILER block. Mutually independent of
+    /// `close_before_response` (that mode never sends a response at all).
+    trailers: bool,
 }
 
 /// The per-binary phrase in the `ArgvError::Trailing` message.
@@ -54,9 +57,14 @@ const TRAILING_AFTER: &str = "--port <u16>";
 /// closure handles this binary's `--close-before-response` flag.
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     let mut close_before_response = false;
+    let mut trailers = false;
     let port = helper_common::parse_port_argv(args, TRAILING_AFTER, |args, i| {
         if args[*i] == "--close-before-response" {
             close_before_response = true;
+            *i += 1;
+            Ok(true)
+        } else if args[*i] == "--trailers" {
+            trailers = true;
             *i += 1;
             Ok(true)
         } else {
@@ -66,6 +74,7 @@ fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     Ok(Args {
         port,
         close_before_response,
+        trailers,
     })
 }
 
@@ -73,7 +82,7 @@ fn print_help() {
     println!(
         "http2-echo-server: HTTP/2 cleartext echo server helper for the envoy-rust differential harness.\n\
          \n\
-         Usage:\n  http2-echo-server --port <u16> [--close-before-response]\n  \
+         Usage:\n  http2-echo-server --port <u16> [--close-before-response] [--trailers]\n  \
          http2-echo-server --help\n  http2-echo-server --version"
     );
 }
@@ -101,6 +110,8 @@ async fn run(args: Args) -> Result<()> {
                     Ok((stream, _)) => {
                         if args.close_before_response {
                             join_set.spawn(handle_connection_close_before_response(stream));
+                        } else if args.trailers {
+                            join_set.spawn(handle_connection_with_trailers(stream));
                         } else {
                             join_set.spawn(handle_connection(stream));
                         }
@@ -196,6 +207,76 @@ async fn handle_connection_close_before_response(tcp: tokio::net::TcpStream) {
     }
 }
 
+/// `--trailers` mode: the ordinary deterministic echo response, plus the
+/// RFC 7230 §4.4 `trailer:` ANNOUNCE header and a response TRAILER block.
+///
+/// The announce header deliberately names only `x-trail-a`, ONE of the two
+/// trailers sent — upstream Envoy forwards the UNANNOUNCED `x-trail-b` as well,
+/// so the rule differential fixture `0090-h2-response-trailers` witnesses is
+/// "forward the block", not "forward what was announced" (phase 111, PV-1).
+///
+/// The echo body shape is deliberately IDENTICAL to `handle_connection`'s:
+/// fixture `0090` inherits fixture `0010`'s byte-exact body comparison, so any
+/// divergence here would fail the fixture for a reason unrelated to trailers.
+async fn handle_connection_with_trailers(tcp: tokio::net::TcpStream) {
+    let mut conn = match envoy_http2::codec::server_handshake(tcp).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "h2 handshake failed (trailers)");
+            return;
+        }
+    };
+    while let Some(stream_result) = conn.accept().await {
+        let (req, mut send_response) = match stream_result {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "h2 stream accept failed (trailers)");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let (parts, mut body) = req.into_parts();
+            let mut body_bytes = bytes::BytesMut::new();
+            while let Some(chunk_result) = body.data().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "h2 body read failed");
+                        return;
+                    }
+                };
+                body_bytes.extend_from_slice(&chunk);
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            let response_body = make_response_body(&parts, &body_bytes);
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .header("trailer", "x-trail-a")
+                .body(())
+                .unwrap();
+            let mut send_stream = match send_response.send_response(response, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "send_response failed");
+                    return;
+                }
+            };
+            // end_of_stream = false: the trailer HEADERS frame follows.
+            if let Err(e) = send_stream.send_data(Bytes::from(response_body), false) {
+                tracing::warn!(error = %e, "send_data failed");
+                return;
+            }
+            let mut trailers = http::HeaderMap::new();
+            trailers.append("x-trail-a", http::HeaderValue::from_static("alpha"));
+            trailers.append("x-trail-b", http::HeaderValue::from_static("beta"));
+            if let Err(e) = send_stream.send_trailers(trailers) {
+                tracing::warn!(error = %e, "send_trailers failed");
+            }
+        });
+    }
+}
+
 /// Build the deterministic-echo body. The body shape MUST match
 /// `http1-echo-server::make_response`'s body shape exactly so cross-protocol
 /// fixtures (if any) remain comparable. The alphabetic header sort is
@@ -285,6 +366,7 @@ mod tests {
             Args {
                 port: 7000,
                 close_before_response: false,
+                trailers: false,
             }
         );
     }
@@ -302,8 +384,87 @@ mod tests {
             Args {
                 port: 7000,
                 close_before_response: true,
+                trailers: false,
             }
         );
+    }
+
+    #[test]
+    fn parse_argv_accepts_trailers() {
+        let args = parse_argv(&[
+            "--port".to_string(),
+            "8080".to_string(),
+            "--trailers".to_string(),
+        ])
+        .expect("parses");
+        assert_eq!(args.port, 8080);
+        assert!(args.trailers);
+        assert!(!args.close_before_response);
+    }
+
+    #[test]
+    fn parse_argv_defaults_trailers_off() {
+        let args = parse_argv(&["--port".to_string(), "8080".to_string()]).expect("parses");
+        assert!(!args.trailers);
+    }
+
+    /// Phase 111: the `--trailers` mode keeps the deterministic echo body
+    /// UNCHANGED (fixture 0090 inherits fixture 0010's byte-exact body
+    /// comparison) and adds the RFC 7230 §4.4 announce header naming only ONE
+    /// of the two trailers it sends. Upstream Envoy forwards the unannounced
+    /// one too, so the rule fixture 0090 witnesses is "forward the block", not
+    /// "forward what was announced".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trailers_mode_emits_announce_header_and_both_trailers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server_task = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                handle_connection_with_trailers(tcp).await;
+            }
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://testharness/test")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers().get("trailer").map(|v| v.as_bytes()),
+            Some(b"x-trail-a".as_slice()),
+            "the announce header names ONLY x-trail-a, deliberately"
+        );
+        let (_parts, mut body) = resp.into_parts();
+        let mut body_bytes = bytes::BytesMut::new();
+        while let Some(chunk_result) = body.data().await {
+            let chunk = chunk_result.unwrap();
+            body_bytes.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        // The echo body shape is untouched by this mode.
+        let s = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(s.starts_with("method: GET\n"), "body shape: {s}");
+        assert!(s.contains("path: /test\n"), "body shape: {s}");
+        // Read the trailers BEFORE aborting the connection task, or the
+        // trailer HEADERS frame is never pumped off the socket.
+        let trailers = body.trailers().await.unwrap().expect("trailer block");
+        assert_eq!(
+            trailers.get("x-trail-a").map(|v| v.as_bytes()),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            trailers.get("x-trail-b").map(|v| v.as_bytes()),
+            Some(b"beta".as_slice()),
+            "the UNANNOUNCED trailer must be sent too"
+        );
+        conn_task.abort();
     }
 
     #[test]

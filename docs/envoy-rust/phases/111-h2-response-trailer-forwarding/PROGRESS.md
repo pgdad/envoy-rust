@@ -386,3 +386,88 @@ error is not a mutation RED), a FAILED verdict, and a GREEN control from the sam
 worktree. The scratch worktree was then removed and only that one; the four
 sibling `.claude/worktrees/agent-*` worktrees belong to a parallel workstream and
 were left alone. Main tree re-checked afterwards: target still exactly 1.
+
+---
+
+## Net-LoC checkpoint after the production chain (Tasks 1–4)
+
+The handoff asks for this to be tracked as the phase runs and said so honestly
+rather than reported at the end.
+
+```
+$ git diff --numstat 0ba60db HEAD -- . ':(exclude)docs/' | awk '{a+=$1;d+=$2} END{print a, d, a-d}'
+775 33 742
+```
+
+**742 net against the plan's ≈406 for those four tasks — a 1.83× ratio on this
+slice, above the worst-observed landed-phase overrun of 1.75.** The overshoot is
+concentrated in test scaffolding, not production code: the `round_trip` helper
+(Task 1), and `spawn_upstream_h2_server_with_trailers` +
+`drive_one_h2_request_through_hcm` + `ObservedH2Response` (Task 3) together
+account for most of it, because — as the plan anticipated but did not price —
+NO in-tree helper could observe a trailer frame, so all three had to be written
+rather than reused.
+
+**This does NOT fire §6.1.** The gate reads on the PLAN's estimate at state 2
+(≈916 < ~1500), which is where it was applied and did not fire; §6.1's
+*mid-execution* trigger is about a single task's sub-steps exceeding ~10 items,
+which was evaluated at Task 3 and did not fire either. Recorded here so the
+state-4 and state-5 sessions see the drift rather than discover it: the
+remaining six tasks are planned at ≈510, and at this slice's ratio the phase
+would land near ≈1670 — over the gate that the estimate cleared. That is the
+exact risk `PLAN.md` §6 stated rather than rounded away.
+
+---
+
+## Task 5 — A trailer-emitting H2 backend the harness can spawn ✅
+
+**Files:** `tests/helpers/http2-echo-server/src/main.rs`,
+`tests/differential/src/backend.rs`.
+
+**Steps 1/2 — RED**, and it names exactly what the plan predicted:
+
+```
+$ cargo test -p http2-echo-server
+error[E0560]: struct `Args` has no field named `trailers`     (×2 — the two existing Args literals)
+error[E0609]: no field `trailers` on type `Args`              (×2)
+error[E0425]: cannot find function `handle_connection_with_trailers` in this scope
+EXIT=101
+```
+
+**Step 3 — the flag and the mode.** `Args` gains `trailers: bool`; `parse_argv`'s
+closure gains an `else if` branch; `print_help`'s usage line gains
+`[--trailers]`; the accept loop's dispatch becomes three-way. The response path
+differs from `handle_connection` in exactly two places — the `trailer: x-trail-a`
+announce header, and a tail of `send_data(.., false)` + `send_trailers`. **The
+`make_response_body` echo shape is untouched**, which is load-bearing: fixture
+`0090` inherits fixture `0010`'s byte-exact body comparison (D-PLAN-7).
+
+Three tests, not two: the plan's two argv tests, plus a wire-level test that
+drives the mode over a real in-process H2 client and asserts the announce header,
+the unchanged echo body shape, AND both trailers. An argv test alone would prove
+the flag parses, not that anything is emitted.
+
+**Steps 4/5 — `Http2TrailersBackend`**, a near-copy of the sibling
+`Http2CloseBackend`: same `spawn_helper_backend`, same `wait_h2_accept_ready`
+readiness poll, same `Drop`/`kill_and_reap`. Its test likewise goes past the
+plan's sketch (which asserts only `port() > 0` and the container host) and
+round-trips an actual request, because a spawn that merely becomes accept-ready
+would satisfy the sketch while emitting no trailers at all.
+
+**Step 6 — GREEN, and the new backend test PROVEN to have run rather than
+self-skipped** (the sibling helper tests return early when the binary is not
+built, which is a silent pass):
+
+```
+$ cargo test -p http2-echo-server
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cargo test -p differential --lib backend
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 143 filtered out
+$ cargo test -p differential --lib http2_trailers_backend_spawns_and_emits_trailers -- --nocapture
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out
+```
+
+The third run is the one that matters: `1 passed` with no `skipping …` line on
+stdout. `cargo build --workspace --all-targets`, `cargo fmt --all -- --check` and
+`cargo clippy -p differential -p http2-echo-server --all-targets --all-features
+-- -D warnings` all clean.

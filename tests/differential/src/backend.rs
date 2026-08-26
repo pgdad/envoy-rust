@@ -532,6 +532,60 @@ impl Drop for Http2CloseBackend {
     }
 }
 
+/// A running `http2-echo-server --trailers` host subprocess — echoes the
+/// deterministic body exactly like `Http2EchoBackend`, and additionally
+/// announces `trailer: x-trail-a` and emits a trailer block of
+/// `x-trail-a: alpha` (ANNOUNCED) plus `x-trail-b: beta` (NOT announced).
+///
+/// Phase 111: the upstream for fixture `0090-h2-response-trailers`, the first
+/// fixture ever to exercise the `Response trailers` row of the equivalence
+/// matrix in `docs/envoy-rust/BEHAVIOR_CONTRACT.md`.
+///
+/// The trailer block is FIXED, not configurable: one announced and one
+/// unannounced trailer is exactly the measured divergence, and a configurable
+/// block would be surface no fixture uses.
+pub struct Http2TrailersBackend {
+    port: u16,
+    child: Option<tokio::process::Child>,
+}
+
+impl Http2TrailersBackend {
+    pub async fn spawn() -> Result<Self> {
+        let (port, child, addr) = spawn_helper_backend(
+            "http2-echo-server",
+            "reserving h2 trailers-backend port",
+            &[std::ffi::OsStr::new("--trailers")],
+            " --trailers",
+        )
+        .await?;
+        wait_h2_accept_ready(addr, Duration::from_secs(2))
+            .await
+            .with_context(|| {
+                format!("http2-echo-server --trailers never became h2-accept-ready on {addr}")
+            })?;
+
+        Ok(Self {
+            port,
+            child: Some(child),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Per ADR-0015 + 05.1 STRICT_DNS posture: always `host.docker.internal`.
+    pub fn container_host(&self) -> &'static str {
+        "host.docker.internal"
+    }
+}
+
+impl Drop for Http2TrailersBackend {
+    fn drop(&mut self) {
+        kill_and_reap(&mut self.child);
+    }
+}
+
 /// H2-aware accept-readiness poll. Connects TCP then runs h2::client::handshake;
 /// retries with exponential backoff up to `budget`. Distinct from
 /// `wait_accept_ready` (which is TCP-only) per SPEC §3 D6.a's recommendation.
@@ -900,6 +954,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http2_trailers_backend_spawns_and_emits_trailers() {
+        if locate_http2_echo_server().is_err() {
+            eprintln!(
+                "skipping http2_trailers_backend_spawns_and_emits_trailers — binary not built"
+            );
+            return;
+        }
+        let backend = Http2TrailersBackend::spawn().await.expect("spawn");
+        assert!(backend.port() > 0);
+        assert_eq!(backend.container_host(), "host.docker.internal");
+        // Prove the mode actually emits the block — a spawn that merely
+        // becomes accept-ready would pass a port/host assertion while sending
+        // no trailers at all.
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", backend.port()).parse().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://testharness/probe")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers().get("trailer").map(|v| v.as_bytes()),
+            Some(b"x-trail-a".as_slice())
+        );
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        // Awaited BEFORE the connection task is aborted.
+        let trailers = body.trailers().await.unwrap().expect("trailer block");
+        assert_eq!(
+            trailers.get("x-trail-a").map(|v| v.as_bytes()),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            trailers.get("x-trail-b").map(|v| v.as_bytes()),
+            Some(b"beta".as_slice())
+        );
+        conn_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
