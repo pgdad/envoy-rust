@@ -1197,6 +1197,13 @@ pub struct DriveHttp1Result {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Phase 111: the response TRAILER block in wire order; EMPTY when the
+    /// response carried none.
+    ///
+    /// Always empty from `drive_http1`: the harness's H1 chunked decoder
+    /// discards trailers, and H1 trailer forwarding is unbuilt in both
+    /// directions, blocked behind chunked response ENCODING (CF-111-2).
+    pub trailers: Vec<(String, String)>,
 }
 
 /// Set-equal modulo allow-list: case-insensitive name set equality, plus
@@ -2320,6 +2327,9 @@ pub async fn drive_http1(
         status,
         headers,
         body,
+        // Phase 111: H1 trailers are unbuilt (CF-111-2) and this driver's
+        // chunked decoder discards any it sees.
+        trailers: Vec::new(),
     })
 }
 
@@ -2398,6 +2408,25 @@ pub async fn drive_http2(
         headers.push((n.as_str().to_string(), value_str.to_string()));
     }
 
+    // Phase 111: read the trailer block. `h2` resolves this only once `data()`
+    // has returned `None`, which the drain loop above guarantees — and it MUST
+    // be awaited BEFORE the `conn_handle.abort()` below, or the trailer HEADERS
+    // frame is never pumped off the socket and this silently reports ZERO
+    // trailers: a false green on the very cell fixture 0090 exists to witness.
+    let mut trailers: Vec<(String, String)> = Vec::new();
+    if let Some(map) = body_stream
+        .trailers()
+        .await
+        .context("H2 response trailers")?
+    {
+        for (n, v) in map.iter() {
+            let value_str = v.to_str().with_context(|| {
+                format!("non-UTF-8 H2 response trailer value for `{}`", n.as_str())
+            })?;
+            trailers.push((n.as_str().to_string(), value_str.to_string()));
+        }
+    }
+
     // Abort the connection task — we have the full response, and the server
     // will not necessarily close the TCP socket on its own (h2's `Connection`
     // future runs until peer EOF). Awaiting unconditionally would tie test
@@ -2411,6 +2440,7 @@ pub async fn drive_http2(
         status,
         headers,
         body,
+        trailers,
     })
 }
 
@@ -9380,6 +9410,59 @@ static_resources:
         let result = result.expect("drive_http2 returns Ok");
         assert_eq!(result.status, 200);
         assert_eq!(&result.body[..], b"ok\n");
+    }
+
+    /// Phase 111: `drive_http2` must surface a response trailer block. Without
+    /// this the harness cannot express the phase's only divergence — and a
+    /// divergence no fixture can express is invisible to the gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_http2_surfaces_response_trailers() {
+        if crate::backend::locate_http2_echo_server().is_err() {
+            eprintln!("skipping drive_http2_surfaces_response_trailers — helper not built");
+            return;
+        }
+        let backend = crate::backend::Http2TrailersBackend::spawn()
+            .await
+            .expect("spawn trailers backend");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", backend.port()).parse().unwrap();
+        let result = drive_http2(addr, &Http1Method::Get, "/", "probe.local", &[])
+            .await
+            .expect("drive");
+        assert_eq!(result.status, 200);
+        let mut names: Vec<String> = result.trailers.iter().map(|(n, _)| n.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["x-trail-a".to_string(), "x-trail-b".to_string()]
+        );
+        let value = |n: &str| -> Option<&str> {
+            result
+                .trailers
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("x-trail-a"), Some("alpha"));
+        assert_eq!(value("x-trail-b"), Some("beta"));
+    }
+
+    /// The trailerless control: a plain echo backend must yield an EMPTY
+    /// trailer vector, never a spurious entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_http2_reports_no_trailers_when_none_sent() {
+        if crate::backend::locate_http2_echo_server().is_err() {
+            eprintln!("skipping drive_http2_reports_no_trailers_when_none_sent — helper not built");
+            return;
+        }
+        let backend = crate::backend::Http2EchoBackend::spawn()
+            .await
+            .expect("spawn echo backend");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", backend.port()).parse().unwrap();
+        let result = drive_http2(addr, &Http1Method::Get, "/", "probe.local", &[])
+            .await
+            .expect("drive");
+        assert_eq!(result.status, 200);
+        assert!(result.trailers.is_empty(), "got {:?}", result.trailers);
     }
 
     // 06.1 D6.c: round-trips `drive_admin_scrape` against a spawned

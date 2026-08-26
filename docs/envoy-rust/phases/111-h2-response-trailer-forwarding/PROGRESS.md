@@ -471,3 +471,47 @@ The third run is the one that matters: `1 passed` with no `skipping …` line on
 stdout. `cargo build --workspace --all-targets`, `cargo fmt --all -- --check` and
 `cargo clippy -p differential -p http2-echo-server --all-targets --all-features
 -- -D warnings` all clean.
+
+---
+
+## Task 6 — The differential driver OBSERVES trailers ✅
+
+**Files:** `tests/differential/src/lib.rs`.
+
+**Steps 1/2 — RED:**
+
+```
+$ cargo test -p differential --lib drive_http2_surfaces_response_trailers
+error[E0609]: no field `trailers` on type `DriveHttp1Result`   (×3)
+EXIT=101
+```
+
+**Step 3 — the field, and the ORDERING trap the plan flags as most likely to
+bite.** `body_stream.trailers().await` is inserted immediately after the
+body-drain loop and **BEFORE** the `drop(send_request); conn_handle.abort();`
+block. Reading after the abort would silently report zero trailers — a false
+green on the very cell fixture `0090` exists to witness — so the comment at the
+site says so explicitly rather than leaving the ordering to look incidental.
+
+Both `DriveHttp1Result` struct-literal sites were updated, exactly two as the
+plan measured: `drive_http2` supplies the real block, and `drive_http1` supplies
+`Vec::new()` with CF-111-2 named (the H1 chunked decoder discards trailers and
+H1 trailer forwarding is unbuilt).
+
+**Step 4 — GREEN, and neither new test self-skipped** (both would return early
+if `http2-echo-server` were unbuilt, which is a silent pass):
+
+```
+$ cargo test -p differential --lib drive_http2
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out
+$ cargo test -p differential --lib
+test result: ok. 165 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+```
+
+3 = the pre-existing `drive_http2_round_trip_against_in_process_listener` + the
+2 new ones, with no `skipping …` line printed. The trailerless control
+(`drive_http2_reports_no_trailers_when_none_sent`, against the plain
+`Http2EchoBackend`) is what stops the positive test from being satisfied by a
+driver that fabricates entries. `cargo build --workspace --all-targets`,
+`cargo fmt --all -- --check` and `cargo clippy -p differential --all-targets
+--all-features -- -D warnings` all clean.
