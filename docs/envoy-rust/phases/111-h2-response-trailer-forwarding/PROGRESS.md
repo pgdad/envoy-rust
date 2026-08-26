@@ -795,3 +795,149 @@ $ grep -n 'HEADER_ALLOW_LIST' -A 4 tests/differential/src/lib.rs
 ```
 
 Exactly THREE entries, unchanged. `location` and `content-type` remain ABSENT.
+
+---
+
+## End-of-state-3 measurements
+
+**These are a SMOKE CHECK, not the §7.5 gate adjudication.** State 4 is a
+separate session and it is what runs `cargo deny check`, `cargo fmt --check`, the
+conformance suites and the full Docker differential sweep, quoting every output.
+What follows is only enough to prove this session did not hand state 4 a broken
+tree.
+
+### Net LoC — the honest number
+
+```
+$ git diff --numstat 0ba60db HEAD -- . ':(exclude)docs/' | awk '{a+=$1;d+=$2} END{print a,d,a-d}'
+1559 34 1525
+```
+
+**1525 net against the plan's ≈916 — a 1.66× overrun that lands 25 lines OVER the
+~1500 §6.1 threshold** (under the worst-observed landed-phase ratio of 1.75,
+above the median 1.32). Thirteen files excluding `docs/`.
+
+**§6.1 does not fire, and the reason is not a technicality.** The gate is
+evaluated at state 2 against the PLAN's estimate (≈916), where it did not fire;
+its *mid-execution* trigger is a single task's sub-step count exceeding ~10,
+which was evaluated at Task 3 — the plan's own named candidate — and did not fire
+either. Splitting a phase whose ten tasks are all landed and green would spend
+six further sessions to no purpose. **But the number is recorded prominently
+rather than buried: `PLAN.md` §6 predicted exactly this ("at the worst-observed
+1.75× it lands ≈1603, i.e. over the gate") and it is now a THIRD datapoint for
+the unlanded `.claude/drafts/DRAFT-ADR-split-thresholds.md`, alongside phase
+110's twelve-session split and phase 111's own state-2 refusal to split.**
+
+The overshoot is concentrated in test scaffolding rather than production code,
+and the cause is structural: **no in-tree helper could observe a trailer frame**,
+so `round_trip`, `spawn_upstream_h2_server_with_trailers`,
+`drive_one_h2_request_through_hcm` + `ObservedH2Response`, and a wire-level test
+for the backend mode all had to be written from scratch. When a phase introduces
+an observable the test helpers cannot see, the OBSERVER has to be priced, not
+just the feature.
+
+### Workspace sweep
+
+```
+$ cargo test --workspace --no-fail-fast
+binaries=167 passed=2247 failed=5 identity=2252
+```
+
+Counted with `grep -oE 'test result: (ok|FAILED)\. …'` — the `ok`-only form makes
+`failed=0` true by construction — with the awk field numbers derived by printing
+one matched line (`$4` passed, `$6` failed) rather than inherited.
+
+**The binary count moved 166 → 167 exactly as predicted**, the new binary being
+the auto-discovered `tests/differential/tests/h2_response_trailers.rs`, and
+fixture `0090` ran and passed inside the sweep.
+
+**The identity closes EXACTLY:**
+
+```
+pre-phase CI passed                     2228
+new tests this phase                    + 24   (t1:6, t2:2, t3:2, t4:1, t5:3+1, t6:2, t7:6, t9:1)
+                                        = 2252
+local passed + failed                     2252
+```
+
+This is the strongest flake-vs-regression discriminator available and it closes
+to the line: every one of the 24 new tests is accounted for, and nothing else
+moved.
+
+**The 5 local REDs are the recorded stable CORE flake set, unchanged and
+untouched by this phase** — the four `access_log_*_upstream_reset` binaries
+(`TcpCloseBackend`, IPv6-unreachable on this host) and
+`admin_config_dump_server_info` (the `192.168.65.2` bridge-IP family). Extracted
+from the `---- <name> stdout ----` markers, never by indentation. These fail
+DETERMINISTICALLY in isolation on this host — that determinism IS the
+environmental signature — and CI is authoritative for them. **No tail members
+appeared, no differential fixture failed, and no test was weakened.**
+
+### Per-crate confirmations (each run at its own task)
+
+| crate | before | after |
+|---|---:|---:|
+| `envoy-http2` lib tests | 119 | **124** |
+| `differential` lib tests | 165 | **171** |
+| `http2-echo-server` | 7 | **10** |
+| fixture dirs / differential test files | 89 / 89 | **90 / 90** |
+
+`cargo build --workspace --all-targets`, `cargo fmt --all -- --check` and
+`cargo clippy` (on every crate this phase touches) were run and clean at each
+task's commit.
+
+---
+
+## State advanced
+
+`STATE.md` moved to **§5 state-3-COMPLETE**; the next unit is the **§5 state-4
+VERIFICATION GATE**, a separate session (§5.1; ADR-0127).
+
+The ADR-0035 relocation was performed and VERIFIED, not asserted: **16 lines
+relocated** (the four top sections' superseded blocks — 5 + 4 + 4 + 2 — plus the
+`### Doctrine reminders` §5.1 bullet), archived into `STATE_HISTORY.md` under
+headers resolved by EXACT whole-line equality to exactly one line each, captured
+from a PRE-EDIT backup, with length-changing splices done bottom-most first.
+Checks that passed: `(old STATE − new STATE)` equals the relocated 16 plus the 10
+in-place-superseded Notes lines; every relocated line is 0× in the new
+`STATE.md` and exactly +1× in `STATE_HISTORY.md` (a PER-FILE delta — a combined
+count is invariant by construction and false-passes); the pre-edit
+`STATE_HISTORY.md` is a SUBSEQUENCE of the post-edit file, proving a pure
+insertion with zero lines lost.
+
+The active phase's Notes subsection was RENAMED IN PLACE
+(`### Phase-111 §5 state-2 PLAN-write` → `### Phase-111 §5 state-3
+implementation`) with its bullets superseded in place, per the measured mid-arc
+rule; those 10 lines are deliberately NOT archived and will be relocated at the
+state-6 close-out.
+
+**The ADR-0160 token sweep found three real drops, each adjudicated against the
+PERMANENT record rather than merely the archive:** `hpack`, `http2::Framer` and
+the `…/111-h2-response-trailer-forwarding/PLAN.md` path, all from the superseded
+state-2 Notes bullets. All three survive in `PLAN.md` and in `ADR-0182` (and the
+path's referent exists on disk), which is the stronger outcome and is what makes
+in-place Notes supersession safe. The universe was built by pairing backticks
+PER LINE — a whole-file regex pairs them globally and manufactures phantom
+zeroes.
+
+**The Standing-traps line was REWRITTEN, not merely preserved.** Its preamble
+carried six claims this session's own commits falsified; byte-preservation
+protects against loss, not against staleness. The enduring doctrine tail
+(183 610 chars) was carried forward BY PYTHON SLICE and asserted with
+`endswith`. A new block was spliced in front of the first existing marker.
+Census re-measured AFTER the write, over both named spans: **traps line alone
+anchored 52 / naive 55; whole `STATE.md` anchored 52 / naive 55** (the two spans
+still coincide — every anchored marker lives inside the traps line). The new
+block was written so it never quotes the marker in prose, so it contributes
+exactly +1 to each — a fixed point solved before the write and verified after
+it. Line length 186 197 → **191 756** characters.
+
+⚠ **One finding worth the next session's attention: the `### Doctrine reminders`
+§5.1 bullet was STALE on arrival.** It still read "PHASE `111` … SITS AT §5
+STATE-0/1" after the state-2 PLAN-write had landed, and
+`git show be1aaf1 -- docs/envoy-rust/STATE.md | grep -c '§5.1'` returns **0** —
+that advance did not touch the bullet at all, even though the traps line's own
+relocation recipe names it as part of the superseded set. It has been rewritten
+here and archived verbatim (stale claim included, corrected only in the
+replacement). A recipe asserting that a line is always rewritten is not evidence
+that it was.
