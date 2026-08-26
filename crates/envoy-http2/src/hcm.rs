@@ -157,6 +157,10 @@ struct H2AttemptResult {
     /// `upstream_rq_total` tick — lock-in #5). Connect-fail / send-fail and
     /// overflow synths leave this `false`.
     upstream_response: bool,
+    /// Phase 111: the upstream response's TRAILER block, if it sent one.
+    /// `None` on every synth/local path — a locally-generated response never
+    /// carries upstream trailers (D-PLAN-5).
+    trailers: crate::TrailerBlock,
 }
 
 /// 16 Task 5: run ONE upstream attempt on the H2 path — pick an endpoint,
@@ -193,6 +197,7 @@ async fn run_h2_attempt(
             endpoint: None,
             outcome: None,
             upstream_response: false,
+            trailers: None,
         };
     };
 
@@ -240,9 +245,10 @@ async fn run_h2_attempt(
     // failure → ConnectFailure. `Overflow` is the byte-exact overflow-503 synth
     // (terminal, not retriable — mirrors the H1 overflow carve-out).
     enum AcquireOutcome {
-        // The upstream connected and send_request resolved (Ok = real response;
-        // Err = post-connect send/recv failure to be classified as Reset).
-        Sent(Result<envoy_http1::Response, String>),
+        // The upstream connected and send_request resolved (Ok = real response
+        // plus its trailer block, if any; Err = post-connect send/recv failure
+        // to be classified as Reset).
+        Sent(Result<(envoy_http1::Response, crate::TrailerBlock), String>),
         // Connect-boundary failure (no request bytes left) → ConnectFailure.
         ConnectFailure,
         // Pool cap / pending overflow — terminal synth-503 (not retriable).
@@ -256,7 +262,16 @@ async fn run_h2_attempt(
                     // 06.1 D4.b: per-cluster upstream_cx_total increment on
                     // successful upstream H1 connect (unchanged).
                     cluster.cx_total().inc();
-                    AcquireOutcome::Sent(s.send_request(out_req).await.map_err(|e| format!("{e}")))
+                    AcquireOutcome::Sent(
+                        s.send_request(out_req)
+                            .await
+                            // Phase 111: the H1 upstream fork shares this enum
+                            // and can carry no trailers — H1 trailer
+                            // forwarding is unbuilt and blocked behind chunked
+                            // response encoding (CF-111-2).
+                            .map(|r| (r, None))
+                            .map_err(|e| format!("{e}")),
+                    )
                 }
                 Err(source) => {
                     tracing::warn!(
@@ -281,9 +296,6 @@ async fn run_h2_attempt(
                             .client_stream_mut()
                             .send_request(out_req)
                             .await
-                            // Phase 111 Task 2: trailers read but not yet
-                            // threaded; Task 3 carries them to the emit seam.
-                            .map(|(r, _trailers)| r)
                             .map_err(|e| format!("{e}")),
                     ),
                     Err(crate::pool::PoolError::Connect(source)) => {
@@ -320,13 +332,7 @@ async fn run_h2_attempt(
                         Ok(mut s) => {
                             cluster.cx_total().inc();
                             AcquireOutcome::Sent(
-                                s.send_request(out_req)
-                                    .await
-                                    // Phase 111 Task 2: trailers read but not
-                                    // yet threaded; Task 3 carries them to the
-                                    // emit seam.
-                                    .map(|(r, _trailers)| r)
-                                    .map_err(|e| format!("{e}")),
+                                s.send_request(out_req).await.map_err(|e| format!("{e}")),
                             )
                         }
                         Err(source) => {
@@ -345,7 +351,7 @@ async fn run_h2_attempt(
     };
 
     match acquire {
-        AcquireOutcome::Sent(Ok(upstream_resp)) => {
+        AcquireOutcome::Sent(Ok((upstream_resp, upstream_trailers))) => {
             // Build the downstream response: mirror the pre-Task-5 inline header
             // policy — replace upstream `server` with `server: envoy-rust`;
             // replace or inject `date`; append x-envoy-upstream-service-time.
@@ -388,6 +394,10 @@ async fn run_h2_attempt(
                 endpoint: Some(endpoint),
                 outcome: Some(envoy_config::AttemptOutcome::Response),
                 upstream_response: true,
+                // Phase 111: the ONLY arm that carries real trailers — this is
+                // the proxied upstream response. Every other arm below is a
+                // locally-generated synth and passes `None` (D-PLAN-5).
+                trailers: upstream_trailers,
             }
         }
         AcquireOutcome::Sent(Err(e)) => {
@@ -401,6 +411,7 @@ async fn run_h2_attempt(
                 endpoint: Some(endpoint),
                 outcome: Some(envoy_config::AttemptOutcome::Reset),
                 upstream_response: false,
+                trailers: None,
             }
         }
         AcquireOutcome::ConnectFailure => {
@@ -414,6 +425,7 @@ async fn run_h2_attempt(
                 endpoint: Some(endpoint),
                 outcome: Some(envoy_config::AttemptOutcome::ConnectFailure),
                 upstream_response: false,
+                trailers: None,
             }
         }
         AcquireOutcome::Overflow(response) => {
@@ -425,6 +437,7 @@ async fn run_h2_attempt(
                 endpoint: Some(endpoint),
                 outcome: None,
                 upstream_response: false,
+                trailers: None,
             }
         }
     }
@@ -574,11 +587,17 @@ async fn handle_one_stream(
     // exactly.
     let mut connect_failure_for_log_h2: bool = false;
 
-    let resp: Response = match request_path {
+    // Phase 111 (D-PLAN-2): the upstream trailer block rides ALONGSIDE the
+    // response rather than as a field on the shared `envoy_http1::Response`
+    // (42 struct-literal sites across four crates, plus a `PartialEq`/`Eq`
+    // derive that a fifth field would silently redefine). EVERY arm below
+    // except the proxied one yields `None`: a locally-generated response must
+    // not inherit an upstream trailer block (D-PLAN-5).
+    let (resp, resp_trailers): (Response, crate::TrailerBlock) = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
             BuildOutcome::Synth(r, details) => {
                 response_code_details_for_log_h2 = details.map(str::to_owned);
-                r
+                (r, None)
             }
             BuildOutcome::Proxy {
                 cluster: cluster_name,
@@ -673,7 +692,7 @@ async fn handle_one_stream(
                     }
                     // Fall through to finalize_h2_stream (no pool contact,
                     // no retry loop).
-                    overflow_resp
+                    (overflow_resp, None)
                 } else {
                     // `Unlimited` (no circuit_breakers — constraint vi,
                     // byte-identical to phase-16) → None; `Acquired` → hold the
@@ -722,7 +741,11 @@ async fn handle_one_stream(
                     // overflow counter already ticked inside `try_acquire_retry`).
                     let mut retry_budget_blocked = false;
 
-                    let (final_response, completing_upstream_response): (Response, bool) = loop {
+                    let (final_response, final_trailers, completing_upstream_response): (
+                        Response,
+                        crate::TrailerBlock,
+                        bool,
+                    ) = loop {
                         attempts += 1;
 
                         // Run one attempt: pick → dispatch (H1-or-H2 fork inside) →
@@ -835,7 +858,11 @@ async fn handle_one_stream(
                                 }
                             }
                         }
-                        break (attempt.response, attempt.upstream_response);
+                        break (
+                            attempt.response,
+                            attempt.trailers,
+                            attempt.upstream_response,
+                        );
                     };
 
                     // Post-loop reconciliation (mirrors H1).
@@ -922,7 +949,9 @@ async fn handle_one_stream(
                             .headers
                             .push(("x-envoy-attempt-count".to_string(), attempts.to_string()));
                     }
-                    outgoing
+                    // Phase 111: the ONE arm that carries real upstream
+                    // trailers.
+                    (outgoing, final_trailers)
                 } // close the `else` (request-budget Acquired/Unlimited path)
             }
         },
@@ -932,7 +961,7 @@ async fn handle_one_stream(
             // headers (closes 09 REVIEW M2 implementation arm).
             // `upstream_host_for_log_h2` stays None (no proxy attempt).
             crate::response::decorate_filter_synth_response_h2(&mut r);
-            r
+            (r, None)
         }
     };
 
@@ -941,6 +970,7 @@ async fn handle_one_stream(
         &mut pipeline,
         send_response,
         resp,
+        resp_trailers,
         req_arrival_instant,
         req_arrival_systime,
         &envoy_req,
@@ -972,6 +1002,10 @@ async fn finalize_h2_stream(
     pipeline: &mut envoy_filter::FilterPipeline,
     send_response: h2::server::SendResponse<Bytes>,
     mut resp: Response,
+    // Phase 111: the upstream response's trailer block, forwarded verbatim to
+    // the downstream client. `None` on every locally-generated response
+    // (D-PLAN-5).
+    trailers: crate::TrailerBlock,
     req_arrival_instant: Instant,
     req_arrival_systime: SystemTime,
     envoy_req: &Request,
@@ -1049,9 +1083,7 @@ async fn finalize_h2_stream(
     let response_headers_for_log_owned: Vec<(String, String)> = resp.headers.clone();
     let response_headers_for_log: &[(String, String)] = &response_headers_for_log_owned;
 
-    // Phase 111 Task 1: the trailer channel exists but is not yet fed —
-    // Task 3 threads the upstream trailers into this argument.
-    let send_result = send_envoy_response(send_response, resp, None).await;
+    let send_result = send_envoy_response(send_response, resp, trailers).await;
 
     // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
     // on the H2 path. `response_status_for_log` is a local derived post-encode
@@ -1680,6 +1712,193 @@ static_resources:
             }
         });
         (addr, handle)
+    }
+
+    // ── Phase 111: end-to-end trailer forwarding through the HCM ─────────
+
+    /// What a downstream H2 client actually observed on the wire. Extends the
+    /// shape the existing tests assert inline with a `trailers` field, which
+    /// is the whole point of phase 111.
+    struct ObservedH2Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    }
+
+    /// Phase 111 sibling of `spawn_upstream_h2_server`: responds 200 + a
+    /// `trailer:` ANNOUNCE header + `body`, then the given trailer block.
+    /// `trailers: &[]` means "send none" — the no-trailer control.
+    async fn spawn_upstream_h2_server_with_trailers(
+        body: &'static [u8],
+        trailers: &'static [(&'static str, &'static str)],
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut conn = match h2::server::handshake(tcp).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            while let Some(result) = conn.accept().await {
+                let (_req, mut send_response) = match result {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let mut builder = http::Response::builder().status(200);
+                if !trailers.is_empty() {
+                    // RFC 7230 §4.4 announce header, naming only the FIRST of
+                    // the trailers actually sent: upstream Envoy forwards the
+                    // unannounced one too, so the rule under test is "forward
+                    // the block", not "forward what was announced".
+                    builder = builder.header("trailer", trailers[0].0);
+                }
+                let resp = builder.body(()).unwrap();
+                let mut send_stream = match send_response.send_response(resp, false) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = send_stream.send_data(bytes::Bytes::from_static(body), trailers.is_empty());
+                if !trailers.is_empty() {
+                    let mut map = http::HeaderMap::new();
+                    for (n, v) in trailers {
+                        map.append(
+                            http::HeaderName::from_static(n),
+                            http::HeaderValue::from_static(v),
+                        );
+                    }
+                    let _ = send_stream.send_trailers(map);
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Drive ONE downstream H2 request through an HCM listening at `addr` and
+    /// return everything the client observed — including the trailer block.
+    ///
+    /// `body_stream.trailers().await` is awaited BEFORE the connection task is
+    /// dropped; reading it after would silently report zero trailers, a false
+    /// green on the very cell under test.
+    async fn drive_one_h2_request_through_hcm(
+        addr: std::net::SocketAddr,
+        path: &str,
+    ) -> ObservedH2Response {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("http://test.example{path}"))
+            .body(())
+            .unwrap();
+        let (response_fut, _tx) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        let status = resp.status().as_u16();
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let mut body_stream = resp.into_body();
+        let mut body = Vec::new();
+        while let Some(chunk) = body_stream.data().await {
+            let chunk = chunk.unwrap();
+            body.extend_from_slice(&chunk);
+            let _ = body_stream.flow_control().release_capacity(chunk.len());
+        }
+        let trailers: Vec<(String, String)> = body_stream
+            .trailers()
+            .await
+            .unwrap()
+            .map(|map| {
+                map.iter()
+                    .map(|(n, v)| {
+                        (
+                            n.as_str().to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        conn_task.abort();
+        ObservedH2Response {
+            status,
+            headers,
+            body,
+            trailers,
+        }
+    }
+
+    /// Phase 111: an upstream H2 trailer block must reach the downstream
+    /// client unchanged. This is the in-process twin of differential fixture
+    /// `0090-h2-response-trailers`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_forwards_upstream_response_trailers_downstream() {
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_server_with_trailers(
+            b"BODY-OK",
+            &[("x-trail-a", "alpha"), ("x-trail-b", "beta")],
+        )
+        .await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
+
+        let observed = drive_one_h2_request_through_hcm(addr, "/").await;
+
+        assert_eq!(observed.status, 200);
+        assert_eq!(observed.body, b"BODY-OK");
+        assert!(
+            observed
+                .headers
+                .iter()
+                .any(|(n, v)| n == "trailer" && v == "x-trail-a"),
+            "the `trailer:` announce header is a pre-existing pass and must not regress; got {:?}",
+            observed.headers
+        );
+        let mut trailers = observed.trailers.clone();
+        trailers.sort();
+        assert_eq!(
+            trailers,
+            vec![
+                ("x-trail-a".to_string(), "alpha".to_string()),
+                ("x-trail-b".to_string(), "beta".to_string()),
+            ],
+            "both the announced AND the unannounced trailer must be forwarded"
+        );
+    }
+
+    /// PV-6 regression pin at the HCM level: a trailerless upstream response
+    /// must reach the client with no trailer block at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_trailerless_upstream_response_forwards_no_trailers() {
+        let (upstream_addr, _upstream_handle) =
+            spawn_upstream_h2_server_with_trailers(b"BODY-OK", &[]).await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
+        let observed = drive_one_h2_request_through_hcm(addr, "/").await;
+        assert_eq!(observed.status, 200);
+        assert_eq!(observed.body, b"BODY-OK");
+        assert!(
+            observed.trailers.is_empty(),
+            "expected no trailers, got {:?}",
+            observed.trailers
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

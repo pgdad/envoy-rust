@@ -206,3 +206,89 @@ test result: ok. 121 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 --all-targets` finished clean — the return-type change is genuinely crate-local,
 verified rather than asserted. `cargo fmt --all -- --check` clean;
 `cargo clippy -p envoy-http2 --all-targets --all-features -- -D warnings` clean.
+
+---
+
+## Task 3 — Thread the trailers from the upstream attempt to the emit seam ✅
+
+**Files:** `crates/envoy-http2/src/hcm.rs`, plus a new crate-level type alias in
+`crates/envoy-http2/src/lib.rs` (see "the plan's code tripped clippy" below).
+
+**§6.1's MID-EXECUTION split trigger was evaluated here and does NOT fire.**
+This was the plan's named candidate ("the largest single task… if any step blows
+past ~10 sub-steps on contact with reality, stop and split"). Measured on
+contact: the threading resolved into **five coherent edit groups** — the
+`AcquireOutcome::Sent` payload (+3 fork call sites), the `H2AttemptResult` field
+(+5 literal sites), the retry-loop tuple (+its single `break`), the
+`request_path` match (+4 arm tails), and `finalize_h2_stream` (param + 1 call
+site + the emit call). No group required unplanned discovery, and the whole task
+landed in one pass. **Phase 111 stays whole; no `111.1`/`111.2` was created.**
+
+**Step 1/2 — RED, and it is a genuine ASSERTION, not a compile error** (the plan
+insists on the distinction, and a compile error would have meant the helper
+sketch was wrong):
+
+```
+$ cargo test -p envoy-http2 --lib h2_forwards_upstream_response_trailers
+thread 'hcm::tests::h2_forwards_upstream_response_trailers_downstream' panicked at
+  crates/envoy-http2/src/hcm.rs:1842:9:
+assertion `left == right` failed: both the announced AND the unannounced trailer must be forwarded
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 123 filtered out
+```
+
+Note WHICH assertion fired: the `trailer:` announce-header assertion, which sits
+ABOVE it, PASSED — so F3's "the announce header is already at parity" is
+re-confirmed by this RED rather than merely quoted.
+
+**Two helpers were written, and the plan's "read the in-tree helper" pointer
+paid off again.** `spawn_upstream_h2_server_with_trailers` mirrors the existing
+`spawn_upstream_h2_server` shape; `drive_one_h2_request_through_hcm` is new,
+because the module's existing tests all drive the HCM INLINE and none has an
+observation type. It awaits `body_stream.trailers()` BEFORE dropping the
+connection task — reading after would silently report zero.
+
+**Steps 3–7 — the five declarations, all located by TEXT.** The `H1` fork of
+`AcquireOutcome::Sent` (which shares the enum and can carry no trailers) is
+wrapped `(r, None)` with CF-111-2 named at the site. Exactly ONE
+`H2AttemptResult` literal — the `Sent(Ok(..))` proxied arm — carries real
+trailers; the other four pass `None`, as do all three non-proxy `request_path`
+arm tails. That is D-PLAN-5, and it is structural rather than remembered.
+
+**⚠ THE PLAN'S OWN CODE TRIPPED CLIPPY, EXACTLY AS THE STANDING TRAP PREDICTS.**
+The plan specifies `Sent(Result<(envoy_http1::Response, Option<Vec<(String,
+String)>>), String>)`. That form fails the plan's own gate (e):
+
+```
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/envoy-http2/src/hcm.rs:251:14
+    | Sent(Result<(envoy_http1::Response, Option<Vec<(String, String)>>), String>),
+    = note: `-D clippy::type-complexity` implied by `-D warnings`
+```
+
+**Fix: a crate-level `pub type TrailerBlock = Option<Vec<(String, String)>>;`**
+in `lib.rs`, carrying the D-PLAN-2 rationale as its doc comment, used at every
+production hop (`client.rs`'s return type, `response.rs`'s parameter, the
+`AcquireOutcome` payload, the `H2AttemptResult` field, the retry-loop tuple, the
+`finalize_h2_stream` parameter). **A type alias is transparent, so the plan's
+§8 "the trailer type is `Option<Vec<(String, String)>>` at every production hop"
+remains literally true** — this is a spelling change, not a design change.
+
+**A second plan-code defect, same class:** the plan's Task 3 Step 7 declares the
+`finalize_h2_stream` parameter `mut trailers` (because Task 4 will assign to it).
+At Task 3 nothing assigns to it yet, so `-D warnings` fails on `unused_mut`. The
+`mut` is therefore added in **Task 4**, at the commit that introduces the
+assignment, keeping every commit's tree warning-free.
+
+**Steps 8/9 — GREEN.**
+
+```
+$ cargo test -p envoy-http2
+test result: ok. 123 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+123 = 121 (post-Task-2) + 2 new. The workspace build is what PROVES the enum
+widening and the struct field stayed crate-local — a `-p envoy-http2` build alone
+would not. `cargo fmt --all -- --check` clean;
+`cargo clippy -p envoy-http2 --all-targets --all-features -- -D warnings` clean.

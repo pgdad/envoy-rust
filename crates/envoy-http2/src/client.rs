@@ -132,7 +132,7 @@ impl ClientStream {
     pub async fn send_request(
         &mut self,
         request: Request,
-    ) -> Result<(Response, Option<Vec<(String, String)>>), Http2Error> {
+    ) -> Result<(Response, crate::TrailerBlock), Http2Error> {
         // (a) :authority resolution. Explicit Host: wins over the captured
         // host. Mirrors envoy_http1::Client::send_request's host-resolution
         // posture per crates/envoy-http1/src/client.rs.

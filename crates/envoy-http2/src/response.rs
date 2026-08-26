@@ -133,7 +133,7 @@ fn build_trailer_map(trailers: &[(String, String)]) -> Result<http::HeaderMap, H
 pub async fn send_envoy_response(
     mut send_response: h2::server::SendResponse<bytes::Bytes>,
     resp: Response,
-    trailers: Option<Vec<(String, String)>>,
+    trailers: crate::TrailerBlock,
 ) -> Result<(), Http2Error> {
     let head = build_http_response(&resp)?;
     let trailer_map = match trailers {

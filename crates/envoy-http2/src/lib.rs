@@ -41,6 +41,25 @@ pub(crate) const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
 ];
 
+/// Phase 111: an upstream HTTP/2 response's TRAILER block, in wire order —
+/// `None` when the upstream sent none, which is the overwhelmingly common case.
+/// `Some(vec![])` is never produced.
+///
+/// The block rides ALONGSIDE `envoy_http1::Response` rather than as a field on
+/// it (D-PLAN-2): that type is shared across four crates with 42 struct-literal
+/// sites and derives `PartialEq`/`Eq`, so a fifth field would both fan out an
+/// `E0063` across all of them and silently redefine every whole-`Response`
+/// equality assertion — for a value only the HTTP/2 path can ever populate.
+///
+/// `Vec<(String, String)>` rather than `http::HeaderMap` so it matches the
+/// shape `Response.headers` already uses, preserving duplicate names and wire
+/// order for free.
+///
+/// This alias exists because the nested form
+/// `Result<(Response, Option<Vec<(String, String)>>), String>` trips
+/// `clippy::type_complexity` at the retry loop's `AcquireOutcome::Sent`.
+pub type TrailerBlock = Option<Vec<(String, String)>>;
+
 pub use client::{Client, ClientStream};
 pub use codec::build_h2_server;
 pub use error::Http2Error;
