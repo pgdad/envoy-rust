@@ -901,6 +901,138 @@ session touching either must not read this section as evidence about them.
 
 ---
 
+## Response trailers
+
+**Phase 111** (`ADR-0181` scope, `ADR-0182` empirical reconciliation). Until
+this phase the `Response trailers` row of the equivalence matrix above — seeded
+at phase 00 — had never been exercised by any fixture. It now has a rule, a
+witness, and an explicit statement of every cell that remains unmatched or
+unmeasured. Witness: fixture `tests/fixtures/0090-h2-response-trailers/`.
+
+Every claim below was MEASURED against the pinned `envoyproxy/envoy:v1.33.0`
+(digest `sha256:56da5afd7df3…`, `ENVOY_TARGET.md`) on a raw-HTTP/2 probe rig,
+with the backend a sibling container on a shared Docker network so both proxies
+drove the identical backend. Nothing here is projected.
+
+### The forward rule
+
+An HTTP/2 response TRAILER block arriving from an HTTP/2 upstream is forwarded
+**verbatim** to the HTTP/2 downstream client. No config knob exists or is
+required on either side: upstream Envoy forwards trailers on a stock config.
+
+The `trailer:` **announce header (RFC 7230 §4.4) is NOT consulted.** Upstream
+Envoy forwards a trailer that was never announced, so filtering the block by the
+announce header would itself be a divergence. The rule is "forward the block",
+not "forward what was announced".
+
+The announce header itself is forwarded as an ordinary response header by BOTH
+proxies. That is **pre-existing parity, not a phase-111 behaviour** — it must
+not regress, and it is asserted by fixture `0090`.
+
+### Comparison discipline
+
+Set-equality of ASCII-lowercased trailer names, plus a value-exact match for
+every name not on the 3-entry `HEADER_ALLOW_LIST` (`server`, `date`,
+`x-envoy-upstream-service-time`) — i.e. literally the `diff_headers` function
+the header axis already uses (`tests/differential/src/lib.rs`), selected in a
+fixture by `expected_trailers: set_equal_modulo_allow_list` on `Driver::Http2`.
+
+Two consequences follow from reusing a SET comparison, and both are real gaps
+rather than guarantees:
+
+- **Duplicate trailer-name multiplicity is NOT compared** (`CF-111-8`). Envoy
+  forwards `x-multi: one` and `x-multi: two` and preserves both; a set
+  comparison collapses the name and reads only the first value.
+- **Trailer ORDER is NOT compared** (`CF-111-9`). Envoy preserves wire order
+  across a five-trailer block, but the harness compares sets and
+  `http::HeaderMap` iteration order is not insertion order anyway — the same
+  blindness this document records for header order.
+
+### Scope
+
+- **HTTP/2 responses only.** HTTP/1.1 trailers are unbuilt in BOTH directions
+  and blocked behind chunked response ENCODING, which
+  `crates/envoy-http1/src/response.rs` records as deferred (`CF-111-2`). The H1
+  differential driver's own chunked decoder discards trailers.
+- **REQUEST trailers (downstream → upstream) are unbuilt** (`CF-111-3`).
+- **Trailers bypass the filter pipeline entirely** (`CF-111-1`). The filter API
+  is headers-only (`crates/envoy-filter/src/pipeline.rs`), which is the gRPC
+  family's SECOND blocking prerequisite and its own phase; an encode-side filter
+  can neither see nor alter a trailer.
+- **Locally-generated replies carry NO trailers.** Every synth path
+  (`no_healthy_upstream`, reset, connect-failure, pool/request-budget overflow,
+  `direct_response`, decode-side short-circuit) yields none, and an encode-side
+  filter that REPLACES the response has the upstream's block explicitly cleared
+  — otherwise it would inherit trailers the upstream never sent for it. Envoy's
+  own behaviour on trailers for locally-generated replies is UNMEASURED.
+
+### Measured upstream behaviours that envoy-rust MATCHES
+
+Recorded so no later session re-derives them:
+
+- `content-length`, `te: trailers` and `host` inside a trailer block are
+  forwarded **VERBATIM**. Envoy sanitises no trailer NAME at all — this
+  corrects a guess, not merely an unknown.
+- Trailers are forwarded on a **non-200** response.
+- Trailers are forwarded on an **EMPTY-body** response, with **no DATA frame at
+  all**. This is the gRPC main case, not a corner: a trailers-only response has
+  an empty body by construction.
+- A response that announces a trailer via `trailer:` and then sends none yields
+  zero trailers on both sides.
+- An **empty trailer HEADERS block** (zero fields) yields zero trailers and a
+  clean end-of-stream on both sides.
+
+### Measured upstream behaviours that envoy-rust does NOT match
+
+Stated plainly rather than omitted. Both are EXCLUDED from fixture `0090`,
+because a fixture that goes red for the wrong reason is worse than no fixture:
+
+- A trailer block containing any HTTP/2 connection-specific name
+  (`connection`, `transfer-encoding`, `upgrade`, `keep-alive`,
+  `proxy-connection`, or `te` with a value other than `trailers`): **Envoy**
+  drops the whole block and returns `200` + the full body +
+  `RST_STREAM(NO_ERROR)`; **envoy-rust** returns `503` with an empty body.
+  `CF-111-5` — **pre-existing and independent of trailer forwarding**: the
+  cause is the `h2` crate's RECEIVE-side validation inside the body-drain loop,
+  and it reproduces with no trailer code in the tree. Note the direction of the
+  asymmetry: Envoy never STRIPS an offending name, it discards the block and
+  resets.
+- A trailer block containing a **pseudo-header** (`:status`, …): **Envoy**
+  drops the whole block and resets; **envoy-rust** forwards the block's
+  surviving non-pseudo fields. `CF-111-6` — a divergence this phase CREATES.
+  Closing it requires deciding whether to mirror Envoy's drop-and-reset, which
+  is a behaviour change beyond forwarding.
+
+**No defensive hop-by-hop strip exists on the trailer emit path, deliberately.**
+Mirroring the header block's `H2_FORBIDDEN_HOP_BY_HOP` strip onto trailers looks
+obviously right and is provably DEAD code: `h2` rejects the same six names on
+the RECEIVE side, so such a block never reaches the emit seam. The reasoning is
+recorded at the site (`crates/envoy-http2/src/response.rs`) so a reviewer does
+not re-raise it.
+
+### Stats
+
+Upstream Envoy exposes `http2.trailers` and `cluster.<name>.http2.trailers`, and
+**both stayed `0`** across eight trailer-forwarding responses (`CF-111-7`).
+There is therefore no stat parity to chase, envoy-rust ticks no trailer stat,
+and **fixture `0090` asserts no stat**. Whether any Envoy stat ever ticks for
+trailers is unresolved.
+
+### Still unmeasured
+
+Do not assume any of these; they are open questions, not settled cells.
+
+- Trailers over **TLS**.
+- Trailers on an **HTTP/1.1 downstream with an HTTP/2 upstream** (the ADR-0028
+  dispatch deferral may make the combination unreachable anyway).
+- Trailers on **retried** requests and on responses a filter or the router
+  **short-circuits**.
+- Whether upstream Envoy emits trailers on **locally-generated** replies.
+- Whether `h2`'s send-side validation would turn some block Envoy accepts into
+  an error here.
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**

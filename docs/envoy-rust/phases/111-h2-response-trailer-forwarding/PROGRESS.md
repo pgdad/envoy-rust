@@ -746,3 +746,52 @@ binary), a `test result:` line (it RAN — a compile error is not a mutation RED
 FAILED, and a GREEN control from the same worktree. The scratch worktree was
 removed — only that one; the four sibling `.claude/worktrees/agent-*` belong to a
 parallel workstream. Main tree re-verified unmutated afterwards.
+
+---
+
+## Task 10 — `BEHAVIOR_CONTRACT.md` gains a `## Response trailers` section ✅
+
+**Files:** `docs/envoy-rust/BEHAVIOR_CONTRACT.md`. **Contributes 0 to the
+net-LoC budget** (the house metric excludes `docs/`), which is exactly why it is
+last and could not be traded away for size.
+
+**Step 1 — insertion point located by TEXT**, in a file that exceeds the read
+limit and was paged, never read whole:
+
+```
+$ grep -n 'Response trailers'      docs/envoy-rust/BEHAVIOR_CONTRACT.md   ->   18  (the matrix row)
+$ grep -n '^## Header allow-list'  docs/envoy-rust/BEHAVIOR_CONTRACT.md   -> 904
+```
+
+The new `## Response trailers` section is placed immediately BEFORE
+`## Header allow-list`, since it reuses that allow-list. Post-insert the file is
+4437 lines with `## Response trailers` at `:904` and `## Header allow-list`
+pushed to `:1036`.
+
+**Step 2 — the section**, eight parts, each traceable to a measurement in
+`PLAN.md` §1: the forward rule (verbatim, announce header NOT consulted); the
+announce header's pre-existing parity; the comparison discipline and the two
+gaps it implies (CF-111-8 multiplicity, CF-111-9 order); the scope (H2 only,
+CF-111-1/2/3, locally-generated replies carry none); the measured behaviours
+envoy-rust MATCHES; the two it does NOT (CF-111-5, CF-111-6) stated plainly
+rather than omitted, with the dead-strip reasoning; the stats (CF-111-7, no stat
+asserted); and what remains unmeasured.
+
+The row it populates — `| Response trailers | Set-equal under the same
+allow-list discipline |` at `:18` — was seeded at phase 00 and has been an
+aspiration ever since. It now has a rule and a witness.
+
+**Step 3 — the contract and the code re-checked against each other**, because
+they are meant to move in lockstep and a Global Constraint forbids this phase
+from touching the list:
+
+```
+$ grep -n 'HEADER_ALLOW_LIST' -A 4 tests/differential/src/lib.rs
+1212: pub const HEADER_ALLOW_LIST: &[(&str, AllowMode)] = &[
+1213:     ("server", AllowMode::NameRequired),
+1214:     ("date", AllowMode::NameRequired),
+1215:     ("x-envoy-upstream-service-time", AllowMode::NameRequired), // 04.3 NEW
+1216: ];
+```
+
+Exactly THREE entries, unchanged. `location` and `content-type` remain ABSENT.
