@@ -281,6 +281,9 @@ async fn run_h2_attempt(
                             .client_stream_mut()
                             .send_request(out_req)
                             .await
+                            // Phase 111 Task 2: trailers read but not yet
+                            // threaded; Task 3 carries them to the emit seam.
+                            .map(|(r, _trailers)| r)
                             .map_err(|e| format!("{e}")),
                     ),
                     Err(crate::pool::PoolError::Connect(source)) => {
@@ -317,7 +320,13 @@ async fn run_h2_attempt(
                         Ok(mut s) => {
                             cluster.cx_total().inc();
                             AcquireOutcome::Sent(
-                                s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                                s.send_request(out_req)
+                                    .await
+                                    // Phase 111 Task 2: trailers read but not
+                                    // yet threaded; Task 3 carries them to the
+                                    // emit seam.
+                                    .map(|(r, _trailers)| r)
+                                    .map_err(|e| format!("{e}")),
                             )
                         }
                         Err(source) => {

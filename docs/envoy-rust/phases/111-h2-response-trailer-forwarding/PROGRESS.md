@@ -147,3 +147,62 @@ applied it and the re-check is clean. `cargo clippy -p envoy-http2 --all-targets
 | `no_trailers_empty_body_is_unchanged` | PV-6 regression pin, `end_of_stream=true` HEADERS |
 | `trailer_names_envoy_forwards_are_not_stripped` | PV-3 rows 10-12 — `content-length`/`te`/`host` NOT stripped |
 | `duplicate_trailer_names_are_both_emitted` | PV-3 row 5 — `append`, not `insert` |
+
+---
+
+## Task 2 — Upstream read: `send_request` returns the trailer block ✅
+
+**Files:** `crates/envoy-http2/src/client.rs`, `crates/envoy-http2/src/hcm.rs`
+(two production call sites, made to discard the trailers with a marker Task 3
+consumes).
+
+**Step 1 — the `Request` literal came from the TREE, not from the plan.**
+`PLAN.md`'s sketch builds `Request { method, path, version, headers, body:
+Bytes::new() }`. The real `envoy_http1::codec::Request` has **six** fields —
+it also carries `bytes_consumed: usize`, and its `body` is `Option<Bytes>`, not
+`Bytes`. The in-tree helper `mk_request(method, path, headers, body)` in the same
+`mod tests` is authoritative and is what both new tests call. This is the first of
+the three "read the in-tree helper" pointers the plan deliberately left unresolved,
+and it would have been a compile error had the sketch been transcribed.
+
+**Step 2 — RED.**
+
+```
+$ cargo test -p envoy-http2 --lib client::tests
+error[E0308]: mismatched types
+   --> crates/envoy-http2/src/client.rs:624:13
+624 |         let (resp, trailers) = client.send_request(req).await.unwrap();
+    |             ^^^^^^^^^^^^^^^^   expected `Response`, found `(_, _)`
+error: could not compile `envoy-http2` (lib test) due to 2 previous errors
+EXIT=101
+```
+
+The message names the tuple mismatch — the check the plan asks for — not
+something unrelated.
+
+**Step 3 — the read, placed where PV-5 says it must go.** `recv_stream.trailers()`
+sits immediately after the body-drain loop's closing brace and **BEFORE** the
+`(g)` status-range guard: `h2` resolves `trailers()` only once `data()` has
+returned `None` (the drain loop guarantees that), and reading before `(g)` keeps
+`recv_stream` alive and reads a block even on a status that guard would reject.
+Non-ASCII trailer values are SKIPPED rather than failing the response — the same
+defensive posture the header conversion directly below already takes.
+
+**Step 4 — the call sites.** Two production sites in `hcm.rs` (the pooled H2
+`client_stream_mut().send_request(out_req)` and the no-pool per-call
+`s.send_request(out_req)`) each gained `.map(|(r, _trailers)| r)` with a marker
+comment naming Task 3. Five `#[cfg(test)]` sites inside `client.rs` were
+destructured. Note the H1 fork's `send_request` at the same `match` is
+`envoy_http1::Client`'s and is untouched.
+
+**Step 5 — GREEN.**
+
+```
+$ cargo test -p envoy-http2
+test result: ok. 121 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+```
+
+121 = 119 (post-Task-1) + the 2 new tests. `cargo build --workspace
+--all-targets` finished clean — the return-type change is genuinely crate-local,
+verified rather than asserted. `cargo fmt --all -- --check` clean;
+`cargo clippy -p envoy-http2 --all-targets --all-features -- -D warnings` clean.

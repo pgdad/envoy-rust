@@ -122,7 +122,17 @@ impl ClientStream {
     /// send-stream / response-future failures, `H2RecvBody` covers body-read
     /// / flow-control failures, `BadStatusCode` is defense-in-depth on the
     /// 100..=599 range invariant.
-    pub async fn send_request(&mut self, request: Request) -> Result<Response, Http2Error> {
+    /// Returns the proxied response and, if the upstream sent one, its
+    /// TRAILER block in wire order.
+    ///
+    /// The trailers ride ALONGSIDE `Response` rather than as a field on it:
+    /// `envoy_http1::Response` is shared across four crates with 42 struct-
+    /// literal sites and a `PartialEq`/`Eq` derive, and only the HTTP/2 path
+    /// can ever populate or emit a trailer block (phase 111, D-PLAN-2).
+    pub async fn send_request(
+        &mut self,
+        request: Request,
+    ) -> Result<(Response, Option<Vec<(String, String)>>), Http2Error> {
         // (a) :authority resolution. Explicit Host: wins over the captured
         // host. Mirrors envoy_http1::Client::send_request's host-resolution
         // posture per crates/envoy-http1/src/client.rs.
@@ -199,6 +209,29 @@ impl ClientStream {
                 .map_err(|source| Http2Error::H2RecvBody { source })?;
         }
 
+        // (f2) Phase 111: read the trailer block. `h2` only resolves this
+        // once `data()` has returned `None`, which the drain loop above
+        // guarantees. Read BEFORE the `(g)` status-range guard, so a trailer
+        // block is read even on a status that guard would reject — and, more
+        // importantly, while `recv_stream` is still alive. `Ok(None)` is the
+        // common case: a response with no trailers.
+        let trailers: Option<Vec<(String, String)>> = recv_stream
+            .trailers()
+            .await
+            .map_err(|source| Http2Error::H2RecvBody { source })?
+            .map(|map| {
+                let mut out: Vec<(String, String)> = Vec::with_capacity(map.len());
+                for (name, value) in map.iter() {
+                    // Same defensive posture as the header conversion below:
+                    // skip a non-ASCII value rather than failing the response.
+                    let Ok(value_str) = value.to_str() else {
+                        continue;
+                    };
+                    out.push((name.as_str().to_string(), value_str.to_string()));
+                }
+                out
+            });
+
         // (g) Translate http::Response<()> + body bytes → envoy Response. The
         // status range is 100..=599 per route-walk + h2 codec validation; the
         // BadStatusCode variant is defense-in-depth (mirrors response.rs).
@@ -215,12 +248,15 @@ impl ClientStream {
             };
             headers.push((name.as_str().to_string(), value_str));
         }
-        Ok(Response {
-            status,
-            reason: None,
-            headers,
-            body: body_bytes.freeze(),
-        })
+        Ok((
+            Response {
+                status,
+                reason: None,
+                headers,
+                body: body_bytes.freeze(),
+            },
+            trailers,
+        ))
     }
 }
 
@@ -401,7 +437,7 @@ mod tests {
         .await;
         let mut client = Client::connect(addr, "test.example").await.unwrap();
         let req = mk_request("GET", "/", vec![], Bytes::new());
-        let _resp = client.send_request(req).await.expect("send_request");
+        let (_resp, _trailers) = client.send_request(req).await.expect("send_request");
         let captured = captured.lock().await;
         let captured = captured.as_ref().expect("h2 server captured request");
         assert_eq!(captured.method().as_str(), "GET");
@@ -424,7 +460,7 @@ mod tests {
         .await;
         let mut client = Client::connect(addr, "test.example").await.unwrap();
         let req = mk_request("GET", "/", vec![("Host", "real.example")], Bytes::new());
-        let _resp = client.send_request(req).await.expect("send_request");
+        let (_resp, _trailers) = client.send_request(req).await.expect("send_request");
         let captured = captured.lock().await;
         let captured = captured.as_ref().expect("h2 server captured request");
         // Per SPEC §3 D1: explicit Host: wins over captured host.
@@ -452,7 +488,7 @@ mod tests {
         .await;
         let mut client = Client::connect(addr, "test.example").await.unwrap();
         let req = mk_request("GET", "/", vec![], Bytes::new());
-        let resp = client.send_request(req).await.expect("send_request");
+        let (resp, _trailers) = client.send_request(req).await.expect("send_request");
         assert_eq!(resp.status, 200);
         assert!(
             resp.headers
@@ -474,7 +510,7 @@ mod tests {
         let (addr, _handle) = spawn_h2_server_chunks(chunks).await;
         let mut client = Client::connect(addr, "test.example").await.unwrap();
         let req = mk_request("GET", "/", vec![], Bytes::new());
-        let resp = client.send_request(req).await.expect("send_request");
+        let (resp, _trailers) = client.send_request(req).await.expect("send_request");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.as_ref(), &b"abcdefghijkl"[..]);
     }
@@ -502,7 +538,7 @@ mod tests {
             ],
             Bytes::new(),
         );
-        let _resp = client.send_request(req).await.expect("send_request");
+        let (_resp, _trailers) = client.send_request(req).await.expect("send_request");
         let captured = captured.lock().await;
         let captured = captured.as_ref().expect("h2 server captured request");
         for forbidden in &[
@@ -550,5 +586,104 @@ mod tests {
             Err(Http2Error::H2ClientHandshake { source: _ }) => {}
             other => panic!("expected H2ClientHandshake, got {other:?}"),
         }
+    }
+
+    // ── Phase 111: the upstream trailer read ─────────────────────────────
+
+    /// Spawn an in-process h2 server that answers with `200` + `body` and then
+    /// the given trailer block. `trailers: &[]` means "send none" — the
+    /// no-trailer control. Distinct from `spawn_h2_server` above, which takes a
+    /// responder closure and cannot express a trailer HEADERS frame.
+    async fn spawn_h2_server_with_trailers(
+        body: &'static str,
+        trailers: &'static [(&'static str, &'static str)],
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut conn = match h2::server::handshake(tcp).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            while let Some(result) = conn.accept().await {
+                let (req, mut send_response) = match result {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let (_parts, mut recv) = req.into_parts();
+                while let Some(chunk) = recv.data().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                }
+                let head = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/plain")
+                    .body(())
+                    .unwrap();
+                let mut send_stream = match send_response.send_response(head, false) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ =
+                    send_stream.send_data(Bytes::from_static(body.as_bytes()), trailers.is_empty());
+                if !trailers.is_empty() {
+                    let mut map = http::HeaderMap::new();
+                    for (n, v) in trailers {
+                        map.append(
+                            http::HeaderName::from_static(n),
+                            http::HeaderValue::from_static(v),
+                        );
+                    }
+                    let _ = send_stream.send_trailers(map);
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_request_returns_the_upstream_trailer_block() {
+        let (addr, srv) = spawn_h2_server_with_trailers(
+            "BODY-OK",
+            &[("x-trail-a", "alpha"), ("x-trail-b", "beta")],
+        )
+        .await;
+        let mut client = Client::connect(addr, "probe.local").await.unwrap();
+        let req = mk_request("GET", "/", vec![], Bytes::new());
+        let (resp, trailers) = client.send_request(req).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(&resp.body[..], b"BODY-OK");
+        let mut got = trailers.expect("trailer block must be present");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("x-trail-a".to_string(), "alpha".to_string()),
+                ("x-trail-b".to_string(), "beta".to_string()),
+            ]
+        );
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_request_returns_none_when_upstream_sends_no_trailers() {
+        let (addr, srv) = spawn_h2_server_with_trailers("BODY-OK", &[]).await;
+        let mut client = Client::connect(addr, "probe.local").await.unwrap();
+        let req = mk_request("GET", "/", vec![], Bytes::new());
+        let (resp, trailers) = client.send_request(req).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(&resp.body[..], b"BODY-OK");
+        assert!(
+            trailers.is_none(),
+            "a trailerless response must yield None, got {trailers:?}"
+        );
+        srv.abort();
     }
 }
