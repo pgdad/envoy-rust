@@ -4,9 +4,12 @@
 //!   - `build_http_response(resp)` — translates an `envoy_http1::Response` into
 //!     an `http::Response<()>` (status + headers; body is sent separately).
 //!     Pure function; testable in isolation.
-//!   - `send_envoy_response(send_response, resp)` — drives the actual H2 wire
-//!     emission via `h2::server::SendResponse::send_response` + body
-//!     send_data. Async; integration-tested via the HCM tests in Task 9.
+//!   - `send_envoy_response(send_response, resp, trailers)` — drives the actual
+//!     H2 wire emission via `h2::server::SendResponse::send_response` + body
+//!     send_data + an optional trailer HEADERS frame. Its end-of-stream fork is
+//!     THREE-way (phase 111): END_STREAM may only ride the LAST frame intended,
+//!     so an empty body WITH trailers sends no DATA frame at all. Async;
+//!     integration-tested via the HCM tests in Task 9.
 //!
 //! H2-forbidden hop-by-hop headers (RFC 7540 §8.1.2.2: connection,
 //! transfer-encoding, upgrade, keep-alive, proxy-connection) are stripped
@@ -68,8 +71,56 @@ pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
     envoy_http1::hcm::decorate_filter_synth_response(resp, None);
 }
 
+/// Translate a trailer block into an `http::HeaderMap` for
+/// `h2::SendStream::send_trailers`.
+///
+/// # No hop-by-hop strip here, deliberately
+///
+/// `build_http_response` strips `crate::H2_FORBIDDEN_HOP_BY_HOP` from the
+/// HEADER block. The trailer block gets no such strip, and that is a MEASURED
+/// decision rather than an oversight (phase 111, D-PLAN-4): `h2` rejects
+/// exactly `connection` / `transfer-encoding` / `upgrade` / `keep-alive` /
+/// `proxy-connection` / `te` != `trailers` on the RECEIVE side too, so an
+/// upstream block containing any of them fails in `ClientStream::send_request`'s
+/// drain loop and never reaches this function. A strip here would be
+/// unreachable, untestable code, which §6.3 forbids. The receive-side
+/// asymmetry against upstream Envoy — which drops the block and resets the
+/// stream where envoy-rust returns 503 — is banked as CF-111-5.
+///
+/// `append`, not `insert`: upstream Envoy preserves duplicate trailer names
+/// and so must we.
+fn build_trailer_map(trailers: &[(String, String)]) -> Result<http::HeaderMap, Http2Error> {
+    let mut map = http::HeaderMap::with_capacity(trailers.len());
+    for (name, value) in trailers {
+        let name_lc = name.to_ascii_lowercase();
+        let header_name = HeaderName::from_bytes(name_lc.as_bytes())
+            .map_err(|_| Http2Error::MalformedH2HeaderBlock)?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| Http2Error::MalformedH2HeaderBlock)?;
+        map.append(header_name, header_value);
+    }
+    Ok(map)
+}
+
 /// Drive the actual H2 response emission. Sends the response head via
-/// `send_response`, then the body via `send_data(end_of_stream=true)`.
+/// `send_response`, then the body via `send_data`, then — phase 111 — the
+/// upstream's trailer block via `send_trailers` when the response carries one.
+///
+/// The end-of-stream fork is THREE-way, and that is a measured requirement
+/// rather than a style choice: `h2` returns `UserError::UnexpectedFrameType`
+/// for ANY frame sent after END_STREAM, so END_STREAM may only ride the LAST
+/// frame we intend to send.
+///
+/// | body | trailers | frames |
+/// |---|---|---|
+/// | empty | none | `send_response(head, end_of_stream = true)` |
+/// | empty | present | `send_response(head, false)` then `send_trailers` — **no DATA frame** |
+/// | non-empty | none | `send_response(head, false)` then `send_data(body, true)` |
+/// | non-empty | present | `send_response(head, false)`, `send_data(body, false)`, `send_trailers` |
+///
+/// The empty-body-with-trailers row is not a corner case: a gRPC trailers-only
+/// response has an empty body by construction, which is the whole point of
+/// this prerequisite.
 ///
 /// Error mapping note: response-head-send failures surface as
 /// `Http2Error::H2StreamAccept` (a misnomer — the variant's name implies
@@ -77,19 +128,34 @@ pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
 /// for the stream). Body-write failures surface as `Http2Error::H2BodyRead`
 /// (also a misnomer when applied to body WRITE). Future cleanup may
 /// rename the variants and/or introduce a single `H2ResponseSend` —
-/// defer per SPEC §6 local signpost 21.
+/// defer per SPEC §6 local signpost 21. Trailer-write failures get their own
+/// `Http2Error::H2SendTrailers` rather than widening that misnomer further.
 pub async fn send_envoy_response(
     mut send_response: h2::server::SendResponse<bytes::Bytes>,
     resp: Response,
+    trailers: Option<Vec<(String, String)>>,
 ) -> Result<(), Http2Error> {
     let head = build_http_response(&resp)?;
+    let trailer_map = match trailers {
+        Some(t) => Some(build_trailer_map(&t)?),
+        None => None,
+    };
+    let body_empty = resp.body.is_empty();
     let mut send_stream = send_response
-        .send_response(head, /* end_of_stream = */ resp.body.is_empty())
+        .send_response(
+            head,
+            /* end_of_stream = */ body_empty && trailer_map.is_none(),
+        )
         .map_err(|source| Http2Error::H2StreamAccept { source })?;
-    if !resp.body.is_empty() {
+    if !body_empty {
         send_stream
-            .send_data(resp.body, /* end_of_stream = */ true)
+            .send_data(resp.body, /* end_of_stream = */ trailer_map.is_none())
             .map_err(|source| Http2Error::H2BodyRead { source })?;
+    }
+    if let Some(map) = trailer_map {
+        send_stream
+            .send_trailers(map)
+            .map_err(|source| Http2Error::H2SendTrailers { source })?;
     }
     Ok(())
 }
@@ -281,5 +347,177 @@ mod tests {
         assert_eq!(name("x-fault-policy").as_deref(), Some("phase-11"));
         // Still no connection.
         assert!(name("connection").is_none());
+    }
+
+    // ── Phase 111: the trailer emit fork ─────────────────────────────────
+    //
+    // `build_http_response` sees headers, never FRAMES, and the end-of-stream
+    // fork is a property of the frame sequence. These tests therefore drive
+    // `send_envoy_response` over a real in-process H2 connection and read back
+    // what the client actually observed on the wire.
+
+    /// Drive `send_envoy_response` over a real in-process H2 connection and
+    /// return what the client actually observed: status, body bytes, and the
+    /// trailer block (empty when none was sent).
+    async fn round_trip(
+        resp: Response,
+        trailers: Option<Vec<(String, String)>>,
+    ) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _peer) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(accepted) = conn.accept().await {
+                let (_req, send_response) = accepted.unwrap();
+                send_envoy_response(send_response, resp, trailers)
+                    .await
+                    .expect("send_envoy_response must succeed");
+            }
+            while conn.accept().await.is_some() {}
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, connection) = h2::client::handshake(tcp).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://probe.local/")
+            .body(())
+            .unwrap();
+        let (response_fut, _tx) = send_request.send_request(req, true).unwrap();
+        let response = response_fut.await.unwrap();
+        let status = response.status().as_u16();
+        let mut body_stream = response.into_body();
+        let mut body = Vec::new();
+        while let Some(chunk) = body_stream.data().await {
+            let chunk = chunk.unwrap();
+            body.extend_from_slice(&chunk);
+            let _ = body_stream.flow_control().release_capacity(chunk.len());
+        }
+        // MUST be awaited BEFORE aborting the connection task, or the trailer
+        // HEADERS frame is never pumped off the socket and this reads an
+        // empty block — a false green on the very cell under test.
+        let observed: Vec<(String, String)> = body_stream
+            .trailers()
+            .await
+            .unwrap()
+            .map(|map| {
+                map.iter()
+                    .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        conn_task.abort();
+        server.abort();
+        (status, body, observed)
+    }
+
+    fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn trailers_follow_a_non_empty_body() {
+        let resp = synth_response(200, vec![("content-type", "text/plain")], b"BODY-OK");
+        let (status, body, trailers) = round_trip(
+            resp,
+            Some(vec![
+                ("x-trail-a".to_string(), "alpha".to_string()),
+                ("x-trail-b".to_string(), "beta".to_string()),
+            ]),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"BODY-OK");
+        assert_eq!(
+            sorted(trailers),
+            vec![
+                ("x-trail-a".to_string(), "alpha".to_string()),
+                ("x-trail-b".to_string(), "beta".to_string()),
+            ]
+        );
+    }
+
+    /// The gRPC main case, not a corner: a trailers-only response has an empty
+    /// body by construction. Today's `send_response(head, end_of_stream=true)`
+    /// branch makes any following frame a `UserError::UnexpectedFrameType`.
+    #[tokio::test]
+    async fn trailers_follow_an_empty_body_with_no_data_frame() {
+        let resp = synth_response(200, vec![("content-type", "application/grpc")], b"");
+        let (status, body, trailers) = round_trip(
+            resp,
+            Some(vec![("grpc-status".to_string(), "0".to_string())]),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "expected no DATA frame, got {body:?}");
+        assert_eq!(trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
+
+    /// PV-6 regression pin: the no-trailers non-empty-body path must be
+    /// byte-identical to today.
+    #[tokio::test]
+    async fn no_trailers_non_empty_body_is_unchanged() {
+        let resp = synth_response(200, vec![("content-type", "text/plain")], b"BODY-OK");
+        let (status, body, trailers) = round_trip(resp, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"BODY-OK");
+        assert!(trailers.is_empty(), "got unexpected trailers {trailers:?}");
+    }
+
+    /// PV-6 regression pin: the no-trailers EMPTY-body path keeps its
+    /// `end_of_stream = true` HEADERS frame.
+    #[tokio::test]
+    async fn no_trailers_empty_body_is_unchanged() {
+        let resp = synth_response(204, vec![], b"");
+        let (status, body, trailers) = round_trip(resp, None).await;
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
+        assert!(trailers.is_empty(), "got unexpected trailers {trailers:?}");
+    }
+
+    /// PV-3 rows 10-12: upstream Envoy forwards `content-length`,
+    /// `te: trailers` and `host` inside a trailer block VERBATIM, and `h2`'s
+    /// send-side `check_headers` permits all three. This pins that we do NOT
+    /// strip them (D-PLAN-4).
+    #[tokio::test]
+    async fn trailer_names_envoy_forwards_are_not_stripped() {
+        let resp = synth_response(200, vec![("content-type", "text/plain")], b"BODY-OK");
+        let (_status, _body, trailers) = round_trip(
+            resp,
+            Some(vec![
+                ("content-length".to_string(), "7".to_string()),
+                ("te".to_string(), "trailers".to_string()),
+                ("host".to_string(), "example.com".to_string()),
+            ]),
+        )
+        .await;
+        assert_eq!(sorted(trailers).len(), 3);
+    }
+
+    /// Duplicate trailer names must BOTH reach the wire (upstream Envoy
+    /// preserves them — PV-3 row 5). `HeaderMap::append`, not `insert`.
+    #[tokio::test]
+    async fn duplicate_trailer_names_are_both_emitted() {
+        let resp = synth_response(200, vec![("content-type", "text/plain")], b"BODY-OK");
+        let (_status, _body, trailers) = round_trip(
+            resp,
+            Some(vec![
+                ("x-multi".to_string(), "one".to_string()),
+                ("x-multi".to_string(), "two".to_string()),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            sorted(trailers),
+            vec![
+                ("x-multi".to_string(), "one".to_string()),
+                ("x-multi".to_string(), "two".to_string()),
+            ]
+        );
     }
 }

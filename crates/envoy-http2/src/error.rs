@@ -29,6 +29,16 @@ pub enum Http2Error {
         source: h2::Error,
     },
 
+    /// Writing the downstream trailer block via `h2::SendStream::send_trailers`
+    /// failed. Distinct from `H2BodyRead` — whose name is already a misnomer
+    /// when applied to a body WRITE — so a trailer failure is attributable
+    /// without widening that misnomer further. Phase 111.
+    #[error("HTTP/2 trailer send failed: {source}")]
+    H2SendTrailers {
+        #[source]
+        source: h2::Error,
+    },
+
     /// The H2 request carried no `:authority` pseudo-header. envoy-rust's HCM
     /// route-walk requires `Host:` (synthesized from `:authority`) per
     /// cross-sub-phase architectural rule 3.

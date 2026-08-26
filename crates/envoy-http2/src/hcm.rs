@@ -1040,7 +1040,9 @@ async fn finalize_h2_stream(
     let response_headers_for_log_owned: Vec<(String, String)> = resp.headers.clone();
     let response_headers_for_log: &[(String, String)] = &response_headers_for_log_owned;
 
-    let send_result = send_envoy_response(send_response, resp).await;
+    // Phase 111 Task 1: the trailer channel exists but is not yet fed —
+    // Task 3 threads the upstream trailers into this argument.
+    let send_result = send_envoy_response(send_response, resp, None).await;
 
     // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
     // on the H2 path. `response_status_for_log` is a local derived post-encode
