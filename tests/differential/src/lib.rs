@@ -3616,6 +3616,26 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let h2_close_backend_port_str = _h2_close_backend.as_ref().map(|b| b.port().to_string());
 
+    // Phase 111: the trailer-emitting upstream for fixture 0090. Distinct from
+    // {{HTTP2_BACKEND_PORT}} (the plain echo backend) — the trailer block is a
+    // spawn-time MODE on the same helper binary, so a fixture selects it by
+    // token rather than by driver.
+    let needs_h2_trailers_backend =
+        scan_needs_marker(&backend_scan_sources, "HTTP2_TRAILERS_BACKEND_PORT");
+    // This binding is the child process's keep-alive: dropping it kills the
+    // backend, so it lives beside its siblings rather than later.
+    let _h2_trailers_backend: Option<crate::backend::Http2TrailersBackend> =
+        if needs_h2_trailers_backend {
+            Some(
+                crate::backend::Http2TrailersBackend::spawn()
+                    .await
+                    .context("spawning Http2TrailersBackend")?,
+            )
+        } else {
+            None
+        };
+    let h2_trailers_backend_port_str = _h2_trailers_backend.as_ref().map(|b| b.port().to_string());
+
     // 68 (ADR-0137 PV-2): a hermetic REFUSED port — reserve an ephemeral port
     // and spawn NO listener, so both proxies get ECONNREFUSED on the TCP HC
     // probe. `reserve_port` skips ports already handed out to the proxies, so
@@ -3665,6 +3685,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
             v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
         }
+        // Phase 111: the trailer-emitting backend port.
+        if let Some(tp) = h2_trailers_backend_port_str.as_deref() {
+            v.push(("HTTP2_TRAILERS_BACKEND_PORT", tp.to_string()));
+        }
         // 68 (ADR-0137 PV-2): the hermetic refused port (no listener).
         if let Some(dp) = dead_backend_port_str.as_deref() {
             v.push(("DEAD_BACKEND_PORT", dp.to_string()));
@@ -3677,6 +3701,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
             || h2_close_backend_port_str.is_some()
+            // Phase 111: WITHOUT this arm the port token renders but
+            // {{BACKEND_HOST}} does not, and the fixture fails with an
+            // unsubstituted token reaching the config parser rather than with a
+            // trailer mismatch. Both sides need it.
+            || h2_trailers_backend_port_str.is_some()
             || dead_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
@@ -3766,6 +3795,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
             v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
         }
+        // Phase 111: the trailer-emitting backend port.
+        if let Some(tp) = h2_trailers_backend_port_str.as_deref() {
+            v.push(("HTTP2_TRAILERS_BACKEND_PORT", tp.to_string()));
+        }
         // 68 (ADR-0137 PV-2): the hermetic refused port (no listener).
         if let Some(dp) = dead_backend_port_str.as_deref() {
             v.push(("DEAD_BACKEND_PORT", dp.to_string()));
@@ -3778,6 +3811,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
             || h2_close_backend_port_str.is_some()
+            // Phase 111: WITHOUT this arm the port token renders but
+            // {{BACKEND_HOST}} does not, and the fixture fails with an
+            // unsubstituted token reaching the config parser rather than with a
+            // trailer mismatch. Both sides need it.
+            || h2_trailers_backend_port_str.is_some()
             || dead_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));

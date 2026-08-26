@@ -582,3 +582,44 @@ regression, and no test was weakened.**
 171 = 165 (post-Task-6) + the 6 new tests. `cargo build --workspace
 --all-targets`, `cargo fmt --all -- --check` and `cargo clippy -p differential
 --all-targets --all-features -- -D warnings` all clean.
+
+---
+
+## Task 8 — `{{HTTP2_TRAILERS_BACKEND_PORT}}` fixture-token plumbing ✅
+
+**Files:** `tests/differential/src/lib.rs`.
+
+**Step 1 — scan + spawn + port binding**, placed beside its `H2_CLOSE_BACKEND_PORT`
+sibling. The `_h2_trailers_backend` binding is the child process's keep-alive —
+dropping it kills the backend — so it sits with its siblings rather than later,
+and the comment at the site says so.
+
+**Step 2 — FOUR substitution edits, not two.** This is the trap the handoff
+names, so it was verified by COUNT rather than by inspection:
+
+```
+$ grep -c 'HTTP2_TRAILERS_BACKEND_PORT'          tests/differential/src/lib.rs
+3     # = 1 scan marker + 2 kv-push sites (upstream side, subject side)
+$ grep -c 'h2_trailers_backend_port_str.is_some()' tests/differential/src/lib.rs
+2     # = the two BACKEND_HOST guard chains, one per proxy side
+```
+
+Both `.push((\"HTTP2_TRAILERS_BACKEND_PORT\", …))` blocks and both `.is_some()`
+guard arms were applied via a replacement asserted to match **exactly twice**,
+so a single-side edit could not pass silently. Missing either guard is the quiet
+failure mode: the port token renders, `{{BACKEND_HOST}}` does not, and the
+fixture then fails with an unsubstituted `{{…}}` reaching the config parser
+instead of with a trailer mismatch — a comment at the site records that symptom.
+
+**Step 3 — verification.** There is deliberately no unit test for the token
+itself; fixture `0090` in Task 9 is its real test.
+
+```
+$ cargo build --workspace --all-targets      # clean
+$ cargo test -p differential --lib --no-fail-fast
+test result: ok. 171 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+```
+
+Unchanged at 171 — this task adds no test, and nothing regressed.
+`cargo fmt --all -- --check` and `cargo clippy -p differential --all-targets
+--all-features -- -D warnings` clean.
