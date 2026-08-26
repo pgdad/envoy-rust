@@ -1004,8 +1004,9 @@ async fn finalize_h2_stream(
     mut resp: Response,
     // Phase 111: the upstream response's trailer block, forwarded verbatim to
     // the downstream client. `None` on every locally-generated response
-    // (D-PLAN-5).
-    trailers: crate::TrailerBlock,
+    // (D-PLAN-5) — and CLEARED below when an encode-side filter replaces the
+    // response wholesale.
+    mut trailers: crate::TrailerBlock,
     req_arrival_instant: Instant,
     req_arrival_systime: SystemTime,
     envoy_req: &Request,
@@ -1070,6 +1071,15 @@ async fn finalize_h2_stream(
             // encode-side wiring). No phase-11 filter takes this path, but future
             // encode-side-short-circuiting H2 filters inherit it.
             crate::response::decorate_filter_synth_response_h2(&mut resp);
+            // Phase 111 D-PLAN-5: the filter REPLACED the response, so the
+            // upstream's trailer block no longer describes what is being sent.
+            // This clear is NOT redundant with the rebuild above: under
+            // D-PLAN-2 the trailers ride ALONGSIDE `resp`, so rebuilding `resp`
+            // as a fresh literal does not touch them — the alongside design's
+            // inverse hazard. SPEC non-goal 6: trailers on locally-generated
+            // replies are out of scope and upstream's behaviour there is
+            // unmeasured.
+            trailers = None;
         }
     }
 
@@ -5398,6 +5408,106 @@ static_resources:
             })),
             runtime: Arc::new(RuntimeSnapshot::default()),
         })
+    }
+
+    /// Phase 111: `synth_h2_hcm_config_with_pipeline`'s PROXYING sibling — the
+    /// single route is a `RouteAction::Route` to the "backend" cluster instead
+    /// of a `DirectResponse`, so the request actually reaches an upstream and
+    /// can pick up a trailer block on the way back. Needed because Task 4's
+    /// hazard only exists when a REAL upstream response's trailers meet an
+    /// encode-side filter that replaces that response.
+    async fn synth_h2_hcm_config_proxy_with_pipeline(
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+        pipeline: Arc<envoy_filter::FilterPipeline>,
+    ) -> Arc<Http1HCMConfig> {
+        use envoy_http1::{HCMConfig, HCMStats};
+        Arc::new(HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: Arc::new(
+                HCMStats::register(&envoy_stats::StatsRegistry::new(), "test")
+                    .expect("HCMStats register"),
+            ),
+            access_log: vec![],
+            filter_pipeline: pipeline,
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                            runtime_fraction: None,
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+            runtime: Arc::new(RuntimeSnapshot::default()),
+        })
+    }
+
+    /// Phase 111 D-PLAN-5: an encode-side filter that REPLACES the response
+    /// must not inherit the upstream's trailer block.
+    ///
+    /// This is the alongside design's INVERSE hazard. A field on `Response`
+    /// would be silently DROPPED by the `StopAndSend` arm's fresh-literal
+    /// rebuild; a separate local is silently KEPT — so a filter-replaced
+    /// response would carry trailers the upstream never sent for it. Neither
+    /// direction is caught by any gate: none of the 89 existing differential
+    /// fixtures has a trailer at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_encode_filter_stop_and_send_drops_upstream_trailers() {
+        let (upstream_addr, _upstream_handle) =
+            spawn_upstream_h2_server_with_trailers(b"BODY-OK", &[("x-trail-a", "alpha")]).await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        // Reuse the in-tree StopAndSend encode fixture — the same one
+        // `h2_stop_and_send_at_encode_substitutes_wire_response` installs. No
+        // change to `crates/envoy-filter/` (SPEC non-goal 3).
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 418,
+            reason: None,
+            headers: vec![("content-length".to_string(), "7".to_string())],
+            body: bytes::Bytes::from_static(b"teapot\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = synth_h2_hcm_config_proxy_with_pipeline(cluster_mgr, pipeline).await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        let observed = drive_one_h2_request_through_hcm(addr, "/").await;
+
+        assert_eq!(
+            observed.status, 418,
+            "the encode filter must have replaced the upstream response"
+        );
+        assert_eq!(
+            observed.body, b"teapot\n",
+            "the replacement body, not the upstream's"
+        );
+        assert!(
+            observed.trailers.is_empty(),
+            "a filter-replaced response must carry no upstream trailers, got {:?}",
+            observed.trailers
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -292,3 +292,97 @@ $ cargo build --workspace --all-targets
 widening and the struct field stayed crate-local — a `-p envoy-http2` build alone
 would not. `cargo fmt --all -- --check` clean;
 `cargo clippy -p envoy-http2 --all-targets --all-features -- -D warnings` clean.
+
+---
+
+## Task 4 — Locally-generated responses carry NO trailers ✅
+
+**Files:** `crates/envoy-http2/src/hcm.rs` (the encode-filter `StopAndSend` arm,
+plus a new proxying test-config helper).
+
+**Step 1 — the hazard, confirmed by reading the arm rather than by argument.**
+The arm rebuilds `resp` as a fresh `Response { status, reason, headers, body }`
+literal from the filter's replacement. Under D-PLAN-2 the trailers live in a
+SEPARATE local, so that rebuild does **not** touch them.
+
+**Step 2 — the in-tree `StopAndSend` fixture EXISTS** (the plan left this
+unresolved on purpose). `envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode`
+and `FilterPipeline::test_from_instances` are already used by
+`h2_stop_and_send_at_encode_substitutes_wire_response`, so **no new filter was
+written and `crates/envoy-filter/` was not touched** (SPEC non-goal 3). What was
+missing is a config helper: the only in-tree helper taking a pipeline
+(`synth_h2_hcm_config_with_pipeline`) routes to a `DirectResponse`, and this
+hazard only exists when a REAL upstream response's trailers meet the filter. A
+proxying sibling, `synth_h2_hcm_config_proxy_with_pipeline`, was added.
+
+**Step 3 — RED, and the hazard is REAL, not theoretical:**
+
+```
+$ cargo test -p envoy-http2 --lib stop_and_send_drops_upstream_trailers
+thread 'hcm::tests::h2_encode_filter_stop_and_send_drops_upstream_trailers' panicked at
+  crates/envoy-http2/src/hcm.rs:5496:9:
+a filter-replaced response must carry no upstream trailers, got [("x-trail-a", "alpha")]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out
+```
+
+The upstream's `x-trail-a: alpha` genuinely leaked onto a `418 teapot` the
+upstream never sent. **Invisible to all 89 existing differential fixtures**,
+because not one of them has a trailer at all.
+
+**Step 4 — the clear**, with a comment stating explicitly why it is NOT redundant
+with the rebuild directly above it. The `finalize_h2_stream` parameter regains
+its `mut` at this commit (deferred from Task 3 to keep that commit
+warning-free).
+
+**Step 5 — GREEN.**
+
+```
+$ cargo test -p envoy-http2
+test result: ok. 124 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+```
+
+`cargo fmt --all -- --check` clean; `cargo clippy -p envoy-http2 --all-targets
+--all-features -- -D warnings` clean.
+
+**Step 6 — MUTATION CHECK, in a scratch worktree, with an unmutated control.**
+
+The clear is a one-line guard, so it gets proved non-vacuous. The worktree was
+created `--detach` at `HEAD` and then **SEEDED** with the working-tree `hcm.rs`
+— the clear was not yet committed, and an unseeded worktree would have tested
+the PRE-clear tree, whose "RED" would have proved nothing.
+
+```
+$ grep -c 'trailers = None;'  crates/envoy-http2/src/hcm.rs     # target, EXACTLY once
+1
+$ grep -c 'trailers: None,'   crates/envoy-http2/src/hcm.rs     # the struct-FIELD form, must NOT be hit
+4
+```
+
+That second count is the point of the check the plan demands: a `sed` on the
+wrong spelling would have hit four `H2AttemptResult` literals as well and faked a
+result. The `sed` is anchored to `^            trailers = None;$`.
+
+**CONTROL (unmutated, same worktree):**
+
+```
+   Compiling envoy-http2 v0.0.0 (…/scratchpad/mut-111-t4/crates/envoy-http2)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 124 filtered out
+```
+
+**MUTATED** (`trailers = None;` → `// MUTATED: the clear removed`; target count
+0, marker count 1; `touch crates/envoy-http2/src/lib.rs` to force a real
+rebuild):
+
+```
+   Compiling envoy-http2 v0.0.0 (…/scratchpad/mut-111-t4/crates/envoy-http2)
+thread 'hcm::tests::h2_encode_filter_stop_and_send_drops_upstream_trailers' panicked at
+  crates/envoy-http2/src/hcm.rs:5506:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out
+```
+
+All four gates the traps ledger requires are met: a `Compiling envoy-http2` line
+(so no stale binary FALSE-PASSED), a `test result:` line (so it RAN — a compile
+error is not a mutation RED), a FAILED verdict, and a GREEN control from the same
+worktree. The scratch worktree was then removed and only that one; the four
+sibling `.claude/worktrees/agent-*` worktrees belong to a parallel workstream and
+were left alone. Main tree re-checked afterwards: target still exactly 1.
