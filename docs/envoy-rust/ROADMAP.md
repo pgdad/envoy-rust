@@ -123,6 +123,10 @@ Active health checks HTTP/TCP/gRPC/custom, outlier detection variants, circuit b
 
 quinn transport, downstream H3 listener, upstream H3 cluster, `h3spec` gate.
 
+| id | title | depends-on | status | sub-phases | summary |
+|---|---|---|---|---|---|
+| 112 | HTTP/3 + QUIC family OPENER, and the family's FIRST BLOCKING PREREQUISITE: TLS ALPN negotiation (`common_tls_context.alpn_protocols`) on BOTH the downstream (`rustls::ServerConfig`) and upstream (`rustls::ClientConfig`) sides — the one of ADR-0177's three measured HTTP/3 blockers that is fully TRUE today AND independent of QUIC, since QUIC mandates ALPN `h3`. MEASURED at the pick on BOTH proxies against the pinned v1.33.0 image: upstream Envoy negotiates `h2` and `http/1.1` from a stock TLS `tcp_proxy` listener, leaves the protocol unnegotiated on a mismatch WITHOUT a `no_application_protocol` alert, and negotiates nothing once the single `alpn_protocols` line is removed; envoy-rust is BOOT-FATAL on the same config because `CommonTlsContext` carries `deny_unknown_fields`. Adds NO UDP, NO QUIC, NO `quinn`, NO new harness driver and NO new dependency; witnessed by NEW fixture `0091-tls-alpn` through the EXISTING `Driver::TlsTcp` plus a new `expected_alpn` rule reusing the handshake accessor `drive_tls` already calls for `expected_cn`. Does NOT lift `ConfigError::Http2OverTlsNotSupported` (CF-112-1). | 03.1 03.2 | planned | — | fixture `0091-tls-alpn` green cross-proxy on the four measured ALPN cells plus a server-preference cell; the `BEHAVIOR_CONTRACT.md` ALPN section populated; stop-condition leg (iii) moves from TWO zero-row families to ONE |
+
 ### gRPC family
 
 gRPC bridge, gRPC-Web, gRPC-JSON transcoding, interop conformance.
