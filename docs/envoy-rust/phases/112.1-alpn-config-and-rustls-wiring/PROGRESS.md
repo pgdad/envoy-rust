@@ -560,3 +560,309 @@ recorded in `ADR-0186`, not deferred work.
 `ADR-0127`: an implementation and its verification are never the same context).
 It runs `superpowers:verification-before-completion` over the full §7.5 six-gate
 definition and quotes every command's output into this file.
+
+---
+
+# §5 state-4 — THE §7.5 VERIFICATION GATE
+
+> **A separate session from the implementation**, per §5.1 and `ADR-0127`: the
+> context that wrote an artifact must not grade it. This section records what
+> the gate actually printed. Where a landed artifact predicted a different
+> number, the difference is stated and adjudicated — see `ADR-0187`.
+>
+> **Session start:** `git status --porcelain` empty; branch `main`; HEAD
+> `c86afd543befabd23f05739f791b100df0d7d48e` (the state-3 implementation);
+> `ls stop` → `No such file or directory`. The four `.claude/worktrees/agent-*`
+> worktrees belong to a PARALLEL WORKSTREAM and were left untouched throughout.
+>
+> ⚠ **The `next-prompt.txt` handoff this session was launched with was STALE.**
+> It instructed the session to perform the state-3 implementation and asserted
+> HEAD was `3a2cf93`. On disk, HEAD was already `c86afd5`, `STATE.md` read
+> **state-3-COMPLETE**, and its `## Next expected skill` named the state-4
+> gate. **Disk was treated as authoritative** — a handoff's claims are claims.
+> The state-3 CI record the previous session left outstanding was landed first
+> as `1dca192` (numstat exactly `2 0`) before any state-4 work began.
+
+---
+
+## Gate (e) — the five workspace commands, run locally from a clean tree
+
+```
+$ cargo build --workspace --all-targets
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+   Compiling http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s
+BUILD_EXIT=0
+```
+`Compiling` lines = **5**, `^warning` = **0**, `^error` = **0**. A non-zero
+`Compiling` count matters: exit 0 with zero of them would be a cached no-op.
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.97s
+CLIPPY_EXIT=0
+```
+**Zero findings over 13 `Checking` lines** — clippy prints `Checking`, not
+`Compiling`, and exit 0 with zero of them would likewise be a cached no-op.
+
+```
+$ cargo fmt --all -- --check
+FMT_EXIT=0
+```
+The whole log is **11 bytes** — the exit marker and nothing else, i.e. a zero
+diff.
+
+```
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+DENY_EXIT=0
+```
+Gated on the four-ok line, ANSI-stripped first because that line is
+colour-coded and a naive grep false-zeroes it. The accompanying
+`unmatched license allowance` notes (e.g. `"Zlib"`) are the normal
+`license-not-encountered` warnings on a green run, not findings.
+
+```
+$ cargo test --workspace --no-fail-fast          # sweep 1
+binaries=167 passed=2259 failed=6   identity(passed+failed)=2265
+$ cargo test --workspace --no-fail-fast          # sweep 2
+binaries=167 passed=2258 failed=7   identity(passed+failed)=2265
+```
+
+**The identity is 2265 in both sweeps and equals CI's `passed` exactly.**
+Only `passed + failed` is invariant; `passed` alone is not, because the local
+RED set varies run to run. Counts come from matching
+`test result: (ok|FAILED)` — never bare `ok`, which makes `failed=0` true by
+construction — with awk fields **derived from a real matched line** ($4, $6).
+
+---
+
+## Gate (e), continued — the local RED set, classified by ISOLATION ONLY
+
+Failing names were extracted from the `---- <name> stdout ----` markers, never
+by indentation, with output redirected to a file rather than piped through
+`tail` (which truncates the `failures:` block).
+
+| sweep | RED set |
+|---|---|
+| 1 (6) | the five core + `access_log_h2_rf_overflow` |
+| 2 (7) | the five core + `access_log_status_code_filter` + `network_filter_rbac_allow_fixture` |
+
+Every member was then re-run **ALONE with a 30-second settle gap before it**,
+because back-to-back Docker-spawning runs manufacture a false
+`FAILS-IN-ISOLATION`.
+
+```
+access_log_h2_rcd_upstream_reset    FAILED. 0 passed; 1 failed   (2.73s)   -> CORE
+access_log_h2_uc_upstream_reset     FAILED. 0 passed; 1 failed   (2.70s)   -> CORE
+access_log_rcd_upstream_reset       FAILED. 0 passed; 1 failed   (2.75s)   -> CORE
+access_log_rf_upstream_reset        FAILED. 0 passed; 1 failed   (2.77s)   -> CORE
+admin_config_dump_server_info       FAILED. 0 passed; 1 failed   (2.76s)   -> CORE
+access_log_h2_rf_overflow           ok. 1 passed; 0 failed       (1.25s)   -> parallel-load flake
+access_log_status_code_filter       ok. 1 passed; 0 failed      (13.26s)   -> parallel-load flake
+network_filter_rbac_allow           ok. 1 passed; 0 failed       (2.40s)   -> parallel-load flake
+```
+
+**The stable core is FIVE — unchanged from the record — and it is the exact
+intersection of the two sweeps.** Its determinism in isolation IS this host's
+signature, not a regression; all five are green in CI. The three varying
+members each pass alone, so none is a new core member. **No test was
+weakened and nothing was fixed.**
+
+⚠ **A recorded trap fired and is worth re-recording.** The first isolation
+attempt at `network_filter_rbac_allow_fixture` returned **exit 101 with NO
+`test result` line at all** — cargo rejected the target and listed the
+available ones. That name is the **test FUNCTION**; the **runner FILE** is
+`network_filter_rbac_allow.rs`. Gating on the existence of the `test result`
+line rather than on the exit code is what caught it; gating on the exit code
+would have recorded a false `FAILS-IN-ISOLATION`.
+
+---
+
+## Gate (a) — new/changed differential fixtures: NONE, vacuous BY DESIGN
+
+`112.1` ships **no new differential fixture**. `112.1/SPEC.md` §4 assigns the
+witness to sibling `112.2` (`0091-tls-alpn`, `0092-tls-alpn-server-preference`,
+and the cell-6 control on `0004-tls-downstream`), mirroring `ADR-0178`'s
+`110.1` and `ADR-0176`'s `109.1`. `tests/` was not touched this sub-phase.
+**Gate (a) passes vacuously and is recorded as vacuous rather than as a pass.**
+
+## Gate (b) — all pre-existing differential fixtures still green. **THE LOAD-BEARING GATE**
+
+`112.1/SPEC.md` §4 makes this the gate that carries the weight, because the
+sub-phase rewrites `DownstreamTls::accept`, the accept path shared by every TLS
+listener in the tree.
+
+```
+differential runner files on disk : 90
+fixture dirs on disk              : 90
+runners MISSING from the CI log   : 0
+CI whole-log `test result: FAILED`: 0
+```
+
+**90 of 90, zero missing.** The census is driven from the **runner FILE names**
+(`ls tests/differential/tests/*.rs`), not the test-function names, which differ
+for many fixtures. The three fixtures that exercise the rewritten accept path
+are among them and each shows a `Running` line:
+
+```
+tls_downstream : 1     tls_upstream : 1     tls_sni : 1
+```
+
+This gate cannot pass vacuously: the three already passed before the rewrite,
+so any change in the accept path is directly observable in them.
+
+## Gate (c) — conformance suites
+
+```
+CI:    Running tests/h2spec_runner.rs
+       test h2spec_pass_rate_gate ... ok
+       test result: ok. 3 passed; 0 failed; ... finished in 0.16s
+CI control: `h2spec not found` = 0  -> the suite GENUINELY RAN (ADR-0163)
+```
+`known-failures.txt` unchanged: **21** lines, md5
+`19cd44d86a8b15d825f76c6e7b265e65`. It was not trimmed.
+
+**The local run is DEMONSTRABLY VACUOUS on this host and was re-measured to
+prove it**, so that the CI evidence above is not mistaken for local evidence:
+
+```
+$ cargo test -p h2spec-conformance --test h2spec_runner -- --nocapture
+h2spec_runner: h2spec not found — skipping locally
+test result: ok. 3 passed; 0 failed; ... finished in 0.00s
+H2SPEC_LOCAL_EXIT=0
+```
+Exit 0, three "passes", and the skip line is invisible without `--nocapture`.
+The `0.00s` runtime on a conformance suite is the tell. **CI is authoritative.**
+
+## Gate (d) — fuzzing
+
+**`112.1` adds NO new fuzz target** — only a corpus seed for the existing
+`parse_bootstrap` target — so no new `ci.yml` step was owed, and the existing
+step covers it. The seed is genuinely in the tree and genuinely not ignored:
+
+```
+git ls-files …/corpus/parse_bootstrap/tls_downstream_alpn.yaml -> tracked
+git check-ignore (PLAIN form) -> EXIT=1  (NOT ignored)
+seed length: 43 lines        tracked seed census: 67
+```
+
+The CI fuzz job (`success`, 13 steps, real runner) ran **5** targets:
+
+```
+Done   180288 runs in 31 second
+Done  4575148 runs in 31 second
+Done  5293078 runs in 31 second
+Done  2720132 runs in 31 second
+Done 19514105 runs in 31 second
+ERROR: libFuzzer      = 0
+Test unit written to  = 0      (no crash artifacts)
+```
+
+## Gate (f) — REVIEW.md
+
+**Not this session's.** Gate (f) is closed by the §5 state-5 code review.
+
+---
+
+## CI on the state-3 implementation — CONFIRMED, and the identity corrected
+
+```
+run 33522915551   conclusion success   attempt 1   total_count: 1
+  build + test + lint : 15 steps, runner GitHub Actions 1000005661, success
+  fuzz                : 13 steps, runner GitHub Actions 1000005660, success
+identity: binaries=167 passed=2265 failed=0
+```
+Not the `runner_name:""` + `steps:0` starvation shape. Counted from the
+ANSI-stripped job log (raw **418800** bytes, so not the ~120-byte out-of-repo
+`gh` error trap). Controls: `test result: FAILED` = **0**; `Running ` = **151**
+after stripping; `h2spec not found` = **0**; `cargo deny`'s four-ok line
+present.
+
+**The identity MOVED, as a code commit requires — but by +13, to 2265, not the
++14 to 2266 that `PLAN.md` M-R13, `ADR-0185` and `ADR-0186` all predicted.
+The prediction was wrong; the run was not.** `ADR-0187` records it.
+
+| | at `3a2cf93` | at `c86afd5` | Δ |
+|---|---|---|---|
+| `envoy-config` lib | **709** | **716** | **+7** |
+| `envoy-tls` lib | **16** | **22** | **+6** |
+| workspace identity | 2252 | **2265** | **+13** |
+
+**Two independent methods agree**, which is why the run is trusted over the
+prediction:
+
+1. the per-binary passed-count **multiset** of this CI log diffed against the
+   baseline CI log for `28e7f4e` (run 33388511508, re-derived here at
+   `binaries=167 passed=2252 failed=0`) — exactly two binaries move,
+   `709 → 716` and `16 → 22`, both with `0 ignored`;
+2. a **source census** of test attributes at each commit — `envoy-config`
+   709 → 716, `envoy-tls` 16 → 22. (The `envoy-tls` census needs the pattern
+   `#\[(tokio::)?test` without a closing bracket: 21 of its 22 tests are
+   spelled `#[tokio::test(flavor = "multi_thread")]`, and a pattern anchored on
+   `]` reads **1**.)
+
+**The root cause is a DOUBLE COUNT, not a lost test.** Task 1 RENAMED
+`rejects_unknown_field_in_common_tls_context` to
+`accepts_alpn_protocols_in_common_tls_context` — present at `3a2cf93`, absent
+at `c86afd5` — and a rename adds zero. Both halves of "708 + 8" are individually
+real: `8` is the count of tests bearing ALPN names (Task 3's filtered run reads
+`8 passed … 708 filtered out`, which sums to 716), and `708` is the count the
+filter did NOT match. **The error is that they were ADDED, which counts the
+renamed test on both sides.** The correct decomposition is **709 + 7**.
+`binaries` correctly stayed at **167**: no new test binary was added.
+
+---
+
+## Stop condition — re-derived from disk this session. ALL THREE LEGS FALSE
+
+No `stop` file was created; `ls stop` → `No such file or directory`.
+
+- **Leg (i) FALSE** — **120** rows / **117** `done` / **1** `in-progress` /
+  **2** `planned`; buckets sum to the row count (117+1+2 = 120). Status is
+  field **4** on a `' | '` split driven from the `^\| [0-9]` prefix. Control:
+  the forbidden `NF == 6` form reads **118**, dropping exactly the two rows
+  (38, 39) that carry unescaped in-cell pipes — a believable near-miss, which
+  is why it is not used. Those rows were NOT "fixed".
+- **Leg (ii) FALSE** — **14** crates, none of `envoy-http3`/`envoy-grpc`/
+  `envoy-wasm`/`envoy-protos`/`envoy-runtime`; `quinn`/`wasmtime`/`tonic`/
+  `opentelemetry`/`prost` = **0** across all **15** manifests, against a
+  **positive control run with the identical invocation**: `tokio` = **12** of
+  15, so the zeros are real. `tests/conformance/` holds only `h2spec/`.
+- **Leg (iii) FALSE** — **11** `### ` family headings, of which one
+  (`### WASM host family`) carries **ZERO** rows. Driven from a single
+  `/^### /` rule; the eleven read 10/5/3/14/3/4/6/29/6/0/13 with **27** rows
+  before the first heading, summing to 120.
+
+---
+
+## Carry-forwards — banked, not consumed (§6.3; `ADR-0165`)
+
+**Nothing was fixed, and a verification state is bound by §6.3 as much as any
+other.** The entire banked set carries forward INTACT: phase 111's
+M-1…M-15 / N-1…N-13 and CF-111-1…CF-111-9, the `110.2` / `110.1` / `109.2` /
+`109.1` / `108.2` REVIEW sets, CF-110-1…9, CF-109-1/2/3, CF-108-1/2/3, CF-76-1,
+CF-75-2/3/4/5/6, CF-72-2/CF-75-1, M71-6, CF-74-1/2/3/4/6, CF-73-1 and the
+HTTP-filters-family (1)-(4). **CF-112-1/2/3/4/6/7 carry forward; CF-112-5 stays
+CLOSED.** This session opened **no new carry-forward**: the identity correction
+is a documentation figure, recorded in `ADR-0187`, not deferred work.
+
+`ROADMAP.md` was **deliberately untouched** — row `112.1` flips at its state-6
+close-out, not here.
+
+---
+
+## Verdict
+
+**§7.5 gate: (a) vacuous by design, (b) PASS, (c) PASS, (d) PASS, (e) PASS.
+(f) is state 5's.** `112.1` is code-complete and verified.
+
+## Next state
+
+**§5 state 5 — the code review — is a SEPARATE session** (§5.1; `ADR-0127`:
+the context that graded an artifact must not review it). It runs
+`superpowers:requesting-code-review` and outputs `REVIEW.md`, closing gate (f).
+A state-5 review writes no code, so **the CI identity must NOT move from
+`binaries=167 passed=2265 failed=0`.**
