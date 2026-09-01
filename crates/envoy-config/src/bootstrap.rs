@@ -1188,6 +1188,12 @@ pub struct CommonTlsContext {
     pub tls_certificates: Vec<TlsCertificate>,
     #[serde(default)]
     pub validation_context: Option<CertificateValidationContext>,
+    /// 112.1 D1: ALPN protocol identifiers, most preferred first. Honored on
+    /// BOTH sides because this struct is the type of `DownstreamTlsContext`
+    /// (`rustls::ServerConfig`) and `UpstreamTlsContext` (`rustls::ClientConfig`).
+    /// Absent or empty means "do not advertise ALPN" (D3).
+    #[serde(default)]
+    pub alpn_protocols: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -8850,10 +8856,12 @@ static_resources:
     }
 
     #[test]
-    fn rejects_unknown_field_in_common_tls_context() {
-        // alpn_protocols is a phase-04 surface; phase 03 fixtures do not
-        // include it (SPEC §6 signpost 14). deny_unknown_fields on
-        // CommonTlsContext rejects it.
+    fn accepts_alpn_protocols_in_common_tls_context() {
+        // 112.1 D1 INVERTS this test. It was written in phase 03 to pin
+        // `deny_unknown_fields` REJECTING `alpn_protocols`, and its own comment
+        // conceded the point ("alpn_protocols is a phase-04 surface"). The
+        // field now exists, so the same document must PARSE, and the parsed
+        // value must be the configured list.
         let yaml = r#"
 static_resources:
   listeners:
@@ -8877,11 +8885,18 @@ static_resources:
           filters: []
   clusters: []
 "#;
-        let err = crate::parse_bootstrap(yaml).expect_err("must reject unknown field");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("alpn_protocols") || msg.contains("unknown field"),
-            "expected unknown-field error, got: {msg}",
+        let bs = crate::parse_bootstrap(yaml).expect("alpn_protocols must now PARSE");
+        let listener = &bs.static_resources.listeners[0];
+        let ts = listener.filter_chains[0]
+            .transport_socket
+            .as_ref()
+            .expect("transport_socket");
+        let crate::TransportSocketTypedConfig::Downstream(ctx) = &ts.typed_config else {
+            panic!("expected DownstreamTlsContext");
+        };
+        assert_eq!(
+            ctx.common_tls_context.alpn_protocols,
+            vec!["h2".to_string()]
         );
     }
 

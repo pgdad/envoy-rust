@@ -144,6 +144,7 @@ mod pki {
                     },
                 }],
                 validation_context: None,
+                alpn_protocols: vec![],
             },
         }
     }
@@ -240,6 +241,7 @@ async fn rejects_empty_tls_certificates() {
         common_tls_context: envoy_config::CommonTlsContext {
             tls_certificates: vec![],
             validation_context: None,
+            alpn_protocols: vec![],
         },
     };
     let err = DownstreamTls::from_context(&ctx).expect_err("must reject");
@@ -459,6 +461,7 @@ mod upstream_pki {
                         inline_string: None,
                     },
                 }),
+                alpn_protocols: vec![],
             },
             sni: sni.to_string(),
         }

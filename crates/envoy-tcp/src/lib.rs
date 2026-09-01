@@ -1194,6 +1194,7 @@ admin:
                         inline_string: None,
                     },
                 }),
+                alpn_protocols: vec![],
             },
             sni: sni.to_string(),
         }
