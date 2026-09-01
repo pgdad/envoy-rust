@@ -8997,6 +8997,68 @@ static_resources:
         );
     }
 
+    /// 112.1: the downstream `alpn_protocols` of an already-parsed bootstrap.
+    fn ds_alpn_of(bs: &crate::Bootstrap) -> &[String] {
+        let ts = bs.static_resources.listeners[0].filter_chains[0]
+            .transport_socket
+            .as_ref()
+            .expect("transport_socket");
+        let crate::TransportSocketTypedConfig::Downstream(ctx) = &ts.typed_config else {
+            panic!("expected DownstreamTlsContext");
+        };
+        &ctx.common_tls_context.alpn_protocols
+    }
+
+    #[test]
+    fn alpn_protocols_defaults_to_empty_when_absent() {
+        let bs = crate::parse_bootstrap(&ds_bootstrap_with_alpn("")).expect("parse");
+        assert!(ds_alpn_of(&bs).is_empty(), "absent must default to empty");
+    }
+
+    #[test]
+    fn accepts_empty_alpn_protocols_list() {
+        // D4': upstream Envoy ACCEPTS `[]` (measured, exit 0).
+        let bs =
+            crate::parse_bootstrap(&ds_bootstrap_with_alpn("alpn_protocols: []")).expect("parse");
+        assert!(ds_alpn_of(&bs).is_empty());
+    }
+
+    #[test]
+    fn accepts_empty_and_duplicate_alpn_elements() {
+        // D4': upstream Envoy ACCEPTS `[""]`, `["h2",""]` and `["h2","h2"]`
+        // (all measured, exit 0). Rejecting them would manufacture a
+        // reject-direction divergence. CF-112-6 banks the runtime quirk.
+        let bs = crate::parse_bootstrap(&ds_bootstrap_with_alpn(
+            r#"alpn_protocols: ["h2", "", "h2"]"#,
+        ))
+        .expect("parse");
+        assert_eq!(
+            ds_alpn_of(&bs),
+            ["h2".to_string(), String::new(), "h2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_alpn_protocols_on_upstream_tls_context() {
+        // D2b: the field is on the SHARED CommonTlsContext, so the cluster
+        // side gains it in the same landing.
+        let bs = crate::parse_bootstrap(&us_bootstrap_with_alpn(
+            r#"alpn_protocols: ["h2", "http/1.1"]"#,
+        ))
+        .expect("parse");
+        let ts = bs.static_resources.clusters[0]
+            .transport_socket
+            .as_ref()
+            .expect("transport_socket");
+        let crate::TransportSocketTypedConfig::Upstream(ctx) = &ts.typed_config else {
+            panic!("expected UpstreamTlsContext");
+        };
+        assert_eq!(
+            ctx.common_tls_context.alpn_protocols,
+            ["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
+
     #[test]
     fn accepts_alpn_protocols_in_common_tls_context() {
         // 112.1 D1 INVERTS this test. It was written in phase 03 to pin
