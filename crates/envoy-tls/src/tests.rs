@@ -1216,3 +1216,50 @@ async fn alpn_client_offers_nothing_negotiates_none() {
     assert_eq!(s, None);
     assert_eq!(c, None);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_offers_configured_alpn_to_the_server() {
+    install_provider_once();
+    let pki = upstream_pki::build();
+
+    // A rustls server that DOES do ALPN, listing ONLY `h2`. It can select `h2`
+    // only if `UpstreamTls` actually put `h2` on the wire, so the server's
+    // post-handshake `alpn_protocol()` is a direct witness of the client offer.
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(StaticResolver(Arc::new(pki.server_certified_key)));
+    let mut server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        acceptor.accept(stream).await.expect("server handshake")
+    });
+
+    // The client lists `http/1.1` FIRST, but the server lists only `h2`, so
+    // `h2` must win — which proves BOTH names went out, not just the first.
+    let mut ctx = upstream_pki::us_context_with(&pki.ca_pem, "envoy-rust.test");
+    ctx.common_tls_context.alpn_protocols = vec!["http/1.1".to_string(), "h2".to_string()];
+    let upstream = UpstreamTls::from_context(&ctx).expect("upstream from_context");
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let client_tls = upstream.connect(stream).await.expect("upstream connect");
+    let server_tls = server_task.await.expect("task joins");
+
+    assert_eq!(
+        server_tls.get_ref().1.alpn_protocol(),
+        Some(&b"h2"[..]),
+        "server must have seen h2 in the client offer"
+    );
+    assert_eq!(
+        client_tls.get_ref().1.alpn_protocol(),
+        Some(&b"h2"[..]),
+        "client must agree on h2"
+    );
+}

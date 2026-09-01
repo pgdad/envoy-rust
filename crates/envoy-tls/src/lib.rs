@@ -361,9 +361,17 @@ impl UpstreamTls {
             })?;
         let ca_path = Path::new(ca_path_str);
         let roots = load_root_store(ca_path)?;
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        // 112.1 D2b/D7: offer the configured list verbatim, in the configured
+        // order. Empty means no ALPN extension is sent (D3).
+        config.alpn_protocols = cfg
+            .common_tls_context
+            .alpn_protocols
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
 
         let server_name = parse_dns_server_name(&cfg.sni)?;
         Ok(Self {
