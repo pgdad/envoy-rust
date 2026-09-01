@@ -3790,6 +3790,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                 }
                 match &ts.typed_config {
                     TransportSocketTypedConfig::Downstream(ctx) => {
+                        validate_alpn_protocols(&ctx.common_tls_context, "listener")?;
                         if ctx.common_tls_context.tls_certificates.is_empty() {
                             return Err(crate::ConfigError::EmptyTlsCertificates {
                                 side: "listener",
@@ -4184,6 +4185,7 @@ pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigErr
         }
         match &ts.typed_config {
             TransportSocketTypedConfig::Upstream(ctx) => {
+                validate_alpn_protocols(&ctx.common_tls_context, "cluster")?;
                 if !ctx.common_tls_context.tls_certificates.is_empty() {
                     return Err(crate::ConfigError::EmptyTlsCertificates { side: "cluster" });
                 }
@@ -5940,6 +5942,28 @@ impl Required {
             Self::InlineString => "inline_string",
         }
     }
+}
+
+/// 112.1 D4': reject an `alpn_protocols` element longer than 255 bytes and
+/// nothing else. RFC 7301 encodes each identifier with a single-octet length
+/// prefix, so 255 is the wire maximum; upstream Envoy v1.33.0 rejects exactly
+/// this case with `Invalid ALPN protocol string` and ACCEPTS the empty
+/// element, the duplicate element and the empty list. `side` is "listener" or
+/// "cluster" and only reaches the error message.
+fn validate_alpn_protocols(
+    ctx: &CommonTlsContext,
+    side: &'static str,
+) -> Result<(), crate::ConfigError> {
+    for (index, proto) in ctx.alpn_protocols.iter().enumerate() {
+        if proto.len() > 255 {
+            return Err(crate::ConfigError::InvalidAlpnProtocol {
+                side,
+                index,
+                len: proto.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `DataSource` against a per-callsite restriction.
@@ -8852,6 +8876,124 @@ static_resources:
         assert!(
             msg.contains("require_client_certificate") || msg.contains("unknown field"),
             "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    /// 112.1: build a minimal single-listener bootstrap whose
+    /// `DownstreamTlsContext.common_tls_context` carries `alpn_line` verbatim.
+    /// Pass `""` to omit the field entirely.
+    fn ds_bootstrap_with_alpn(alpn_line: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                {alpn_line}
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters: []
+  clusters: []
+"#
+        )
+    }
+
+    /// 112.1: the same, for a cluster-side `UpstreamTlsContext`. NOTE the
+    /// plaintext listener: a bootstrap with neither a listener nor an admin
+    /// endpoint is rejected `ConfigError::NoRuntime` before the cluster walk
+    /// is ever reached, which would make every assertion below vacuous.
+    fn us_bootstrap_with_alpn(alpn_line: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: backend.example.com
+          common_tls_context:
+            {alpn_line}
+            validation_context:
+              trusted_ca:
+                filename: /tmp/ca.pem
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#
+        )
+    }
+
+    #[test]
+    fn accepts_alpn_element_of_exactly_255_bytes() {
+        // D4': upstream accepts 254 and 255; only >255 is rejected.
+        let e = "a".repeat(255);
+        let yaml = ds_bootstrap_with_alpn(&format!("alpn_protocols: [\"{e}\"]"));
+        crate::parse_bootstrap(&yaml).expect("255 bytes must be ACCEPTED");
+    }
+
+    #[test]
+    fn rejects_alpn_element_longer_than_255_bytes_on_listener() {
+        let e = "a".repeat(256);
+        let yaml = ds_bootstrap_with_alpn(&format!("alpn_protocols: [\"{e}\"]"));
+        let err = crate::parse_bootstrap(&yaml).expect_err("256 bytes must be REJECTED");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidAlpnProtocol {
+                    side: "listener",
+                    index: 0,
+                    len: 256
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_alpn_element_longer_than_255_bytes_on_cluster() {
+        let e = "a".repeat(256);
+        let yaml = us_bootstrap_with_alpn(&format!("alpn_protocols: [\"h2\", \"{e}\"]"));
+        let err = crate::parse_bootstrap(&yaml).expect_err("256 bytes must be REJECTED");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidAlpnProtocol {
+                    side: "cluster",
+                    index: 1,
+                    len: 256
+                }
+            ),
+            "got {err:?}"
         );
     }
 

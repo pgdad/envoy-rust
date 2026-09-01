@@ -81,6 +81,19 @@ pub enum ConfigError {
     NoRuntime,
     #[error("bootstrap has {0} listeners; phase 01 supports at most one")]
     TooManyListeners(usize),
+    /// 112.1 D4': an `alpn_protocols` element longer than 255 bytes. Upstream
+    /// Envoy v1.33.0 was MEASURED to ACCEPT a zero-length element, a duplicate
+    /// element and an empty list, and to REJECT only this case with
+    /// `Invalid ALPN protocol string`. The two reject sets therefore coincide;
+    /// rejecting any wider set would manufacture a reject-direction divergence.
+    #[error(
+        "invalid ALPN protocol string on the {side} side: element {index} is {len} bytes; the maximum is 255"
+    )]
+    InvalidAlpnProtocol {
+        side: &'static str,
+        index: usize,
+        len: usize,
+    },
     #[error("unsupported network filter '{0}'; envoy-rust accepts only '{1}'")]
     UnsupportedFilter(String, &'static str),
     #[error("filter '{0}' requires typed_config")]
