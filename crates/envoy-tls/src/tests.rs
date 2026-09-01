@@ -1198,3 +1198,21 @@ async fn alpn_empty_server_list_does_not_advertise() {
     assert_eq!(s, None);
     assert_eq!(c, None);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alpn_mismatch_completes_handshake_with_no_protocol() {
+    install_provider_once();
+    let pki = pki::build();
+    let (s, c) = alpn_handshake(&pki, &["h2", "http/1.1"], &["h3"]).await;
+    assert_eq!(s, None, "server must select nothing");
+    assert_eq!(c, None, "client must select nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alpn_client_offers_nothing_negotiates_none() {
+    install_provider_once();
+    let pki = pki::build();
+    let (s, c) = alpn_handshake(&pki, &["h2", "http/1.1"], &[]).await;
+    assert_eq!(s, None);
+    assert_eq!(c, None);
+}

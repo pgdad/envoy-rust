@@ -68,18 +68,35 @@ pub enum TlsError {
 #[derive(Debug)]
 pub struct DownstreamTls {
     config: Arc<ServerConfig>,
+    /// 112.1 D6': an ALPN-free twin of `config`, identical except that
+    /// `alpn_protocols` is left empty. `None` means no ALPN is configured, and
+    /// `accept()` then takes the unchanged pre-112 `TlsAcceptor` path (D6'.1).
+    alpn_free_config: Option<Arc<ServerConfig>>,
+    /// The configured ALPN list, wire-encoded, for `accept()`'s intersection
+    /// test. Empty exactly when `alpn_free_config` is `None`.
+    alpn: Vec<Vec<u8>>,
 }
 
-/// 112.1 D2a/D3: finish a built `ServerConfig` by attaching the configured ALPN
-/// list. An empty list leaves `alpn_protocols` empty, which is rustls' own
-/// documented "don't do ALPN at all" (D3).
-fn finish_server_config(mut config: ServerConfig, alpn_protocols: &[String]) -> Arc<ServerConfig> {
+/// 112.1 D2a/D3/D6': finish a built `ServerConfig` by attaching the configured
+/// ALPN list, and — only when that list is non-empty — produce the ALPN-free
+/// twin D6' hands to `into_stream` on a mismatch. The twin is cloned BEFORE
+/// `alpn_protocols` is set, so it is byte-identical except for that one field;
+/// `rustls::ServerConfig` derives `Clone` and every non-trivial field is an
+/// `Arc`, so the clone is cheap.
+fn finish_server_config(
+    mut config: ServerConfig,
+    alpn_protocols: &[String],
+) -> (Arc<ServerConfig>, Option<Arc<ServerConfig>>, Vec<Vec<u8>>) {
     let wire: Vec<Vec<u8>> = alpn_protocols
         .iter()
         .map(|p| p.as_bytes().to_vec())
         .collect();
-    config.alpn_protocols = wire;
-    Arc::new(config)
+    if wire.is_empty() {
+        return (Arc::new(config), None, wire);
+    }
+    let alpn_free = Arc::new(config.clone());
+    config.alpn_protocols = wire.clone();
+    (Arc::new(config), Some(alpn_free), wire)
 }
 
 impl DownstreamTls {
@@ -101,8 +118,13 @@ impl DownstreamTls {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        let config = finish_server_config(config, &cfg.common_tls_context.alpn_protocols);
-        Ok(Self { config })
+        let (config, alpn_free_config, alpn) =
+            finish_server_config(config, &cfg.common_tls_context.alpn_protocols);
+        Ok(Self {
+            config,
+            alpn_free_config,
+            alpn,
+        })
     }
 
     /// 03.2-only: build from a full `envoy_config::Listener` by walking all
@@ -184,8 +206,13 @@ impl DownstreamTls {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        let config = finish_server_config(config, alpn_protocols.unwrap_or(&[]));
-        Ok(Self { config })
+        let (config, alpn_free_config, alpn) =
+            finish_server_config(config, alpn_protocols.unwrap_or(&[]));
+        Ok(Self {
+            config,
+            alpn_free_config,
+            alpn,
+        })
     }
 
     /// Hands a connected downstream `TcpStream` through the rustls server
@@ -196,9 +223,54 @@ impl DownstreamTls {
         &self,
         downstream: TcpStream,
     ) -> Result<tokio_rustls::server::TlsStream<TcpStream>, TlsError> {
-        let acceptor = tokio_rustls::TlsAcceptor::from(self.config.clone());
-        acceptor
-            .accept(downstream)
+        // 112.1 D6'.1: no ALPN configured -> the unchanged pre-112 path. Every
+        // config in the tree today, fixtures 0004/0005/0006 included, lands here.
+        let Some(alpn_free) = self.alpn_free_config.as_ref() else {
+            let acceptor = tokio_rustls::TlsAcceptor::from(self.config.clone());
+            return acceptor
+                .accept(downstream)
+                .await
+                .map_err(|source| TlsError::Handshake { source });
+        };
+
+        // 112.1 D6': ALPN IS configured. rustls decides ALPN inside
+        // `process_common` from the `ServerConfig` already in force, and sends a
+        // FATAL `no_application_protocol` alert when the client offered a
+        // non-empty set that does not intersect a non-empty server list.
+        // Upstream Envoy instead completes the handshake with nothing selected.
+        // So peek the ClientHello first and hand `into_stream` the ALPN-free
+        // config on a mismatch: rustls then takes the `our_protocols.is_empty()`
+        // branch, sends no alert, and selects nothing.
+        let start =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), downstream)
+                .await
+                .map_err(|source| TlsError::Handshake { source })?;
+
+        // `ClientHello<'a>` borrows `start`, and `into_stream` consumes it, so
+        // the borrow must be dead first: reduce to an owned `bool` in this block.
+        let advertise = {
+            let hello = start.client_hello();
+            match hello.alpn() {
+                // Client sent no ALPN extension. rustls skips the selection
+                // block entirely, so the ALPN-carrying config selects nothing
+                // and sends no alert — parity with Envoy for free.
+                None => true,
+                Some(offered) => {
+                    let offered: Vec<&[u8]> = offered.collect();
+                    self.alpn
+                        .iter()
+                        .any(|ours| offered.contains(&ours.as_slice()))
+                }
+            }
+        };
+
+        let config = if advertise {
+            self.config.clone()
+        } else {
+            alpn_free.clone()
+        };
+        start
+            .into_stream(config)
             .await
             .map_err(|source| TlsError::Handshake { source })
     }
