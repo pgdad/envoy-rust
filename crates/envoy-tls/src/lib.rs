@@ -70,6 +70,18 @@ pub struct DownstreamTls {
     config: Arc<ServerConfig>,
 }
 
+/// 112.1 D2a/D3: finish a built `ServerConfig` by attaching the configured ALPN
+/// list. An empty list leaves `alpn_protocols` empty, which is rustls' own
+/// documented "don't do ALPN at all" (D3).
+fn finish_server_config(mut config: ServerConfig, alpn_protocols: &[String]) -> Arc<ServerConfig> {
+    let wire: Vec<Vec<u8>> = alpn_protocols
+        .iter()
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
+    config.alpn_protocols = wire;
+    Arc::new(config)
+}
+
 impl DownstreamTls {
     /// Build from a parsed envoy_config::DownstreamTlsContext.
     ///
@@ -89,9 +101,8 @@ impl DownstreamTls {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        Ok(Self {
-            config: Arc::new(config),
-        })
+        let config = finish_server_config(config, &cfg.common_tls_context.alpn_protocols);
+        Ok(Self { config })
     }
 
     /// 03.2-only: build from a full `envoy_config::Listener` by walking all
@@ -112,6 +123,15 @@ impl DownstreamTls {
     pub fn from_listener(listener: &envoy_config::Listener) -> Result<Self, TlsError> {
         let mut map: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
         let mut default: Option<Arc<CertifiedKey>> = None;
+        // 112.1 D2a': ALPN is a `rustls::ServerConfig` property and this
+        // constructor builds ONE config for the whole listener, so per-chain
+        // ALPN is inexpressible (CF-112-4, a declared non-goal). The FIRST
+        // filter chain carrying a `DownstreamTlsContext` supplies the list;
+        // a later chain declaring a DIFFERENT non-empty list is warned about
+        // rather than silently dropped or rejected — rejecting would
+        // manufacture a reject-direction divergence against upstream Envoy,
+        // whose per-chain semantics are unmeasured.
+        let mut alpn_protocols: Option<&[String]> = None;
 
         for chain in &listener.filter_chains {
             let Some(socket) = &chain.transport_socket else {
@@ -122,6 +142,23 @@ impl DownstreamTls {
                 // Validator rejects mismatched direction on listeners; defensive.
                 continue;
             };
+
+            match alpn_protocols {
+                None => alpn_protocols = Some(&ctx.common_tls_context.alpn_protocols),
+                Some(first) => {
+                    let this = &ctx.common_tls_context.alpn_protocols;
+                    if !this.is_empty() && this.as_slice() != first {
+                        tracing::warn!(
+                            listener = %listener.name,
+                            honored = ?first,
+                            ignored = ?this,
+                            "per-filter-chain alpn_protocols is not supported; \
+                             honoring the first TLS filter chain's list for the \
+                             whole listener (CF-112-4)"
+                        );
+                    }
+                }
+            }
 
             let certs = &ctx.common_tls_context.tls_certificates;
             let cert = certs.first().ok_or(TlsError::DownstreamRequiresCert)?;
@@ -147,9 +184,8 @@ impl DownstreamTls {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        Ok(Self {
-            config: Arc::new(config),
-        })
+        let config = finish_server_config(config, alpn_protocols.unwrap_or(&[]));
+        Ok(Self { config })
     }
 
     /// Hands a connected downstream `TcpStream` through the rustls server

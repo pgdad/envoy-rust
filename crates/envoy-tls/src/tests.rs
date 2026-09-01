@@ -1110,3 +1110,91 @@ async fn sni_resolver_without_default_aborts_unknown_sni() {
         "server must abort (no cert for SNI, no default), got Ok"
     );
 }
+
+/// Build a `DownstreamTlsContext` carrying `alpn_protocols`.
+fn ds_context_with_alpn(pki: &pki::Pki, alpn: &[&str]) -> envoy_config::DownstreamTlsContext {
+    let mut ctx = pki::ds_context_with(&pki.leaf_cert_pem, &pki.leaf_key_pem);
+    ctx.common_tls_context.alpn_protocols = alpn.iter().map(|s| s.to_string()).collect();
+    ctx
+}
+
+/// Drive ONE real loopback handshake: a `DownstreamTls` built from `server_alpn`
+/// against a `tokio_rustls` client offering `client_alpn` (empty = offer none).
+/// Returns `(server_selected, client_selected)` as owned bytes. Panics on a
+/// handshake failure, which is itself the D6' assertion for the mismatch cell.
+async fn alpn_handshake(
+    pki: &pki::Pki,
+    server_alpn: &[&str],
+    client_alpn: &[&str],
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    use rustls::pki_types::ServerName;
+    let ctx = ds_context_with_alpn(pki, server_alpn);
+    let downstream = DownstreamTls::from_context(&ctx).expect("from_context");
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        downstream.accept(stream).await
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(pki.ca_der_for_root_store.clone())
+        .expect("add ca");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let server_name = ServerName::try_from("a.example.com").expect("server name");
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+    let client_tls = if client_alpn.is_empty() {
+        connector.connect(server_name, tcp).await
+    } else {
+        connector
+            .with_alpn(client_alpn.iter().map(|s| s.as_bytes().to_vec()).collect())
+            .connect(server_name, tcp)
+            .await
+    }
+    .expect("client handshake must SUCCEED");
+
+    let server_tls = server_task
+        .await
+        .expect("server task joins")
+        .expect("server handshake must SUCCEED");
+
+    (
+        server_tls.get_ref().1.alpn_protocol().map(|p| p.to_vec()),
+        client_tls.get_ref().1.alpn_protocol().map(|p| p.to_vec()),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alpn_negotiates_h2_when_both_offer_it() {
+    install_provider_once();
+    let pki = pki::build();
+    let (s, c) = alpn_handshake(&pki, &["h2", "http/1.1"], &["h2", "http/1.1"]).await;
+    assert_eq!(s.as_deref(), Some(&b"h2"[..]), "server side");
+    assert_eq!(c.as_deref(), Some(&b"h2"[..]), "client side");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alpn_selection_follows_server_preference() {
+    install_provider_once();
+    let pki = pki::build();
+    let (s, c) = alpn_handshake(&pki, &["http/1.1", "h2"], &["h2", "http/1.1"]).await;
+    assert_eq!(s.as_deref(), Some(&b"http/1.1"[..]), "server side");
+    assert_eq!(c.as_deref(), Some(&b"http/1.1"[..]), "client side");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alpn_empty_server_list_does_not_advertise() {
+    install_provider_once();
+    let pki = pki::build();
+    let (s, c) = alpn_handshake(&pki, &[], &["h2", "http/1.1"]).await;
+    assert_eq!(s, None);
+    assert_eq!(c, None);
+}
