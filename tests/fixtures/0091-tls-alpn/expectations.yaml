@@ -1,0 +1,31 @@
+# 112.2 cells 1-4. One listener, one server list (["h2", "http/1.1"]), four
+# independent TLS handshakes that vary only the CLIENT's offer. Each probe
+# asserts what the completed handshake negotiated, on BOTH proxies; both
+# satisfying the rule IS the cross-proxy equivalence claim (E3).
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    # Cell 1 — full intersection; the server's first choice wins.
+    - sni: a.example.com
+      expected_cn: a.example.com
+      client_alpn: ["h2", "http/1.1"]
+      expected_alpn: { kind: selected, protocol: h2 }
+    # Cell 2 — the client offers only the server's SECOND choice.
+    - sni: a.example.com
+      expected_cn: a.example.com
+      client_alpn: ["http/1.1"]
+      expected_alpn: { kind: selected, protocol: http/1.1 }
+    # Cell 3 — NO intersection. Upstream Envoy completes the handshake with
+    # nothing selected and sends no `no_application_protocol` alert; this is
+    # the cell that fails if 112.1's D6' accept path is wrong.
+    - sni: a.example.com
+      expected_cn: a.example.com
+      client_alpn: ["h3"]
+      expected_alpn: { kind: none_selected }
+    # Cell 4 — the client sends no ALPN extension at all.
+    - sni: a.example.com
+      expected_cn: a.example.com
+      expected_alpn: { kind: none_selected }
+equivalence:
+  response_body:
+    kind: byte_exact
