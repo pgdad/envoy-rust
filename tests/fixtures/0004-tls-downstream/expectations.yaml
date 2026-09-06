@@ -1,6 +1,11 @@
 driver:
   kind: tls_tcp
   sni: a.example.com
+  # 112.2 cell 6 — the no-ALPN control. This listener configures no
+  # `alpn_protocols`, so a client that DOES offer ALPN must still complete the
+  # handshake with nothing negotiated (parent SPEC §1.1 F4, MEASURED).
+  client_alpn: ["h2", "http/1.1"]
+  expected_alpn: { kind: none_selected }
 equivalence:
   response_body:
     kind: byte_exact
