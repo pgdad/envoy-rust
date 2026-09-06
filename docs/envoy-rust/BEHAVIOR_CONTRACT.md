@@ -1033,6 +1033,125 @@ Do not assume any of these; they are open questions, not settled cells.
 
 ---
 
+## ALPN
+
+**Phase 112** (`ADR-0183` scope, `ADR-0184` split), landed as sub-phases `112.1`
+(the config surface and the `rustls` wiring) and `112.2` (this witness). Before
+phase 112 envoy-rust rejected `common_tls_context.alpn_protocols` at
+config-parse time, so every cell below was unreachable — the divergence was
+boot-level, not a value divergence. Witnesses: fixtures
+`tests/fixtures/0091-tls-alpn/` (cells 1–4),
+`tests/fixtures/0092-tls-alpn-server-preference/` (cell 5) and
+`tests/fixtures/0004-tls-downstream/` (cell 6).
+
+Every upstream-Envoy value below was MEASURED against the pinned
+`envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd7df3…`, `ENVOY_TARGET.md`,
+verified on the running container), on loopback-mapped ports asserted free
+before each run, with a REACHABLE backend — see "Determinism" below. Nothing
+here is projected.
+
+### The negotiation rule
+
+`common_tls_context.alpn_protocols` is a list of ALPN protocol identifiers,
+**most preferred first**, honored on both sides of the connection: on a
+`DownstreamTlsContext` it is the server's list (`rustls::ServerConfig`), and on
+an `UpstreamTlsContext` it is the list envoy-rust OFFERS to a backend
+(`rustls::ClientConfig`). An absent or empty list means "do not advertise ALPN
+at all".
+
+**Selection follows the SERVER's order**, not the client's. Measured on
+upstream Envoy 5/5 with the lists deliberately disagreeing (fixture `0092`), and
+true of `rustls` by construction — its selection loop iterates the server's list
+in the outer position and only scans the client's with `.any()`.
+
+### The six cells
+
+Server list `["h2", "http/1.1"]` unless stated otherwise.
+
+| # | client offers | server lists | negotiated | witness |
+|---|---|---|---|---|
+| 1 | `h2`, `http/1.1` | `h2`, `http/1.1` | `h2` | `0091` probe 1 |
+| 2 | `http/1.1` | `h2`, `http/1.1` | `http/1.1` | `0091` probe 2 |
+| 3 | `h3` (no intersection) | `h2`, `http/1.1` | **nothing**, handshake SUCCEEDS | `0091` probe 3 |
+| 4 | *(no ALPN extension)* | `h2`, `http/1.1` | nothing | `0091` probe 4 |
+| 5 | `h2`, `http/1.1` | **`http/1.1`, `h2`** | `http/1.1` — the SERVER's first choice | `0092` |
+| 6 | `h2`, `http/1.1` | *(field absent)* | nothing | `0004` |
+
+### The mismatch disposition — cell 3, the one piece of real engineering
+
+RFC 7301 §3.2 PERMITS a fatal `no_application_protocol` alert when nothing the
+client offered is acceptable. **Upstream Envoy declines to send one:** the
+handshake completes with no protocol selected. `rustls` by default does the
+opposite — it sends the fatal alert and the handshake FAILS.
+
+envoy-rust matches Envoy, and does so through a deliberate accept path rather
+than by luck: when — and only when — a non-empty `alpn_protocols` is configured,
+`DownstreamTls::accept` drives a `tokio_rustls::LazyConfigAcceptor`, reads the
+ClientHello's offered list, and hands `into_stream` an ALPN-free twin of the
+`ServerConfig` if nothing intersects. `rustls` then takes its
+`our_protocols.is_empty()` branch: no alert, nothing selected, handshake
+completes. When no ALPN is configured the pre-112 `TlsAcceptor` path is taken
+unchanged, which is why every pre-112 fixture is unaffected.
+
+### Determinism — a probe on this surface needs a reachable backend
+
+With `tcp_proxy` pointed at an unreachable upstream, upstream Envoy's ALPN cells
+are **non-deterministic**: Envoy tears the connection down when the upstream
+connect fails and the teardown races the handshake, returning
+`No ALPN negotiated` for a cell that should have negotiated on roughly 1 in 4
+sequences, landing on a different cell each time. With a reachable backend, 40
+consecutive handshakes were deterministic and `listener.<addr>.ssl.handshake`
+equalled `downstream_cx_total` exactly. Fixtures on this surface must therefore
+supply a real backend; the differential harness always does.
+
+### Element validation
+
+Upstream Envoy v1.33.0 ACCEPTS an empty list, an empty element (`""`) and a
+duplicate element, and REJECTS an element that is too long with
+`Invalid ALPN protocol string`. envoy-rust rejects the over-long element at
+config-load with `ConfigError::InvalidAlpnProtocol { side, index, len }`. The
+error TEXT differs and is not compared; only the accept/reject direction is.
+
+⚠ **The reject sets do NOT fully coincide, and this is a live divergence**
+(`CF-112-8`, MEASURED). Upstream applies the 255-byte bound **per
+comma-separated segment** of an element; envoy-rust applies it to the whole
+element. So `alpn_protocols: ["<255 a's>,<255 b's>"]` — a 511-byte element whose
+segments are each 255 — BOOTS upstream and is REJECTED by envoy-rust, while a
+259-byte element containing one 256-byte segment is rejected by both. Total
+element length is irrelevant upstream; the segment is the unit.
+
+### Cells that are NOT matched, NOT compared, or NOT measured
+
+- **The UPSTREAM offer is not differentially witnessed** (`CF-112-2`). It is
+  honored and unit-tested — Envoy was measured to offer the configured list
+  verbatim and in order — but no harness driver can report what a BACKEND
+  negotiated, so the cross-proxy witness covers the downstream direction only.
+- **Whether a comma inside an element yields TWO offered protocols on the wire
+  is INFERRED, not measured** (`CF-112-8` Consequence 2). If the segment is the
+  unit of the length check it is probably the unit of the wire encoding too, in
+  which case `["h2,http/1.1"]` — accepted by both — offers two protocols
+  upstream and one 11-byte protocol here.
+- **An empty element's runtime behaviour diverges** (`CF-112-6`, `CF-112-9`).
+  Upstream Envoy with a server list of `["", "h2"]` negotiates NOTHING AT ALL,
+  not even `h2`: one empty element poisons the whole list. envoy-rust does not
+  reproduce that quirk, and an empty element in a CLUSTER's list additionally
+  trips a `debug_assert!` inside `rustls`' `PayloadU8<NonEmpty>` on the upstream
+  connect — a panic in debug and test builds. No fixture configures one.
+- **Per-filter-chain ALPN is inexpressible** (`CF-112-4`). ALPN is a
+  `rustls::ServerConfig` property and `DownstreamTls::from_listener` builds one
+  config per listener, so when several chains disagree the FIRST chain's
+  non-empty list wins for the whole listener and a warning is logged. Upstream
+  Envoy's own per-chain-vs-per-listener semantics are UNMEASURED, so this is an
+  unadjudicated gap rather than a known divergence.
+- **ALPN × SNI-selected filter chains is UNMEASURED** (`CF-112-3`).
+- **No ALPN-related stat is asserted.** No `ssl.*` counter is compared on this
+  surface; the negotiated protocol is read from the completed handshake only.
+- **Advertising `h2` does not mean serving it.** `ConfigError::Http2OverTlsNotSupported`
+  is NOT lifted (`CF-112-1`): every ALPN fixture is `tcp_proxy`, and a listener
+  that negotiates `h2` over TLS and then speaks HTTP/2 is a later phase.
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**
