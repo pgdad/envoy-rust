@@ -23,3 +23,10 @@ async fn tls_alpn_fixture() {
         .await
         .expect("fixture passes");
 }
+
+#[tokio::test]
+async fn tls_alpn_server_preference_fixture() {
+    differential::run_fixture(&fixture("0092-tls-alpn-server-preference"))
+        .await
+        .expect("fixture passes");
+}

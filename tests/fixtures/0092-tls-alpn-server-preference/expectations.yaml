@@ -1,0 +1,14 @@
+# 112.2 cell 5 — the D5 selection-order witness. The server list is REVERSED
+# relative to 0091 and the client's offer is unchanged, so the selected
+# protocol discriminates server preference from client preference: it is
+# `http/1.1` iff selection follows the SERVER's order.
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+      expected_cn: a.example.com
+      client_alpn: ["h2", "http/1.1"]
+      expected_alpn: { kind: selected, protocol: http/1.1 }
+equivalence:
+  response_body:
+    kind: byte_exact
