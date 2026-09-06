@@ -1957,14 +1957,20 @@ pub async fn drive_tls(
     sni: &str,
     root_store: rustls::RootCertStore,
     expected_cn: Option<&str>,
+    client_alpn: &[String],
+    expected_alpn: Option<&AlpnRule>,
 ) -> Result<Vec<u8>> {
     use rustls::pki_types::ServerName;
     use std::convert::TryFrom;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let client_cfg = rustls::ClientConfig::builder()
+    let mut client_cfg = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
+    // 112.2 E1: an empty `client_alpn` leaves `alpn_protocols` empty, which is
+    // rustls' "do not send the ALPN extension at all" — the pre-112 behaviour
+    // every existing TLS fixture relies on.
+    client_cfg.alpn_protocols = client_alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
     let server_name = ServerName::try_from(sni)
         .map_err(|e| anyhow::anyhow!("parsing sni {sni:?}: {e}"))?
@@ -1988,6 +1994,14 @@ pub async fn drive_tls(
             .first()
             .ok_or_else(|| anyhow::anyhow!("peer cert chain is empty"))?;
         check_cn_or_san(leaf, cn).context("expected_cn match")?;
+    }
+
+    // 112.2 E1: the negotiated protocol is read off the SAME completed
+    // handshake value `expected_cn` already uses — `.alpn_protocol()` beside
+    // `.peer_certificates()`. No new driver, no second connection.
+    if let Some(rule) = expected_alpn {
+        check_alpn(tls.get_ref().1.alpn_protocol(), rule)
+            .with_context(|| format!("expected_alpn match against {addr}"))?;
     }
 
     tls.write_all(payload).await?;
@@ -2095,6 +2109,41 @@ pub async fn drive_tls_probes(
         outputs.push(out);
     }
     Ok(outputs)
+}
+
+/// 112.2 E2: adjudicate a completed handshake's negotiated ALPN protocol
+/// against a fixture's `expected_alpn` rule.
+///
+/// `negotiated` is `rustls`' `alpn_protocol()` on the completed connection:
+/// `None` means the handshake finished with no protocol selected, which is
+/// upstream Envoy's MEASURED disposition both on a mismatch (parent SPEC
+/// §1.1 F2) and when the server advertises no list at all (F4). It is NOT an
+/// error condition, so it must be assertable — hence `AlpnRule::NoneSelected`.
+fn check_alpn(negotiated: Option<&[u8]>, rule: &AlpnRule) -> Result<()> {
+    match rule {
+        AlpnRule::Selected { protocol } => {
+            let got = negotiated.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expected ALPN {protocol:?} to be negotiated, but the handshake \
+                     completed with no protocol selected"
+                )
+            })?;
+            let got = std::str::from_utf8(got)
+                .map_err(|e| anyhow::anyhow!("negotiated ALPN is not valid UTF-8: {e}"))?;
+            if got != protocol {
+                bail!("expected ALPN {protocol:?}, got {got:?}");
+            }
+        }
+        AlpnRule::NoneSelected => {
+            if let Some(got) = negotiated {
+                bail!(
+                    "expected NO ALPN protocol to be negotiated, got {:?}",
+                    String::from_utf8_lossy(got)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Walk a leaf cert's SAN DNS entries + CommonName for a case-insensitive
@@ -4258,9 +4307,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         }
         // (f) Real TLS dispatch arm.
         Driver::TlsTcp {
-            sni, expected_cn, ..
+            sni,
+            expected_cn,
+            client_alpn,
+            expected_alpn,
         } => {
-            run_tls_tcp_arm(&ctx, upstream, subject, sni, expected_cn).await?;
+            run_tls_tcp_arm(
+                &ctx,
+                upstream,
+                subject,
+                sni,
+                expected_cn,
+                client_alpn,
+                expected_alpn.as_ref(),
+            )
+            .await?;
         }
         // 03.2 Task 8: per-SNI probe list. Equivalence is enforced inside
         // `drive_tls_probes` per probe (byte-equality + per-probe expected_cn);
@@ -4959,6 +5020,8 @@ async fn run_tls_tcp_arm(
     mut subject: subject::Subject,
     sni: &str,
     expected_cn: &Option<String>,
+    client_alpn: &[String],
+    expected_alpn: Option<&AlpnRule>,
 ) -> Result<()> {
     let FixtureCtx {
         fixture_dir,
@@ -4994,12 +5057,22 @@ async fn run_tls_tcp_arm(
         sni,
         roots.clone(),
         expected_cn.as_deref(),
+        client_alpn,
+        expected_alpn,
     )
     .await
     .context("upstream envoy tls drive")?;
-    let subject_out = drive_tls(subject_addr, &payload, sni, roots, expected_cn.as_deref())
-        .await
-        .context("envoy-rust tls drive")?;
+    let subject_out = drive_tls(
+        subject_addr,
+        &payload,
+        sni,
+        roots,
+        expected_cn.as_deref(),
+        client_alpn,
+        expected_alpn,
+    )
+    .await
+    .context("envoy-rust tls drive")?;
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
     assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
@@ -9006,6 +9079,30 @@ driver:
             err.to_string().contains("protocul"),
             "unexpected error: {err}"
         );
+    }
+
+    // 112.2 Task 2 RED: the adjudicator distinguishes "negotiated X" from
+    // "negotiated nothing" in both directions.
+    #[test]
+    fn check_alpn_adjudicates_all_four_outcomes() {
+        let h2 = AlpnRule::Selected {
+            protocol: "h2".to_string(),
+        };
+        // positive rule, matching protocol
+        check_alpn(Some(b"h2"), &h2).expect("h2 matches h2");
+        // positive rule, wrong protocol
+        let e = check_alpn(Some(b"http/1.1"), &h2).unwrap_err().to_string();
+        assert!(e.contains("expected ALPN \"h2\""), "unexpected: {e}");
+        // positive rule, nothing negotiated
+        let e = check_alpn(None, &h2).unwrap_err().to_string();
+        assert!(e.contains("no protocol selected"), "unexpected: {e}");
+        // negative rule, nothing negotiated
+        check_alpn(None, &AlpnRule::NoneSelected).expect("None satisfies NoneSelected");
+        // negative rule, something negotiated
+        let e = check_alpn(Some(b"h2"), &AlpnRule::NoneSelected)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("expected NO ALPN"), "unexpected: {e}");
     }
 
     #[test]
