@@ -81,10 +81,21 @@ pub enum Driver {
         host: String,
     },
     /// 03.1 NEW: TLS round-trip with explicit SNI + optional CN/SAN check.
+    ///
+    /// 112.2 E1: `client_alpn` is the ALPN protocol list the harness's client
+    /// OFFERS, and `expected_alpn` is what the completed handshake must have
+    /// selected. Both are `#[serde(default)]`, so every pre-112 fixture
+    /// (`0004-tls-downstream` included) parses unchanged; an empty
+    /// `client_alpn` means "offer no ALPN extension at all", which is the
+    /// pre-112 behaviour.
     TlsTcp {
         sni: String,
         #[serde(default)]
         expected_cn: Option<String>,
+        #[serde(default)]
+        client_alpn: Vec<String>,
+        #[serde(default)]
+        expected_alpn: Option<AlpnRule>,
     },
     /// 03.2 NEW: drive a sequence of per-SNI TLS probes against a single
     /// listener address. Each probe runs a fresh TLS handshake (varying SNI),
@@ -728,12 +739,45 @@ pub enum AdminAssertion {
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
+///
+/// 112.2 E1: `client_alpn` / `expected_alpn` are per-probe, because
+/// `0091-tls-alpn` varies the CLIENT's offer across four probes against one
+/// server list. Both are `#[serde(default)]` so `0006-tls-sni`'s probes parse
+/// unchanged.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsTcpProbe {
     pub sni: String,
     #[serde(default)]
     pub expected_cn: Option<String>,
+    #[serde(default)]
+    pub client_alpn: Vec<String>,
+    #[serde(default)]
+    pub expected_alpn: Option<AlpnRule>,
+}
+
+/// 112.2 E2: what the completed TLS handshake must have negotiated.
+///
+/// Cells 3, 4 and 6 of the phase-112 cell table assert the ABSENCE of a
+/// negotiated protocol, which is a different claim from "any protocol". A
+/// rule carrying only a positive value would make those three cells
+/// unwriteable, and letting `expected_alpn: None` mean "negotiated nothing"
+/// would make them silently vacuous — `None` already means "do not check".
+/// Hence the explicit negative arm.
+///
+/// Internally tagged, copying `BodyRule`'s shape so a unit-form and a
+/// struct-form variant can coexist:
+/// `expected_alpn: { kind: selected, protocol: h2 }` /
+/// `expected_alpn: { kind: none_selected }`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AlpnRule {
+    /// The handshake must have selected exactly this protocol.
+    Selected { protocol: String },
+    /// The handshake must have completed with NO protocol selected. This is
+    /// the mismatch disposition upstream Envoy was MEASURED to have (parent
+    /// SPEC §1.1 F2) and that `112.1`'s D6' reproduces in envoy-rust.
+    NoneSelected,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -4213,7 +4257,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             run_http_get_arm(&ctx, upstream, subject, path, host).await?;
         }
         // (f) Real TLS dispatch arm.
-        Driver::TlsTcp { sni, expected_cn } => {
+        Driver::TlsTcp {
+            sni, expected_cn, ..
+        } => {
             run_tls_tcp_arm(&ctx, upstream, subject, sni, expected_cn).await?;
         }
         // 03.2 Task 8: per-SNI probe list. Equivalence is enforced inside
@@ -8833,6 +8879,133 @@ driver:
             }
             _ => panic!("unexpected driver: {:?}", e.driver),
         }
+    }
+
+    // 112.2 Task 1 RED: the four cells of `0091-tls-alpn` as a probe list —
+    // a per-probe client offer plus a positive and a negative expectation.
+    #[test]
+    fn expectations_parse_tls_alpn_probe_list() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+      client_alpn: ["h2", "http/1.1"]
+      expected_alpn: { kind: selected, protocol: h2 }
+    - sni: a.example.com
+      client_alpn: ["h3"]
+      expected_alpn: { kind: none_selected }
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcpProbeList { ref probes } => {
+                assert_eq!(probes.len(), 2);
+                assert_eq!(probes[0].client_alpn, vec!["h2", "http/1.1"]);
+                assert_eq!(
+                    probes[0].expected_alpn,
+                    Some(AlpnRule::Selected {
+                        protocol: "h2".to_string()
+                    })
+                );
+                assert_eq!(probes[1].client_alpn, vec!["h3"]);
+                assert_eq!(probes[1].expected_alpn, Some(AlpnRule::NoneSelected));
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+    }
+
+    // 112.2 Task 1 RED: cell 4 — the client offers NOTHING. `client_alpn`
+    // defaults to empty, which is "send no ALPN extension".
+    #[test]
+    fn expectations_parse_tls_alpn_probe_without_client_offer() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+      expected_alpn: { kind: none_selected }
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcpProbeList { ref probes } => {
+                assert!(probes[0].client_alpn.is_empty());
+                assert_eq!(probes[0].expected_alpn, Some(AlpnRule::NoneSelected));
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+    }
+
+    // 112.2 Task 1 RED: cell 6 rides on `Driver::TlsTcp`, so the single-probe
+    // driver carries the same two fields.
+    #[test]
+    fn expectations_parse_tls_tcp_with_alpn_fields() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp
+  sni: a.example.com
+  client_alpn: ["h2", "http/1.1"]
+  expected_alpn: { kind: none_selected }
+equivalence:
+  response_body:
+    kind: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcp {
+                ref sni,
+                ref client_alpn,
+                ref expected_alpn,
+                ..
+            } => {
+                assert_eq!(sni, "a.example.com");
+                assert_eq!(client_alpn, &vec!["h2", "http/1.1"]);
+                assert_eq!(expected_alpn.as_ref(), Some(&AlpnRule::NoneSelected));
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+    }
+
+    // 112.2 PV: every pre-112 TLS fixture must still parse with the new
+    // fields absent — this is the `#[serde(default)]` claim, pinned.
+    #[test]
+    fn expectations_parse_pre_112_tls_fixtures_unchanged() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp
+  sni: a.example.com
+equivalence:
+  response_body:
+    kind: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcp {
+                ref client_alpn,
+                ref expected_alpn,
+                ..
+            } => {
+                assert!(client_alpn.is_empty());
+                assert!(expected_alpn.is_none());
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+    }
+
+    // 112.2 Task 1 RED: `AlpnRule` carries `deny_unknown_fields`, so a typo
+    // in the rule is a hard parse error rather than a silently ignored key.
+    #[test]
+    fn expectations_reject_unknown_alpn_rule_field() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp
+  sni: a.example.com
+  expected_alpn: { kind: selected, protocol: h2, protocul: h3 }
+"#;
+        let err = serde_yaml::from_str::<Expectations>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("protocul"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
