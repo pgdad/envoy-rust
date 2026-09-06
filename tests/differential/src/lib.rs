@@ -2050,13 +2050,21 @@ pub async fn drive_tls_probes(
     use std::convert::TryFrom;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let client_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
-
+    // 112.2 E1: the client's ALPN offer is PER PROBE, and `alpn_protocols`
+    // lives on the `ClientConfig`, so the config and its connector are built
+    // inside the loop rather than once outside it. Every other probe-level
+    // discipline below is unchanged.
     let mut outputs = Vec::with_capacity(probes.len());
     for probe in probes {
+        let mut client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = probe
+            .client_alpn
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
         let server_name = ServerName::try_from(probe.sni.as_str())
             .map_err(|e| anyhow::anyhow!("parsing sni {:?}: {e}", probe.sni))?
             .to_owned();
@@ -2079,6 +2087,15 @@ pub async fn drive_tls_probes(
             })?;
             check_cn_or_san(leaf, cn)
                 .with_context(|| format!("expected_cn match for probe sni={:?}", probe.sni))?;
+        }
+
+        if let Some(rule) = &probe.expected_alpn {
+            check_alpn(tls.get_ref().1.alpn_protocol(), rule).with_context(|| {
+                format!(
+                    "expected_alpn match against {addr} for probe sni={:?} client_alpn={:?}",
+                    probe.sni, probe.client_alpn
+                )
+            })?;
         }
 
         tls.write_all(payload)
@@ -9103,6 +9120,39 @@ driver:
             .unwrap_err()
             .to_string();
         assert!(e.contains("expected NO ALPN"), "unexpected: {e}");
+    }
+
+    // 112.2 Task 3 RED: `drive_tls_probes` reads the offer off each probe, so
+    // pin that a probe list parses into per-probe offers that DIFFER — the
+    // property that makes one fixture cover four cells.
+    #[test]
+    fn tls_probe_list_carries_distinct_per_probe_offers() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+      client_alpn: ["h2", "http/1.1"]
+      expected_alpn: { kind: selected, protocol: h2 }
+    - sni: a.example.com
+      client_alpn: ["http/1.1"]
+      expected_alpn: { kind: selected, protocol: http/1.1 }
+    - sni: a.example.com
+      client_alpn: ["h3"]
+      expected_alpn: { kind: none_selected }
+    - sni: a.example.com
+      expected_alpn: { kind: none_selected }
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::TlsTcpProbeList { probes } = e.driver else {
+            panic!("unexpected driver")
+        };
+        let offers: Vec<&[String]> = probes.iter().map(|p| p.client_alpn.as_slice()).collect();
+        assert_eq!(offers.len(), 4);
+        assert_eq!(offers[0], ["h2".to_string(), "http/1.1".to_string()]);
+        assert_eq!(offers[1], ["http/1.1".to_string()]);
+        assert_eq!(offers[2], ["h3".to_string()]);
+        assert!(offers[3].is_empty());
     }
 
     #[test]
