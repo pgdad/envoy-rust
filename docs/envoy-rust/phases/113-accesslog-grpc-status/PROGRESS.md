@@ -596,3 +596,50 @@ CF-113-2 must delete a test deliberately.
 | `cargo build --workspace --all-targets` | exit **0** |
 | `cargo fmt --all -- --check` | exit **0** |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
+
+---
+
+## Task 8 — fuzz corpus seeds for the EXISTING `accesslog_format_parse` target
+
+**Status: COMPLETE.** Commit: `phase 113 task 8: fuzz corpus seeds for the %GRPC_STATUS% keywords`.
+
+No NEW fuzz target: §7.4's "parser, codec, or filter" trigger is satisfied by
+the pre-existing `crates/envoy-accesslog/fuzz/fuzz_targets/accesslog_format_parse.rs`,
+which already covers the format-string parser this phase extends. A new target
+would need a `ci.yml` step, and `ci.yml` is on the untouchable list (§5
+non-goal 5). The existing target's CI step was confirmed present, so gate (d)
+has somewhere to run.
+
+### Step 1 — the failing check
+
+```
+$ git check-ignore -q crates/envoy-accesslog/fuzz/corpus/accesslog_format_parse/grpc_status.txt && echo IGNORED
+IGNORED
+```
+
+The PLAIN form was used, not `-v`: the `-v` form also reports negation rules and
+its exit code does not answer "is it ignored?".
+
+### Step 2-3 — three seeds, three `!` negations
+
+```
+grpc_status.txt: %GRPC_STATUS%
+grpc_status_formats.txt: %GRPC_STATUS(SNAKE_STRING)% %GRPC_STATUS(NUMBER)% %GRPC_STATUS_NUMBER%
+grpc_status_malformed.txt: %GRPC_STATUS(% %GRPC_STATUS(FOO)% %GRPC_STATUS()% %GRPC_STATUS(CAMEL_STRING):5%
+```
+
+The malformed seed deliberately spans the reject surface this phase created: an
+unclosed paren, an unknown argument, the newly-ACCEPTED empty `()`, and the
+`:N` length suffix.
+
+### Step 4 — verified TRACKED, with `git ls-files` and not `ls`
+
+```
+$ git add -A && git ls-files crates/envoy-accesslog/fuzz/corpus/accesslog_format_parse/ | wc -l
+11
+```
+
+**11 = the 8 pre-existing seeds plus these 3, exactly `PLAN.md`'s figure.** Each
+of the three was then re-checked individually with the plain `git check-ignore`
+form and all three now report NOT ignored. `ls` would have shown the files
+whether or not git could see them — the whole point of this task's trap.

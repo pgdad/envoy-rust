@@ -10,3 +10,6 @@ corpus/accesslog_format_parse/*
 !corpus/accesslog_format_parse/empty.txt
 !corpus/accesslog_format_parse/multibyte.txt
 !corpus/accesslog_format_parse/dynamic_metadata.txt
+!corpus/accesslog_format_parse/grpc_status.txt
+!corpus/accesslog_format_parse/grpc_status_formats.txt
+!corpus/accesslog_format_parse/grpc_status_malformed.txt
