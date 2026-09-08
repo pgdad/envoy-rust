@@ -330,3 +330,66 @@ keyword remains fatal.
 workspace**, exactly at the boundary the Task-1 correction predicted: the three
 `dead_code` items now have production consumers in `render_op` and
 `encode_single_op`. No `#[allow]` was needed and none exists.
+
+---
+
+## Task 4 — the text-format render arm: tests
+
+**Status: COMPLETE.** Commit: `phase 113 task 4: pin the %GRPC_STATUS% text-format rendering`.
+
+The arm itself landed in Task 3(e) because the compiler forced it; this task
+pins its behaviour end-to-end through `CompiledFormat`.
+
+### Step 1 — the tests
+
+`rec_grpc` / `render1` helpers plus
+`grpc_status_text_renders_all_three_spellings` (all five spellings on a present
+value) and `grpc_status_absent_renders_the_dash_sentinel` (the gate's
+observable).
+
+### Step 2 — the mutation, RUN and SEEN to fail
+
+These tests cannot be seen RED by absence — the code they exercise already
+exists. `PLAN.md` therefore specifies a MUTATION as the RED evidence, which is
+the correct discipline for a characterization pin. The anchor was asserted
+unique before mutating (`anchor occurrences = 1`), then
+`None => out.push_str(empty_or_dash),` was changed to
+`None => out.push_str("?"),`:
+
+```
+test command_operator::tests::grpc_status_absent_renders_the_dash_sentinel ... FAILED
+assertion `left == right` failed
+  left: "?"
+ right: "-"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.00s
+```
+
+Byte-for-byte the failure `PLAN.md` Task 4 Step 2 predicts. **The test bites.**
+
+### Step 3 — revert, and verify the arm reads exactly as specified
+
+Reverted, then confirmed by TEXT rather than by trusting the edit —
+`grep -c 'push_str("?")'` returns **0**, and the arm reads:
+
+```rust
+        Op::GrpcStatus { format } => match record.grpc_status.as_deref() {
+            Some(raw) => out.push_str(&render_grpc_status(raw, *format)),
+            None => out.push_str(empty_or_dash),
+        },
+```
+
+### Step 4 — GREEN
+
+```
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 0.00s
+```
+
+**12 is exactly the figure `PLAN.md` Task 4 Step 4 predicts.**
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** (implied by the clippy `--all-targets` run) |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |

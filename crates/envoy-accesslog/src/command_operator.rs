@@ -1403,4 +1403,38 @@ mod tests {
             FormatParseError::UnknownKeyword(k) if k == "GRPC_STATUSX"
         ));
     }
+
+    fn rec_grpc(v: Option<&str>) -> AccessLogRecord {
+        let mut r = AccessLogRecord::test_baseline();
+        r.grpc_status = v.map(str::to_owned);
+        r
+    }
+
+    fn render1(fmt: &str, r: &AccessLogRecord) -> String {
+        let segs = parse_format(fmt).expect("parses");
+        CompiledFormat::new(segs).render(r)
+    }
+
+    // End-to-end through the compiled format: the three spellings on a present
+    // value.
+    #[test]
+    fn grpc_status_text_renders_all_three_spellings() {
+        let r = rec_grpc(Some("5"));
+        assert_eq!(render1("%GRPC_STATUS%", &r), "NotFound");
+        assert_eq!(render1("%GRPC_STATUS(CAMEL_STRING)%", &r), "NotFound");
+        assert_eq!(render1("%GRPC_STATUS(SNAKE_STRING)%", &r), "NOT_FOUND");
+        assert_eq!(render1("%GRPC_STATUS(NUMBER)%", &r), "5");
+        assert_eq!(render1("%GRPC_STATUS_NUMBER%", &r), "5");
+    }
+
+    // THE GATE'S OBSERVABLE: an absent `grpc_status` renders the `-` sentinel,
+    // which is how a non-gRPC request logs. This is the cell four of fixture
+    // 0093's twelve probes exercise.
+    #[test]
+    fn grpc_status_absent_renders_the_dash_sentinel() {
+        let r = rec_grpc(None);
+        assert_eq!(render1("%GRPC_STATUS%", &r), "-");
+        assert_eq!(render1("%GRPC_STATUS(SNAKE_STRING)%", &r), "-");
+        assert_eq!(render1("%GRPC_STATUS_NUMBER%", &r), "-");
+    }
 }
