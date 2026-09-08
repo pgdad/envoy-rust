@@ -824,3 +824,117 @@ $ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
 **Additions only, deletions 0**, exactly as `PLAN.md` Step 3 requires. The `## `
 heading count is unchanged against `HEAD` and the `## gRPC` section's `### `
 count went 8 → 12, i.e. the four new subsections and nothing else.
+
+---
+
+# Implementation complete — the §5 state-3 close
+
+**All TEN `PLAN.md` tasks landed, in order, each with TDD and each with its own
+task commit.** The active unit is now phase 113 at §5 **state 4** (the §7.5
+verification gate), which is a SEPARATE session (§5.1; `ADR-0127`).
+
+## Task ledger
+
+| task | commit | what landed |
+|---|---|---|
+| 1 | `abbe107` | `GrpcStatusFormat`, the MEASURED 17-code table, `grpc_status_code`, `render_grpc_status` |
+| 2 | `2201c36` | `AccessLogRecord.grpc_status` + the five-site E0063 sweep |
+| 3 | `5aeda62` | the parser, the alias, both compiler-forced `match` arms, `number_opt`, the empty-`()` correction |
+| 4 | `8233136` | the text-render pin (mutation-proved) |
+| 5 | `d3ce3ef` | the JSON typed carve-out pin (mutation-proved) |
+| 6 | `f151731` | the H1 population site + the gate pins (gate-deletion-proved) |
+| 7 | *(in `f151731`'s successor)* | the H2 boundary helper `h2_grpc_status()` + its pin |
+| 8 | `9712ef4` | three fuzz corpus seeds + their `.gitignore` negations |
+| 9 | `e53582f` | fixture `0093` (12 probes) + its runner, GREEN cross-proxy, two mutations |
+| 10 | `0b0c7ea` | `BEHAVIOR_CONTRACT.md` §I-§L |
+
+## Size — the §6.1 calibration datapoint
+
+```
+$ git diff --numstat 1ff03ba4 HEAD -- . ':(exclude)docs/'
+added=1172 deleted=7 net=1165
+```
+
+**1165 landed vs the PLAN's MEASURED 1092 = 1.07×.** The §6.1 gate is ~1500, so
+this clears by **335 lines / 22%**, and no mid-execution split trigger fired (no
+task's sub-steps approached ~10 items).
+
+Per-file against the PLAN's table: `json_format.rs` 85 = 85, `envoy-http1/hcm.rs`
+133 = 133, the fuzz set 6 = 6, the runner 25 = 25 — four exact hits.
+`command_operator.rs` 364 vs 362 and `record.rs` 26 vs 24 are within noise.
+`envoy-http2/hcm.rs` came in UNDER at 27 vs 34. **The overage is essentially all
+fixture prose**: 498 vs 422, because the `README.md` and `expectations.yaml`
+carry the CF-113-6 limitation and the per-probe rationale that `PLAN.md`
+required in words but did not budget lines for.
+
+This is the **third measured-estimate datapoint**: `112.1` 1.00×, `112.2` 1.10×,
+`113` 1.07× — all far under the projected-estimate band (`110.2` 1.33×, `110.1`
+1.41×, `111` 1.66×). The discriminator remains METHOD, not luck.
+
+## Test-suite state at this commit
+
+`cargo test --workspace --lib` → **1884 passed, 1 failed**.
+
+**The one failure is classified by ISOLATION, never by its text**:
+`envoy-http2 client::tests::send_request_maps_h2_handshake_failure_to_typed_error`
+(`expected H2ClientHandshake, got Ok(ClientStream { host: "test.example", .. })`).
+Re-run ALONE with 5-second settle gaps it passes **3/3**:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+```
+
+It is the documented pre-existing host flake (the handshake unexpectedly
+SUCCEEDS on this host). The structural check agrees and is independent of the
+isolation result: **phase 113's only `envoy-http2` change is in `hcm.rs`**, while
+this test lives in `client.rs`, which
+`git diff --stat 1ff03ba4 HEAD -- crates/envoy-http2/src/client.rs` shows
+UNTOUCHED. CI is authoritative.
+
+New tests added by this phase: **24** — 17 `envoy-accesslog` (112 → 129),
+5 `envoy-http1` (233 → 238), 1 `envoy-http2` (124 → 125), plus the 1 differential
+fixture test, which also adds ONE test binary.
+
+## What this session did NOT do
+
+- **Did not run the §7.5 verification gate.** That is state 4, a separate
+  session. `cargo deny check`, `cargo fuzz`, the conformance suites and the
+  full 93-fixture differential sweep are all its work, not this one's.
+- **Did not touch `ROADMAP.md`.** Row `113` stays `planned` until the state-6
+  close-out. Census unchanged: 121 rows / 120 `done` / 1 `planned`.
+- **Did not edit `SPEC.md` or `PLAN.md`.** Both are landed and uneditable; every
+  correction is forward, in this file and `ADR-0194`.
+- **Did not fix anything outside phase 113** (§6.3; `ADR-0165`). Every
+  carry-forward stands INTACT — `CF-113-1`…`CF-113-6`, `CF-112-1`…`CF-112-19`,
+  the `112.1`/`112.2`/`111`/`110.x`/`109.x`/`108.2` REVIEW sets,
+  `CF-111-1`…`CF-111-9`, `CF-110-1`…`9`, `CF-109-1/2/3`, `CF-108-1/2/3`,
+  `CF-76-1`, `CF-75-2/3/4/5/6`, `CF-72-2`/`CF-75-1`, `M71-6`,
+  `CF-74-1/2/3/4/6`, `CF-73-1` and the HTTP-filters-family (1)-(4).
+  **`CF-111-4` remains consumed only in PART** (the `%TRAILER(name)%` half is
+  untouched). **`CF-112-5` stays CLOSED.** The phase-112 ALPN cleanup rider was
+  NOT taken.
+- **Did not create a `stop` file.** All three stop-condition legs were
+  re-measured FALSE from disk at session start.
+
+## PV-8
+
+```
+$ git diff --numstat 1ff03ba4 -- Cargo.toml Cargo.lock .github/workflows/ci.yml tests/differential/src/lib.rs
+(no output)
+```
+
+All four untouched across the whole phase: no new dependency, no new workspace
+crate, no new config surface, no new harness driver, no new fuzz target.
+
+## For the state-4 session
+
+- **`cargo build -p envoy-bin` BEFORE any differential run** and gate on the
+  `Compiling` line, not the exit code — the harness spawns a pre-built binary.
+- **Only isolation classifies a local RED**, with a settle gap between Docker
+  runs; back-to-back runs manufacture a false `FAILS-IN-ISOLATION`.
+- **Do NOT record fixture `0093` as covering the request-side gate.** It cannot,
+  and `ADR-0194` DECISION 3 re-measured that at this commit.
+- Gate (d) is the PRE-EXISTING `accesslog_format_parse` target, which gained
+  three seeds; there is no new fuzz target and `ci.yml` is unchanged.

@@ -2402,6 +2402,50 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0194: Phase-113 §5 state-3 implementation — **the PLAN's "every task ends green on `clippy -D warnings`" constraint is STRUCTURALLY UNMEETABLE at two task boundaries, and a whole-slice prototype cannot detect that**; the gate is DEFERRED from Tasks 1-2 to Task 3 rather than suppressed. Also records the landed size at **1165 net LoC vs the MEASURED 1092 (1.07×)**, CONFIRMS `ADR-0193` DECISION 2 by re-running its mutation, and corrects three PLAN predictions that did not hold.
+
+**Context.** The phase-113 state-3 implementation executed all ten `PLAN.md` tasks in order with TDD on each. `PLAN.md`'s Global Constraints require every task boundary to be green on `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check`. Task 1 could not meet the clippy clause, and the reason generalises.
+
+**DECISION 1 — the clippy gate is DEFERRED from Tasks 1 and 2 to Task 3; it is NOT suppressed, and no `#[allow(dead_code)]` is added.**
+
+Task 1 adds `GrpcStatusFormat`, `GRPC_STATUS_NAMES`, `grpc_status_code` and `render_grpc_status`. Their only *production* consumer is the `Op::GrpcStatus` render arm, which `PLAN.md` deliberately defers to Task 3 because the compiler forbids a finer cut there (adding the variant breaks both exhaustive `match`es over `Op`). Between Task 1 and Task 3 those four items are reachable only from `#[cfg(test)]` code, and `dead_code` does not count a test-only use in the **lib** target. `-D warnings` therefore fails at the Task-1 boundary BY CONSTRUCTION:
+
+```
+error: function `render_grpc_status` is never used
+   --> crates/envoy-accesslog/src/command_operator.rs:138:15
+    = note: `-D dead-code` implied by `-D warnings`
+error: could not compile `envoy-accesslog` (lib) due to 3 previous errors
+```
+
+Three options were weighed. (a) **Add `#[allow(dead_code)]` in Task 1 and remove it in Task 3** — keeps every boundary green, but introduces a suppression that must be *remembered* to be removed; if it is forgotten it becomes a permanent lint hole in the crate that first taught this project the value of `-D warnings`. (b) **Merge Tasks 1-3 into one commit** — green throughout, but destroys the TDD granularity `PLAN.md` was written for and makes the RED-then-GREEN evidence for three separate concerns land as one undifferentiated change. (c) **DEFER the clippy gate to Task 3, keeping build/fmt/tests required at every boundary** — CHOSEN. Nothing is suppressed, the task and commit structure is preserved exactly as planned, and the gap is closed at the first boundary where a production consumer exists. It was verified closed: clippy is green from Task 3 onward and at every subsequent task.
+
+The failure set was re-checked at Task 2 rather than assumed to be unchanged — it is still exactly the same three items, so Task 2 introduced no new dead item.
+
+**DECISION 2 — the root cause is a METHOD limit, and it is worth stating generally: A WHOLE-SLICE PROTOTYPE CANNOT VALIDATE A TASK BOUNDARY.**
+
+`ADR-0193` measured 1092 net LoC on a scratch tree carrying *every* task's code blocks simultaneously. On such a tree every item has its consumer, so no per-task `dead_code` can appear. The prototype's green clippy run was therefore evidence about the SLICE and not about any boundary inside it, and `PLAN.md` generalised it one step too far when it wrote the constraint per-task. This is not a defect in `ADR-0193`'s size figure, which remains sound for what it measured. **A future PLAN-write that prototypes its plan should state which of its claims are slice-level and which are boundary-level, and should not assert a per-task gate it has only measured once at the end.**
+
+**DECISION 3 — `ADR-0193` DECISION 2 is CONFIRMED at this commit by re-running its mutation, and `SPEC.md` §6 stays refuted.** The claim that fixture `0093` cannot witness the operator's request-side gate is a banked conclusion, so it was re-measured rather than inherited. With the gate deleted from `build_access_log_record` and `envoy-bin` rebuilt, against one compiled tree:
+
+| witness | under gate deletion |
+|---|---|
+| fixture `0093` | **GREEN** — `1 passed; 0 failed` |
+| `hcm::grpc_status_access_log_tests` | **RED** — `4 passed; 1 failed` |
+
+The single RED test is `gate_stays_shut_on_the_four_measured_negative_spellings`, exactly as `ADR-0193` names. **CF-113-6 stands as banked.** The fixture's `README.md` and `expectations.yaml` both state the limitation explicitly so a REVIEW cannot record `0093` as covering the gate.
+
+**DECISION 4 — the landed size is 1165 net LoC excluding `docs/`, against the MEASURED 1092: a ratio of 1.07×.** Re-derived at this commit with `git diff --numstat 1ff03ba4 HEAD -- . ':(exclude)docs/'`. The overage is concentrated in the fixture (498 landed vs 422 planned), whose `README.md` and `expectations.yaml` carry the CF-113-6 limitation and the per-probe rationale that `PLAN.md` required but did not itself budget lines for; `envoy-http2/src/hcm.rs` came in UNDER (27 vs 34). The §6.1 gate is ~1500, so this clears by 335 lines / 22%, and no mid-execution split trigger fired — no task's sub-steps approached ~10 items.
+
+**This is the THIRD measured-estimate datapoint and it belongs with the other two**: `112.1` 1.00×, `112.2` 1.10×, `113` **1.07×**. All three sit far below the projected-estimate band (`110.2` 1.33×, `110.1` 1.41×, `111` 1.66×). The discriminator remains METHOD. Relevant to the unlanded `.claude/drafts/DRAFT-ADR-split-thresholds.md`, which must NOT be acted on here.
+
+**DECISION 5 — three PLAN predictions did not hold, all recorded rather than quietly absorbed.** (a) Task 2 Step 4 predicts the `envoy-accesslog` crate finishes at **127**; it finishes at **129**. The arithmetic closes (112 pre-existing + 17 added) and the transcription was diffed against `PLAN.md`'s own code blocks with no test added or missing, so the 127 is a stale prototype figure. The http1 (238) and http2 (125+1 ignored) predictions both held exactly. (b) Task 6 Step 2 predicts **5** failures before the H1 population site lands; **3** failed. Two of the five assert that the value is ABSENT, which Task 2's `None` placeholder supplies, so they pass VACUOUSLY instead of failing — including the gate pin itself, whose RED evidence must therefore come from a wrong implementation (DECISION 3's mutation) rather than from a missing one. (c) Task 3 Step 4's "Task 1's 4 tests plus these 6" totals 10 and 10 ran, but the COMPOSITION differs: the filter `grpc_status` misses `empty_parens_are_accepted_on_no_arg_operators` and catches Task 2's record test. An agreeing total is not a verified composition.
+
+**DECISION 6 — the empty-`()` relaxation's SCOPE was measured, not argued.** It changes the contract of eleven pre-existing operators, so a temporary probe (appended, run, then reverted, with the file restored from a pre-probe copy and the probe text re-grepped to 0) confirmed `%REQ()%`, `%RESP()%` and `%DYNAMIC_METADATA()%` all still reject. The relaxation is structurally confined: `parse_operator` dispatches those three by exact keyword BEFORE reaching the `no_arg_op` branch that carries it. The permanent guard is inside `grpc_status_rejects_length_suffix_and_argument_on_the_alias`, which pins `%RESPONSE_CODE(FOO)%` as still fatal.
+
+**Consequences.** Ten tasks landed across ten commits plus this state-advance. `PLAN.md` and `SPEC.md` were NOT edited (both landed and uneditable); every correction is forward, in `PROGRESS.md` and this ADR. Nothing outside phase 113 was fixed (§6.3; `ADR-0165`) — every carry-forward listed in `SPEC.md` §10 and `ADR-0193` stands INTACT, `CF-111-4` remains consumed only in PART, `CF-112-5` stays CLOSED, and `CF-113-5`/`CF-113-6` stay open as `ADR-0193` opened them. `ROADMAP.md` was NOT touched: row `113` stays `planned` until the §5 state-6 close-out. PV-8 holds — `Cargo.toml`, `Cargo.lock`, `.github/workflows/ci.yml` and `tests/differential/src/lib.rs` are untouched across the whole phase. The next unit is the §5 **state-4 verification gate**, which is a SEPARATE session (§5.1; `ADR-0127`).
+
+---
+
 ## ADR-0193: Phase-113 §5 state-2 PLAN-write — **`PLAN.md` written as 9 TDD tasks; the §6.1 split gate is MEASURED at 1092 net LoC and DOES NOT FIRE, so `ADR-0193`'s own split reservation is RELEASED and consumed by this ADR.** **CORRECTS FOUR LANDED `SPEC.md` CLAIMS**, the most consequential being that fixture `0093` **CANNOT witness the operator's request-side gate at all** — MEASURED by mutation, not argued. Discharges PV-1…PV-8; opens **CF-113-5** and **CF-113-6**. No `crates/` change lands at this commit.
 
 **Context.** `SPEC.md` (landed at `bca95fa4`) charters the `%GRPC_STATUS%` access-log command-operator family and carries PLAN-VERIFY items PV-1…PV-8. Landed artifacts are never edited, so a PLAN-write that finds the SPEC wrong corrects it FORWARD in an ADR — the discipline `ADR-0185`, `ADR-0186` and `ADR-0189` each established. This ADR is that correction, plus the split adjudication §6.1 requires at state 2.
