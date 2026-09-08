@@ -393,3 +393,77 @@ test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; f
 | `cargo build --workspace --all-targets` | exit **0** (implied by the clippy `--all-targets` run) |
 | `cargo fmt --all -- --check` | exit **0** |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
+
+---
+
+## Task 5 — the JSON typed carve-out: tests
+
+**Status: COMPLETE.** Commit: `phase 113 task 5: pin %GRPC_STATUS% under the JSON single-operator typed carve-out`.
+
+### Step 1 — the tests
+
+`rec_gs` helper plus `grpc_status_json_typing_present`,
+`grpc_status_json_typing_fallbacks_keep_their_type`,
+`grpc_status_json_absent_is_null_in_every_format` and
+`grpc_status_json_multi_segment_leaves_the_carve_out`.
+
+### Step 2 — the mutation, RUN and SEEN to fail
+
+The `Number` branch of the `encode_single_op` arm was temporarily rewritten to
+call `quote_opt` on the rendered string instead of `number_opt` (anchor asserted
+unique first):
+
+```
+test json_format::tests::grpc_status_json_typing_present ... FAILED
+assertion `left == right` failed
+  left: "\"5\""
+ right: "5"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.00s
+```
+
+Byte-for-byte what `PLAN.md` Task 5 Step 2 predicts — quoted where an unquoted
+number is required. **The typed carve-out is genuinely pinned**; had `number_opt`
+been redundant, this mutation would have stayed green.
+
+### Step 3-4 — revert, then GREEN
+
+Reverted and re-checked by text
+(`grep -c 'GrpcStatusFormat::Number => number_opt'` = **1**).
+
+```
+test json_format::tests::grpc_status_json_absent_is_null_in_every_format ... ok
+test json_format::tests::grpc_status_json_typing_fallbacks_keep_their_type ... ok
+test json_format::tests::grpc_status_json_multi_segment_leaves_the_carve_out ... ok
+test json_format::tests::grpc_status_json_typing_present ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+```
+
+Whole crate: `test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+
+### The accesslog test-count discrepancy, resolved by measurement
+
+⚠ **`PLAN.md` Task 2 Step 4 predicts the `envoy-accesslog` crate finishes at
+`127`. It finishes at `129`, and the extra two are NOT an over-transcription.**
+
+The arithmetic closes exactly: Task 1's filtered run reported `4 passed; 112
+filtered out`, so the pre-existing crate total was **112**. This phase adds
+4 (T1) + 1 (T2) + 6 (T3) + 2 (T4) + 4 (T5) = **17**, and 112 + 17 = **129**.
+
+The transcription was diffed against `PLAN.md` rather than assumed correct: the
+set of test function names added under `crates/envoy-accesslog/` was compared
+with the `fn` names appearing in `PLAN.md`'s code blocks, and the only
+difference is the token `render`, which is the grep truncating the helper
+`render1` (the pattern `[a-z_]+` does not span the digit). **No test in the tree
+is absent from the plan, and no planned test is missing from the tree.**
+
+So the `127` is a stale figure in the PLAN's prototype column, not a defect in
+this implementation. The http1/http2 columns are checked against their own
+predictions at Tasks 6 and 7.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |

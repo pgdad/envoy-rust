@@ -905,4 +905,54 @@ mod tests {
             "{\"o\":{\"alt\":\"POST\",\"ctrl\":\"a\\u0001b\",\"dur\":42,\"trunc\":\"PO\"}}\n"
         );
     }
+
+    fn rec_gs(v: Option<&str>) -> AccessLogRecord {
+        let mut r = rec();
+        r.grpc_status = v.map(str::to_owned);
+        r
+    }
+
+    // The two STRING formats are quoted; the NUMBER format is an UNQUOTED
+    // number.
+    #[test]
+    fn grpc_status_json_typing_present() {
+        let r = rec_gs(Some("5"));
+        assert_eq!(enc("%GRPC_STATUS%", &r), "\"NotFound\"");
+        assert_eq!(enc("%GRPC_STATUS(SNAKE_STRING)%", &r), "\"NOT_FOUND\"");
+        assert_eq!(enc("%GRPC_STATUS(NUMBER)%", &r), "5");
+        assert_eq!(enc("%GRPC_STATUS_NUMBER%", &r), "5");
+    }
+
+    // The fallbacks keep their TYPE: an out-of-enum numeric is the QUOTED
+    // string `"99"` under CAMEL_STRING but the UNQUOTED number `99` under
+    // NUMBER; the unparseable sentinel behaves the same way with `-1`.
+    #[test]
+    fn grpc_status_json_typing_fallbacks_keep_their_type() {
+        let r = rec_gs(Some("99"));
+        assert_eq!(enc("%GRPC_STATUS%", &r), "\"99\"");
+        assert_eq!(enc("%GRPC_STATUS_NUMBER%", &r), "99");
+        let r = rec_gs(Some("notanumber"));
+        assert_eq!(enc("%GRPC_STATUS%", &r), "\"-1\"");
+        assert_eq!(enc("%GRPC_STATUS_NUMBER%", &r), "-1");
+    }
+
+    // Gate closed → `null` in EVERY format, string and numeric alike.
+    #[test]
+    fn grpc_status_json_absent_is_null_in_every_format() {
+        let r = rec_gs(None);
+        assert_eq!(enc("%GRPC_STATUS%", &r), "null");
+        assert_eq!(enc("%GRPC_STATUS(SNAKE_STRING)%", &r), "null");
+        assert_eq!(enc("%GRPC_STATUS(NUMBER)%", &r), "null");
+        assert_eq!(enc("%GRPC_STATUS_NUMBER%", &r), "null");
+    }
+
+    // A MULTI-SEGMENT leaf LEAVES the typed carve-out and becomes a quoted
+    // string, with the absent value rendering the `-` sentinel INSIDE the
+    // quotes. MEASURED: `{"mixed_num":"x5"}` and, gate-closed, `{"mixed_num":"x-"}`.
+    #[test]
+    fn grpc_status_json_multi_segment_leaves_the_carve_out() {
+        assert_eq!(enc("x%GRPC_STATUS_NUMBER%", &rec_gs(Some("5"))), "\"x5\"");
+        assert_eq!(enc("x%GRPC_STATUS%", &rec_gs(Some("5"))), "\"xNotFound\"");
+        assert_eq!(enc("x%GRPC_STATUS_NUMBER%", &rec_gs(None)), "\"x-\"");
+    }
 }
