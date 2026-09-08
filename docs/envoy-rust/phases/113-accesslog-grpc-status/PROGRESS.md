@@ -554,3 +554,45 @@ Mutation reverted; `grep -c 'if crate::grpc::is_grpc_request(&request.req.header
 | `cargo build --workspace --all-targets` | exit **0** |
 | `cargo fmt --all -- --check` | exit **0** |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
+
+---
+
+## Task 7 — the HTTP/2 boundary: a named helper, not an inline `None`
+
+**Status: COMPLETE.** Commit: `phase 113 task 7: pin the H2 %GRPC_STATUS% boundary behind a named helper (CF-113-2)`.
+
+### Step 1-2 — the failing test
+
+```
+error[E0425]: cannot find function `h2_grpc_status` in module `super`
+error: could not compile `envoy-http2` (lib test) due to 1 previous error
+```
+
+### Step 3-4 — implementation, GREEN
+
+`fn h2_grpc_status() -> Option<String>` added immediately above
+`finalize_h2_stream`'s `#[allow(clippy::too_many_arguments)]` (anchor asserted
+unique), and Task 2's placeholder in the `AccessLogRecord` literal changed from
+`grpc_status: None,` to `grpc_status: h2_grpc_status(),`.
+
+```
+test hcm::h2_grpc_status_boundary_tests::h2_grpc_status_is_absent ... ok
+test result: ok. 125 passed; 1 ignored; 0 failed; 0 measured; 0 filtered out; finished in 0.54s
+```
+
+**125 passed + 1 ignored is exactly `PLAN.md`'s prediction for `envoy-http2`.**
+Together with Task 6's 238, two of the three prototype test-count predictions
+held precisely; only the accesslog column (127 vs the measured 129) was stale.
+
+`PLAN.md` explicitly forbids pinning this with an `include_str!` source-text
+assertion, and none was used — the pin is a behavioural assertion on a named
+function, so an unrelated edit to `hcm.rs` cannot break it and a phase lifting
+CF-113-2 must delete a test deliberately.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |

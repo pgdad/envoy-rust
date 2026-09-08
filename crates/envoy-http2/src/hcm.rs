@@ -996,6 +996,20 @@ async fn handle_one_stream(
 /// AFTER `send_envoy_response` returns (covers both the empty-body
 /// `send_response(.., end_of_stream=true)` branch and the non-empty
 /// `send_data(.., end_of_stream=true)` branch uniformly).
+/// The `%GRPC_STATUS%` backing value for the HTTP/2 access-log record.
+///
+/// ALWAYS `None` (CF-113-2). H2's gRPC status would have to come from the
+/// response TRAILER block, and `finalize_h2_stream` MOVES `trailers` into
+/// `send_envoy_response` before it builds the record — so the value is not
+/// live at the record build. Phase 113 is HTTP/1.1-only by charter.
+///
+/// This is a named function rather than an inline `None` so the boundary is
+/// pinned by `h2_grpc_status_is_absent` below: a phase that lifts it must
+/// change a tested function, not silently edit a struct literal.
+fn h2_grpc_status() -> Option<String> {
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_h2_stream(
     config: &Arc<HCMConfig>,
@@ -1180,7 +1194,7 @@ async fn finalize_h2_stream(
             // response-path (direct_response / via_upstream).
             response_code_details: response_code_details_for_log_h2,
             dynamic_metadata,
-            grpc_status: None,
+            grpc_status: h2_grpc_status(),
         };
         for sink in &config.inner.access_log {
             // Phase 70: the per-sink emit gate. A sink with no filter always
@@ -7731,5 +7745,17 @@ static_resources:
             }
             _other => panic!("expected BuildOutcome::Synth from the shared seam"),
         }
+    }
+}
+
+// ── Phase 113 boundary pin: H2 has NO %GRPC_STATUS% (CF-113-2) ─────────────
+#[cfg(test)]
+mod h2_grpc_status_boundary_tests {
+    // Pins the CF-113-2 boundary. A phase that lifts it must DELETE this test
+    // deliberately rather than change H2 behaviour silently (the ADR-0049
+    // silent-divergence class).
+    #[test]
+    fn h2_grpc_status_is_absent() {
+        assert_eq!(super::h2_grpc_status(), None);
     }
 }
