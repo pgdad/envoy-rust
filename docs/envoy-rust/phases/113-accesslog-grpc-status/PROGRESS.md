@@ -938,3 +938,273 @@ crate, no new config surface, no new harness driver, no new fuzz target.
   and `ADR-0194` DECISION 3 re-measured that at this commit.
 - Gate (d) is the PRE-EXISTING `accesslog_format_parse` target, which gained
   three seeds; there is no new fuzz target and `ci.yml` is unchanged.
+
+---
+
+# §5 STATE 4 — the §7.5 verification gate
+
+**Session:** the §5 state-4 verification gate, run in a SEPARATE session from the
+state-3 implementation per §5.1 / `ADR-0127` (the context that wrote an artifact
+must not grade it). Entered at HEAD `bb794bfdd3360f7d88fca260e330feda22092efa`,
+the state-3 CI-record commit, tree clean, `origin/main` in sync.
+
+**Result: the gate PASSES on legs (a), (b), (c), (d) and (e). Leg (f) is state
+5's and is NOT this session's.** No ADR fired — nothing ambiguous was resolved.
+
+All three stop-condition legs were re-measured FALSE from disk before anything
+else, and no `stop` file was created.
+
+---
+
+## Leg (e) — the five `cargo` commands
+
+⚠ **`cargo clippy` was run TWICE, and the first run is exactly the trap this
+project has banked.** It exited **0** in **0.10s** with **ZERO `Checking`
+lines** — a fully cached no-op that proves nothing. The `Checking` count
+measures the CACHE's dirty set, not the code. A dirty set was forced with an
+**mtime-only** `touch -m` of the three phase-113 crate roots (paths first
+confirmed tracked via `git ls-files --error-unmatch`, so no file was created and
+`git status --porcelain` stayed empty), and clippy was re-run:
+
+```
+Checking lines in that run: 0  <-- 0 means CACHED NO-OP
+  touched (tracked, mtime only): crates/envoy-accesslog/src/lib.rs
+  touched (tracked, mtime only): crates/envoy-http1/src/lib.rs
+  touched (tracked, mtime only): crates/envoy-http2/src/lib.rs
+(tree still clean above — touch -m changed no content)
+CLIPPY_EXIT=0
+Checking lines now: 14
+    Checking envoy-accesslog v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-accesslog)
+    Checking envoy-config v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-config)
+    Checking envoy-listener v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-cluster v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+    Checking envoy-tls v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tls)
+    Checking envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+error lines: 0  warning lines: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.06s
+```
+
+**14 crates genuinely re-checked, 0 errors, 0 warnings.** That is the result the
+gate records; the 0.10s run is recorded only so a reader knows it was rejected.
+
+| command | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit **0**, **0 bytes** of output |
+| `cargo build --workspace --all-targets` | exit **0** — `Finished \`dev\` profile ... in 3.11s` |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0**, **14 `Checking`**, 0 errors, 0 warnings |
+| `cargo deny check` | exit **0** — `advisories ok, bans ok, licenses ok, sources ok` |
+| `cargo test --workspace --no-fail-fast` | **169 binaries, 2292 passed, 6 failed** — every failure classified below |
+
+`cargo deny check` also emits one `warning[license-not-encountered]` for the
+`"Zlib"` allowance at `deny.toml:50`. It is **pre-existing and cannot be this
+phase's**: `git diff --numstat 1ff03ba4 HEAD -- deny.toml Cargo.toml Cargo.lock
+.github/workflows/ci.yml tests/differential/src/lib.rs` returns **empty**, so the
+whole dependency and policy surface is untouched. That same empty result is
+**PV-8 re-confirmed at the gate.**
+
+---
+
+## Legs (a) and (b) — the differential corpus
+
+The full sweep was run with `--no-fail-fast` and redirected to a file (never
+piped through `tail`, which truncates the `failures:` block). The awk fields
+were DERIVED by printing `$1..$NF` of one matched line rather than assumed —
+this local form has **no** ISO timestamp prefix, so `$4` is passed and `$6` is
+failed, one lower than the `gh api …/jobs/<id>/logs` form:
+
+```
+$1=[test] $2=[result:] $3=[ok.] $4=[178] $5=[passed;] $6=[0] $7=[failed;] $8=[2] $9=[ignored;] ...
+binaries=169 passed=2292 failed=6
+ok rows: 163   FAILED rows: 6
+```
+
+**`failed=6` is not tautological** — 163 `ok` rows and 6 `FAILED` rows were
+counted separately, so the match genuinely discriminates.
+
+### The six local reds, censused by their `---- <name> stdout ----` markers
+
+Censused by marker, not by indentation (the `failures:` block cannot be censused
+by indentation):
+
+```
+---- access_log_h2_rcd_upstream_reset stdout ----
+---- access_log_h2_uc_upstream_reset stdout ----
+---- access_log_rcd_upstream_reset stdout ----
+---- access_log_rf_upstream_reset stdout ----
+---- admin_config_dump_server_info stdout ----
+---- set_metadata_dynamic_metadata stdout ----
+```
+
+**FIVE are exactly the documented stable core** — the four
+`access_log_*_upstream_reset` plus `admin_config_dump_server_info`. They are a
+known local-host set, CI-authoritative, and not a regression.
+
+**The SIXTH, `set_metadata_dynamic_metadata`, is NOT in the documented core, and
+it was treated as a suspect rather than waved through** — deliberately, because
+phase 113 modified `command_operator.rs`, which owns the `%DYNAMIC_METADATA%`
+parse path, and this phase's empty-`()` relaxation changed the guard that arm
+sits behind. A name-collision with a surface this phase touched is exactly when
+a text-based dismissal would be wrong.
+
+It was classified by **ISOLATION**, after a 30-second settle gap and with a
+30-second gap between runs (back-to-back Docker runs manufacture a false
+`FAILS-IN-ISOLATION`):
+
+```
+run 1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.83s
+run 2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.80s
+run 3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.79s
+```
+
+**3/3 green alone.** Two independent corroborations agree, and neither is the
+failure text:
+
+1. **Structural.** The panic is `upstream Envoy never became accept-ready` /
+   `127.0.0.1:55566 not accept-ready within 10s: Connection refused`. The party
+   that failed to bind is the **upstream Envoy Docker container** — a process
+   envoy-rust does not build, link, or configure. No change under `crates/` can
+   cause it.
+2. **CI.** The state-3 run 34175051145 reported `failed=0` across all 169
+   binaries, this test included.
+
+It is the documented upstream-container readiness family: contention under a
+parallel sweep, not a regression.
+
+### Leg (a) — fixture `0093`, this phase's own witness
+
+⚠ Run only AFTER an explicit `cargo build -p envoy-bin`, gated on the
+`Compiling` lines and not the exit code, because the harness spawns a
+**pre-built** binary and `cargo test -p differential` never rebuilds it:
+
+```
+build exit=0; Compiling lines=12
+   Compiling envoy-accesslog v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-accesslog)
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.78s
+```
+
+**GREEN against both real proxies, on a binary proved to carry this phase's
+code.**
+
+⚠ **Leg (a) does NOT extend to the request-side gate.** `ADR-0193` DECISION 2 /
+`ADR-0194` DECISION 3: fixture `0093` cannot witness it, and stays GREEN with
+the gate deleted. This gate session did not re-run that mutation — it was
+measured at `8841ae3f` and is recorded there — but it restates the limitation so
+that **the state-5 REVIEW cannot read leg (a) as gate coverage.**
+
+### Leg (b) — the other 92 fixtures
+
+Covered by the same sweep. Of the 92 pre-existing runner files, the only reds are
+the six above: five documented stable-core, one isolated-green. **No
+pre-existing fixture regressed.**
+
+---
+
+## Leg (c) — conformance
+
+⚠ **The h2spec gate SELF-SKIPS locally and a local green is worthless.**
+Verified rather than assumed: `which h2spec` → **not on PATH**, and
+`tests/conformance/h2spec/tests/h2spec_runner.rs:26` returns early with
+`eprintln!("h2spec_runner: {} — skipping locally")` when the binary is missing.
+So the local sweep's pass for that binary carries **no information**.
+
+**CI is the authority for leg (c)**, and it genuinely ran: at the state-3 run
+34175051145 the ANSI-stripped job log had `h2spec not found` = **0**
+occurrences, which is the positive control that the gate executed rather than
+self-skipped. This session's own CI run re-confirms it below.
+
+---
+
+## Leg (d) — fuzzing
+
+**No NEW fuzz target**, so no `ci.yml` change was needed; §7.4's trigger is
+satisfied by the pre-existing `accesslog_format_parse` target, which already
+covers the format-string parser this phase extended. Confirmed on disk:
+
+```
+78:    name: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse + grpc_health_decode, 30s each)
+122:      - name: fuzz accesslog_format_parse
+127:        run: cargo +nightly fuzz run accesslog_format_parse -- -max_total_time=30
+```
+
+The three new seeds are TRACKED — verified with `git ls-files` and the PLAIN
+`git check-ignore` form per file, never with `ls`:
+
+```
+11   (8 pre-existing + 3 new)
+  not ignored: grpc_status
+  not ignored: grpc_status_formats
+  not ignored: grpc_status_malformed
+```
+
+CI's exact invocation was run locally, from the crate directory:
+
+```
+$ cd crates/envoy-accesslog && cargo +nightly fuzz run accesslog_format_parse -- -max_total_time=30
+FUZZ_EXIT=0
+Done 4117175 runs in 31 second(s)
+crash/leak/deadly-signal markers: 0
+```
+
+**The corpus was genuinely READ** — the positive control against a fuzzer that
+silently starts from nothing:
+
+```
+INFO: seed corpus: files: 1774 min: 1b max: 4032b total: 1175850b rss: 33Mb
+#1775	INITED cov: 409 ft: 1877 corp: 444/193Kb exec/s: 0 rss: 81Mb
+```
+
+Tree still clean afterwards and the tracked seed count still 11, so the run
+produced no crash artifact and no accidental corpus commit.
+
+---
+
+## A citation defect in this file's own state-3 section, corrected forward
+
+⚠ **`PROGRESS.md`'s state-3 task ledger cites Task 7's commit as
+`*(in \`f151731\`'s successor)*`. That is vague where every other row is exact,
+and it is wrong to leave standing: Task 7 has its own commit, `c9dfb50`**
+(`phase 113 task 7: pin the H2 %GRPC_STATUS% boundary behind a named helper
+(CF-113-2)`), re-derived here from `git log`.
+
+The landed state-3 text is not rewritten — the correction is recorded forward,
+which is the same discipline the state-3 session used for `PLAN.md`. The task
+COUNT it supports is unaffected and was re-verified: ten task commits
+(`abbe107`, `2201c36`, `5aeda62`, `8233136`, `d3ce3ef`, `f151731`, `c9dfb50`,
+`9712ef4`, `e53582f`, `0b0c7ea`) plus the state-advance `8841ae3f` = eleven, as
+`STATE.md` states.
+
+---
+
+## What this session did NOT do
+
+- **Did not run the state-5 code review.** Leg (f) is that session's; §5.1 and
+  `ADR-0127` forbid chaining 4→5.
+- **Did not touch `ROADMAP.md`.** Row `113` stays `planned` until the state-6
+  close-out. Census re-measured unchanged: 121 rows / 120 `done` / 1 `planned`.
+- **Did not edit `SPEC.md`, `PLAN.md`, or any landed task commit.**
+- **Did not fix anything outside phase 113** (§6.3; `ADR-0165`). Every
+  carry-forward stands INTACT, `CF-111-4` still consumed only in PART,
+  `CF-112-5` still CLOSED, `CF-113-5`/`CF-113-6` still open.
+- **Did not fire an ADR.** Nothing ambiguous was resolved; the one correction is
+  a citation, recorded above.
+- **Did not create a `stop` file.**
+
+## For the state-5 session
+
+- **`REVIEW.md` is yours, and it is §7.5 leg (f).** The other five legs are
+  discharged and quoted above.
+- ⚠ **Do NOT record fixture `0093` as covering the operator's request-side
+  gate.** It provably does not (`ADR-0193` DECISION 2, `ADR-0194` DECISION 3,
+  `CF-113-6`); the sole witness is
+  `hcm::grpc_status_access_log_tests::gate_stays_shut_on_the_four_measured_negative_spellings`.
+- ⚠ **The empty-`()` relaxation changed the contract of ELEVEN pre-existing
+  operators.** Its scope was measured, not argued — review that reasoning
+  rather than re-deriving it from the diff alone.
+- ⚠ **`ADR-0194` DECISION 1 deferred the clippy gate at two task boundaries.**
+  Confirm there is no `#[allow(dead_code)]` anywhere in the phase's diff rather
+  than taking the ADR's word: the correct check is scoped to `crates/`/`tests/`,
+  because the phrase appears in the ADR/STATE/PROGRESS PROSE and an unscoped
+  grep returns a misleading 4.
