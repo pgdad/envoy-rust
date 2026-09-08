@@ -1,8 +1,8 @@
 //! AccessLogRecord — POD value-type carrying the per-request fields
 //! rendered by the Envoy access-log emitters: the 14 default-format
 //! substitution targets, a leading `start_time` SystemTime (formatted
-//! per `default_format::format_iso8601`), and 4 later-phase
-//! command-operator targets (19 fields total).
+//! per `default_format::format_iso8601`), and 5 later-phase
+//! command-operator targets (20 fields total).
 //!
 //! Built at HCM on-response-complete time by `envoy-http1::hcm`'s
 //! factored join point; consumed (by reference) by
@@ -11,11 +11,12 @@
 use std::time::{Duration, SystemTime};
 
 /// AccessLogRecord — value-type carrying the per-request state that
-/// the Envoy access-log emitters render. 19 fields total: a leading
+/// the Envoy access-log emitters render. 20 fields total: a leading
 /// SystemTime for `%START_TIME%`, 14 substitution targets matching
-/// the Envoy default access-log format (one per token), plus 4
+/// the Envoy default access-log format (one per token), plus 5
 /// later-phase command-operator targets (`upstream_cluster`,
-/// `route_name`, `response_code_details`, `dynamic_metadata`).
+/// `route_name`, `response_code_details`, `dynamic_metadata`,
+/// `grpc_status`).
 ///
 /// Built at HCM on-response-complete time; consumed by reference by
 /// the default-format emitter and the FileSink. Owns its String
@@ -110,6 +111,16 @@ pub struct AccessLogRecord {
     /// `%DYNAMIC_METADATA(namespace:key)%` command-operator (phase 33).
     pub dynamic_metadata:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+
+    /// Raw wire value of the response `grpc-status` header, captured ONLY when
+    /// the REQUEST was a gRPC request (phase 113). `None` on every non-gRPC
+    /// request, even when the response carries the header — that gate is the
+    /// measured upstream rule, not an optimisation. Stored as the raw string
+    /// (not a parsed integer) so the renderer can reproduce upstream's
+    /// out-of-enum and unparseable fallbacks. Rendered by `%GRPC_STATUS%` /
+    /// `%GRPC_STATUS(CAMEL_STRING|SNAKE_STRING|NUMBER)%` / `%GRPC_STATUS_NUMBER%`
+    /// — absent → `-` sentinel / json `null`.
+    pub grpc_status: Option<String>,
 }
 
 /// Shared test-fixture constructor. Lives on the type (not in a test module)
@@ -145,6 +156,7 @@ impl AccessLogRecord {
             route_name: None,
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
+            grpc_status: None,
         }
     }
 }
@@ -232,5 +244,19 @@ mod tests {
         clone.method = "POST".into();
         assert_eq!(original.method, "GET");
         assert_eq!(clone.method, "POST");
+    }
+
+    // Phase 113: the %GRPC_STATUS% backing field. Absent by default — the HCM
+    // populates it only when the REQUEST was a gRPC request.
+    #[test]
+    fn record_grpc_status_defaults_absent_and_carries_the_raw_value() {
+        let absent = AccessLogRecord::test_baseline();
+        assert!(absent.grpc_status.is_none());
+
+        let coded = AccessLogRecord {
+            grpc_status: Some("13".into()),
+            ..absent
+        };
+        assert_eq!(coded.grpc_status.as_deref(), Some("13"));
     }
 }

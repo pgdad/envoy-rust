@@ -133,3 +133,96 @@ unusual-looking
 which rustfmt accepts unchanged. That is corroboration that the PLAN's code was
 genuinely executed rather than written from reasoning — a hand-written block
 would almost certainly have needed reformatting here.
+
+---
+
+## Task 2 — `AccessLogRecord.grpc_status` and the five-site E0063 sweep
+
+**Status: COMPLETE.** Commit: `phase 113 task 2: AccessLogRecord.grpc_status + the five-site E0063 sweep`.
+
+### Step 1-2 — the failing test, RUN and SEEN to fail
+
+`record_grpc_status_defaults_absent_and_carries_the_raw_value` added to
+`mod tests` in `crates/envoy-accesslog/src/record.rs`.
+`cargo test -p envoy-accesslog --lib record_grpc_status`:
+
+```
+error[E0609]: no field `grpc_status` on type `record::AccessLogRecord`
+   --> crates/envoy-accesslog/src/record.rs:248:26
+    |
+248 |         assert_eq!(coded.grpc_status.as_deref(), Some("13"));
+    |                          ^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `start_time`, `method`, `path`, `protocol`, `response_code` ... and 14 others
+error: could not compile `envoy-accesslog` (lib test) due to 3 previous errors
+```
+
+### Step 3 — the field and the sweep
+
+`pub grpc_status: Option<String>` added as the LAST field of `AccessLogRecord`,
+with the doc comment `PLAN.md` specifies. Both `19 fields total` occurrences
+(module doc and struct doc) updated to `20 fields total`, and the struct doc's
+`plus 4 later-phase command-operator targets (...)` enumeration widened to 5 and
+extended with `grpc_status` — the enumeration is a second, independent count of
+the same thing, and leaving it at 4 while the total said 20 would have shipped a
+document that contradicts itself.
+
+**The E0063 site list was re-derived from disk rather than inherited**, by
+grepping `AccessLogRecord {` across `crates/` and `tests/`. It returns nine
+literals; the five exhaustive ones are exactly those `PLAN.md` names:
+
+| # | site (re-derived at THIS commit) | kind |
+|---|---|---|
+| 1 | `crates/envoy-http1/src/hcm.rs:1662` `build_access_log_record` | production |
+| 2 | `crates/envoy-http2/src/hcm.rs:1158` `finalize_h2_stream` | production |
+| 3 | `crates/envoy-accesslog/src/record.rs:128` `test_baseline()` | `#[cfg(test)]` |
+| 4 | `crates/envoy-accesslog/src/file_sink.rs:169` `make_record()` | `#[cfg(test)]` |
+| 5 | `crates/envoy-http1/src/hcm.rs:2594` `record_get_200()` | `#[cfg(test)]` |
+
+The four `..base` functional-update literals at `record.rs:166/178/190/205` were
+NOT touched, as `PLAN.md` requires, and the five `test_baseline()`-based
+builders (`command_operator.rs:704`/`:868`, `json_format.rs:293`/`:315`,
+`default_format.rs:201`) needed no edit — they inherit the new field
+transitively, which is that constructor's stated design intent.
+
+Every replacement asserted its anchor occurs EXACTLY ONCE before splicing.
+`grpc_status: None,` is a substring of itself at several sites, so a
+count-blind `replace` would have been silently wrong at more than one of them.
+
+### Step 4 — GREEN
+
+`cargo build --workspace --all-targets` → `Finished \`dev\` profile ... in 6.51s`,
+exit 0, **zero `E0063` remaining**. That is the load-bearing result: `PLAN.md`
+says a sixth literal would mean the enumeration was incomplete and must be
+reported. There is no sixth.
+
+`cargo test -p envoy-accesslog -p envoy-http1 -p envoy-http2 --lib`:
+
+```
+     Running unittests src/lib.rs (target/debug/deps/envoy_accesslog-79243f11c2014c81)
+test result: ok. 117 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/envoy_http1-2f7bcc9b69abd627)
+test result: ok. 233 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/envoy_http2-fd244d1e8f63bdf3)
+test result: ok. 124 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.54s
+```
+
+⚠ **`PLAN.md` Task 2 Step 4 predicts `127 / 238 / 125`. Those are END-OF-SLICE
+prototype figures, not Task-2 figures** — the same whole-slice artefact behind
+the clippy finding above. The remaining tasks add 5 http1 tests (Task 6) and 1
+http2 test (Task 7), which lands those two exactly on 238 and 125. The
+accesslog column is tracked to its final value at Task 5 rather than asserted
+against 127 here.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **DEFERRED to Task 3** — the SAME three `dead_code` items as Task 1, no new one |
+
+The clippy failure set was re-checked, not assumed: it is still exactly
+`GRPC_STATUS_NAMES` / `grpc_status_code` / `render_grpc_status`. Task 2 added no
+new dead item — the new record field is `pub` on a `pub` struct and so is
+reachable.

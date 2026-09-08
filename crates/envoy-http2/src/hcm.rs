@@ -1180,6 +1180,7 @@ async fn finalize_h2_stream(
             // response-path (direct_response / via_upstream).
             response_code_details: response_code_details_for_log_h2,
             dynamic_metadata,
+            grpc_status: None,
         };
         for sink in &config.inner.access_log {
             // Phase 70: the per-sink emit gate. A sink with no filter always

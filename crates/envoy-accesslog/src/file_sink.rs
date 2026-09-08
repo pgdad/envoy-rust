@@ -186,6 +186,7 @@ mod tests {
             route_name: None,
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
+            grpc_status: None,
         }
     }
 
