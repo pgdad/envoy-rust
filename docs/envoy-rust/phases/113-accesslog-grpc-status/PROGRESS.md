@@ -226,3 +226,107 @@ The clippy failure set was re-checked, not assumed: it is still exactly
 `GRPC_STATUS_NAMES` / `grpc_status_code` / `render_grpc_status`. Task 2 added no
 new dead item — the new record field is `pub` on a `pub` struct and so is
 reachable.
+
+---
+
+## Task 3 — the parser: the `GRPC_STATUS` arm, the alias, and the empty-`()` correction
+
+**Status: COMPLETE.** Commit: `phase 113 task 3: parse %GRPC_STATUS% family; accept empty () on no-arg operators (measured divergence)`.
+
+This is the task the compiler forbids cutting finer: adding `Op::GrpcStatus`
+breaks BOTH exhaustive `match`es over `Op`, so the variant, the parse arm, the
+alias, the `render_op` arm and the `encode_single_op` arm land together. Tasks 4
+and 5 add only the tests that pin the two arms.
+
+### Step 1-2 — the failing tests, RUN and SEEN to fail
+
+Six tests added: `grpc_status_default_format_is_camel_string`,
+`grpc_status_number_alias_agrees_with_number_argument`,
+`empty_parens_are_accepted_on_no_arg_operators`,
+`grpc_status_rejects_every_measured_bad_argument` (9 spellings),
+`grpc_status_rejects_length_suffix_and_argument_on_the_alias`,
+`grpc_status_keyword_match_is_exact_not_prefix`.
+
+```
+error[E0599]: no variant named `GrpcStatus` found for enum `command_operator::Op`
+error: could not compile `envoy-accesslog` (lib test) due to 1 previous error
+```
+
+### Step 3 — the implementation, five parts
+
+(a) `Op::GrpcStatus { format: GrpcStatusFormat }` as the 15th variant.
+(b) the `"GRPC_STATUS" => parse_grpc_status_op(rest)` arm plus the no-arg guard
+relaxed from `rest.is_some()` to `rest.is_some_and(|r| r != "()")`.
+(c) `"GRPC_STATUS_NUMBER"` added to `no_arg_op`, constructing the SAME variant
+with `format: Number` rather than a second variant.
+(d) `parse_grpc_status_op`.
+(e) the two forced arms — `render_op` and `encode_single_op` — plus `number_opt`
+in `json_format.rs`.
+
+Every splice asserted its anchor occurs exactly once first.
+
+### Step 4 — GREEN, and the regression question the change actually raises
+
+`cargo test -p envoy-accesslog --lib grpc_status` → `10 passed; 0 failed; 113
+filtered out`.
+
+⚠ **`PLAN.md` says "Task 1's 4 tests plus these 6" = 10, and 10 is what ran —
+but the COMPOSITION is not what that sentence describes.** The filter
+`grpc_status` does not match `empty_parens_are_accepted_on_no_arg_operators`
+(its name contains no such substring) and does match Task 2's
+`record_grpc_status_defaults_absent_and_carries_the_raw_value`. The 10 is
+4 (Task 1) + 5 (Task 3) + 1 (Task 2), not 4 + 6. The missing test was run
+separately and passes:
+
+```
+test command_operator::tests::empty_parens_are_accepted_on_no_arg_operators ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 0.00s
+```
+
+Recorded because an agreeing TOTAL is not a verified composition — this is the
+same class as the PLAN-write's own `cp -r` finding, where two agreeing numbers
+turned out to be one measurement.
+
+Whole crate: `cargo test -p envoy-accesslog --lib` → `123 passed; 0 failed`.
+
+**The `()` relaxation changes the contract of ELEVEN pre-existing operators, so
+its scope was MEASURED, not argued.** `PLAN.md` requires it not to reach
+`REQ`/`RESP`/`DYNAMIC_METADATA`. A temporary probe was appended, run, and then
+reverted (the file was restored from a pre-probe copy and `grep -c
+tmp_scope_probe` re-checked to 0):
+
+```
+    fn tmp_scope_probe_empty_parens_does_not_reach_arg_taking_operators() {
+        for f in ["%REQ()%", "%RESP()%", "%DYNAMIC_METADATA()%", "%REQ%", "%DYNAMIC_METADATA%"] {
+            assert!(parse_format(f).is_err(), "{f} must STILL be rejected");
+        }
+    }
+```
+```
+test command_operator::tests::tmp_scope_probe_empty_parens_does_not_reach_arg_taking_operators ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.00s
+```
+
+All five still reject. The relaxation is structurally scoped: `parse_operator`
+dispatches `REQ`/`RESP`/`DYNAMIC_METADATA` by exact keyword BEFORE the `other =>
+no_arg_op(other)` branch the relaxation lives in, so those three can never reach
+it. The pre-existing suites confirm it from the other side —
+`dynamic_metadata` 7 passed, `truncat` 6 passed, both unchanged.
+
+The permanent guard against over-widening is inside
+`grpc_status_rejects_length_suffix_and_argument_on_the_alias`, which asserts
+`%RESPONSE_CODE(FOO)%` is STILL rejected: a NON-empty argument on a no-arg
+keyword remains fatal.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `Finished \`dev\` profile ... in 4.03s`, exit **0** |
+
+**The deferred clippy gate is DISCHARGED here, in full and for the whole
+workspace**, exactly at the boundary the Task-1 correction predicted: the three
+`dead_code` items now have production consumers in `render_op` and
+`encode_single_op`. No `#[allow]` was needed and none exists.

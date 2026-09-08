@@ -84,6 +84,13 @@ pub enum Op {
     /// string value renders RAW, UNQUOTED (§A3); an absent namespace or key
     /// renders `-` (§A4).
     DynamicMetadata { namespace: String, key: String },
+    /// `%GRPC_STATUS%` / `%GRPC_STATUS(CAMEL_STRING|SNAKE_STRING|NUMBER)%` /
+    /// `%GRPC_STATUS_NUMBER%` (phase 113). Backed by
+    /// [`crate::record::AccessLogRecord::grpc_status`], which the HCM populates
+    /// only when the REQUEST was gRPC. `%GRPC_STATUS_NUMBER%` is an ALIAS for
+    /// `%GRPC_STATUS(NUMBER)%` — MEASURED byte-identical upstream in both the
+    /// text and the JSON format — so both spellings parse to this one variant.
+    GrpcStatus { format: GrpcStatusFormat },
 }
 
 /// The rendering format of a `%GRPC_STATUS%` operator. `CamelString` is the
@@ -315,10 +322,15 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         "REQ" => parse_header_op(keyword, rest, Side::Req),
         "RESP" => parse_header_op(keyword, rest, Side::Resp),
         "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
+        "GRPC_STATUS" => parse_grpc_status_op(rest),
         other => match no_arg_op(other) {
-            // Non-arg keywords: must NOT carry parens.
+            // Non-arg keywords: must NOT carry parens — EXCEPT an EMPTY `()`,
+            // which upstream accepts on every no-arg operator (MEASURED at the
+            // phase-113 PLAN-write: `%RESPONSE_CODE()%` and `%PROTOCOL()%` both
+            // load OK on envoyproxy/envoy:v1.33.0, while `%RESPONSE_CODE(FOO)%`
+            // is rejected with `does not take any parameters or length`).
             Some(op) => {
-                if rest.is_some() {
+                if rest.is_some_and(|r| r != "()") {
                     return Err(FormatParseError::MalformedArgument {
                         keyword: other.to_string(),
                         detail: "this operator takes no '(...)' argument".to_string(),
@@ -349,8 +361,61 @@ fn no_arg_op(keyword: &str) -> Option<Op> {
         "RESPONSE_CODE_DETAILS" => Op::ResponseCodeDetails,
         "START_TIME" => Op::StartTime,
         "DURATION" => Op::Duration,
+        // Phase 113: an ALIAS for `%GRPC_STATUS(NUMBER)%` (MEASURED identical
+        // upstream in both the text and the JSON format), so it constructs the
+        // same `Op` rather than a second variant.
+        "GRPC_STATUS_NUMBER" => Op::GrpcStatus {
+            format: GrpcStatusFormat::Number,
+        },
         _ => return None,
     })
+}
+
+/// Parse `%GRPC_STATUS%`, `%GRPC_STATUS()%` and
+/// `%GRPC_STATUS(CAMEL_STRING|SNAKE_STRING|NUMBER)%`.
+///
+/// This is the engine's FIRST operator with an OPTIONAL parenthesized argument:
+/// `REQ`/`RESP`/`DYNAMIC_METADATA` all REQUIRE one and every `no_arg_op`
+/// keyword FORBIDS one. MEASURED reject set (upstream
+/// `GrpcStatusFormatter only supports CAMEL_STRING, SNAKE_STRING or NUMBER.`):
+/// lower/mixed case, any surrounding whitespace, a comma-separated pair, and
+/// any unknown spelling. A trailing `:N` length is separately fatal upstream
+/// (`GRPC_STATUS does not allow length to be specified.`).
+fn parse_grpc_status_op(rest: Option<&str>) -> Result<Op, FormatParseError> {
+    let Some(rest) = rest else {
+        return Ok(Op::GrpcStatus {
+            format: GrpcStatusFormat::CamelString,
+        });
+    };
+    debug_assert!(rest.starts_with('('));
+
+    let close = rest
+        .find(')')
+        .ok_or_else(|| FormatParseError::MalformedArgument {
+            keyword: "GRPC_STATUS".to_string(),
+            detail: "missing closing ')' on the format argument".to_string(),
+        })?;
+    if !rest[close + 1..].is_empty() {
+        return Err(FormatParseError::MalformedArgument {
+            keyword: "GRPC_STATUS".to_string(),
+            detail: "does not allow a ':N' length to be specified".to_string(),
+        });
+    }
+
+    let format = match &rest[1..close] {
+        "" | "CAMEL_STRING" => GrpcStatusFormat::CamelString,
+        "SNAKE_STRING" => GrpcStatusFormat::SnakeString,
+        "NUMBER" => GrpcStatusFormat::Number,
+        other => {
+            return Err(FormatParseError::MalformedArgument {
+                keyword: "GRPC_STATUS".to_string(),
+                detail: format!(
+                    "only supports CAMEL_STRING, SNAKE_STRING or NUMBER (got '{other}')"
+                ),
+            });
+        }
+    };
+    Ok(Op::GrpcStatus { format })
 }
 
 /// Parse a `REQ`/`RESP` operator: `KEYWORD(ARG)` optionally followed by `:N`.
@@ -624,6 +689,10 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord, omit_empty: bo
                 .map(String::as_str)
                 .unwrap_or(empty_or_dash),
         ),
+        Op::GrpcStatus { format } => match record.grpc_status.as_deref() {
+            Some(raw) => out.push_str(&render_grpc_status(raw, *format)),
+            None => out.push_str(empty_or_dash),
+        },
         Op::Req {
             name,
             alt,
@@ -1232,5 +1301,106 @@ mod tests {
                 "raw {raw:?}"
             );
         }
+    }
+
+    // The default (no argument) format is CAMEL_STRING, NOT the number and NOT
+    // the snake spelling.
+    #[test]
+    fn grpc_status_default_format_is_camel_string() {
+        assert_eq!(
+            parse_format("%GRPC_STATUS%").unwrap(),
+            vec![Segment::Op(Op::GrpcStatus {
+                format: GrpcStatusFormat::CamelString
+            })]
+        );
+    }
+
+    // `%GRPC_STATUS_NUMBER%` and `%GRPC_STATUS(NUMBER)%` are the SAME operator:
+    // MEASURED byte-identical upstream in both the text and the JSON format.
+    #[test]
+    fn grpc_status_number_alias_agrees_with_number_argument() {
+        assert_eq!(
+            parse_format("%GRPC_STATUS_NUMBER%").unwrap(),
+            parse_format("%GRPC_STATUS(NUMBER)%").unwrap()
+        );
+    }
+
+    // An EMPTY `()` argument is ACCEPTED and means the default — on
+    // `%GRPC_STATUS%` AND on every pre-existing no-arg operator. MEASURED:
+    // `%GRPC_STATUS()%`, `%GRPC_STATUS_NUMBER()%`, `%RESPONSE_CODE()%` and
+    // `%PROTOCOL()%` all load `configuration ... OK` on
+    // envoyproxy/envoy:v1.33.0. envoy-rust rejected all four before this phase.
+    #[test]
+    fn empty_parens_are_accepted_on_no_arg_operators() {
+        for (with, without) in [
+            ("%GRPC_STATUS()%", "%GRPC_STATUS%"),
+            ("%GRPC_STATUS_NUMBER()%", "%GRPC_STATUS_NUMBER%"),
+            ("%RESPONSE_CODE()%", "%RESPONSE_CODE%"),
+            ("%PROTOCOL()%", "%PROTOCOL%"),
+        ] {
+            assert_eq!(
+                parse_format(with).unwrap(),
+                parse_format(without).unwrap(),
+                "{with} must parse as {without}"
+            );
+        }
+    }
+
+    // The MEASURED reject set. Upstream:
+    // `GrpcStatusFormatter only supports CAMEL_STRING, SNAKE_STRING or NUMBER.`
+    // Case-sensitive, no whitespace tolerance, no multi-argument form.
+    #[test]
+    fn grpc_status_rejects_every_measured_bad_argument() {
+        for bad in [
+            "%GRPC_STATUS(camel_string)%",
+            "%GRPC_STATUS(Camel_String)%",
+            "%GRPC_STATUS(number)%",
+            "%GRPC_STATUS( CAMEL_STRING )%",
+            "%GRPC_STATUS(CAMEL_STRING )%",
+            "%GRPC_STATUS( CAMEL_STRING)%",
+            "%GRPC_STATUS(  )%",
+            "%GRPC_STATUS(FOO)%",
+            "%GRPC_STATUS(NUMBER,CAMEL_STRING)%",
+        ] {
+            assert!(
+                matches!(
+                    parse_format(bad).unwrap_err(),
+                    FormatParseError::MalformedArgument { .. }
+                ),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    // A trailing `:N` length is separately fatal upstream
+    // (`GRPC_STATUS does not allow length to be specified.`), and
+    // `%GRPC_STATUS_NUMBER(NUMBER)%` is fatal as
+    // `GRPC_STATUS_NUMBER does not take any parameters or length`.
+    #[test]
+    fn grpc_status_rejects_length_suffix_and_argument_on_the_alias() {
+        assert!(matches!(
+            parse_format("%GRPC_STATUS(CAMEL_STRING):5%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+        assert!(matches!(
+            parse_format("%GRPC_STATUS_NUMBER(NUMBER)%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+        // The `()` tolerance must NOT have widened this: a NON-empty argument
+        // on a no-arg keyword is still rejected.
+        assert!(matches!(
+            parse_format("%RESPONSE_CODE(FOO)%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+    }
+
+    // `%GRPC_STATUSX%` stays an UnknownKeyword — the new arm matches the
+    // keyword EXACTLY, not by prefix.
+    #[test]
+    fn grpc_status_keyword_match_is_exact_not_prefix() {
+        assert!(matches!(
+            parse_format("%GRPC_STATUSX%").unwrap_err(),
+            FormatParseError::UnknownKeyword(k) if k == "GRPC_STATUSX"
+        ));
     }
 }

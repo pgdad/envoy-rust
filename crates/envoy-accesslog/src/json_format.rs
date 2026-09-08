@@ -220,6 +220,21 @@ fn quote(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Emit an OPTIONAL numeric value: the unquoted number when present, `null`
+/// when absent. `quote_opt` cannot express this — `%GRPC_STATUS(NUMBER)%` is
+/// the engine's FIRST operator that is both numeric-typed AND `Option`-backed
+/// (every prior numeric operator reads a non-`Option` field and is always
+/// present). MEASURED upstream: `{"gs_num_op":5}` on a gRPC request, and
+/// `{"gs_num_op":null}` when the gate is closed.
+fn number_opt(out: &mut String, v: Option<i64>) {
+    match v {
+        Some(n) => {
+            let _ = write!(out, "{n}");
+        }
+        None => out.push_str("null"),
+    }
+}
+
 fn quote_opt(out: &mut String, v: Option<&str>) {
     match v {
         Some(s) => quote(out, s),
@@ -259,6 +274,26 @@ fn encode_single_op(out: &mut String, op: &Op, r: &AccessLogRecord) {
                 .and_then(|m| m.get(key))
                 .map(String::as_str),
         ),
+        // Phase 113. MEASURED upstream: the two string formats are quoted
+        // strings even when the value falls back to the number (`"99"`) or to
+        // the unparseable sentinel (`"-1"`); the NUMBER format is an UNQUOTED
+        // number in exactly those same cells (`99`, `-1`). Both are `null` when
+        // the gate is closed.
+        Op::GrpcStatus { format } => match format {
+            crate::command_operator::GrpcStatusFormat::Number => number_opt(
+                out,
+                r.grpc_status
+                    .as_deref()
+                    .map(crate::command_operator::grpc_status_code),
+            ),
+            _ => quote_opt(
+                out,
+                r.grpc_status
+                    .as_deref()
+                    .map(|raw| crate::command_operator::render_grpc_status(raw, *format))
+                    .as_deref(),
+            ),
+        },
         Op::Req {
             name,
             alt,
