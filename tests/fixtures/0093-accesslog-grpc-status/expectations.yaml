@@ -1,0 +1,166 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0093-envoy-mount/access.log
+    envoy_rust: /tmp/0093-envoy-rust-mount/access.log
+  probes:
+    # TWELVE probes, EVERY ONE ON ITS OWN `path:`, and that is load-bearing.
+    # This driver asserts only (a) a per-side line COUNT and (b) whole-line
+    # cross-proxy equality — there is no per-probe assertion and no expected-line
+    # field. With a shared path the twelve lines could not be attributed to the
+    # probes that produced them, and a regression that permuted the mapping
+    # would keep the count at 12 and still pass. `PATH=%REQ(:PATH)%` names the
+    # producer of each line, so any permutation REDs the byte compare. `:path`
+    # is on the seven-name `REQ_ALLOW_LIST`; the gating `content-type` is NOT,
+    # and echoing it would be BOOT-FATAL.
+    #
+    # EVERY probe sets `expected_status` EXPLICITLY. Probes 1-8 are 200 because
+    # the phase-110 transform REWRITES the status; probes 9-12 are the
+    # underlying `direct_response.status` because it does not fire. Relying on
+    # the driver's `200` default would make probes 9-12 RED.
+    #
+    # All twelve are `expect_logged: true` — this fixture has no access-log
+    # `filter:`. The LAST probe being kept means the driver's ordering-aware
+    # `suppression_settle` charges the cheap 2 s CF70_3_SETTLE.
+    # Probe 1 — POSITIVE. `direct_response.status: 200` → 200 → the DEFAULT cell of the phase-110 map. Counter-intuitive: a 200 does NOT map to OK/0.
+    #   GS=Unknown SNAKE=UNKNOWN NUM=2 CODE=200 PATH=/g-ok
+    - method: get
+      path: /g-ok
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 2 — POSITIVE. `direct_response.status: 400` → 400 → 13, an explicit entry in the sparse map.
+    #   GS=Internal SNAKE=INTERNAL NUM=13 CODE=200 PATH=/g-internal
+    - method: get
+      path: /g-internal
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 3 — POSITIVE. `direct_response.status: 401` → 401 → 16, the map's highest code.
+    #   GS=Unauthenticated SNAKE=UNAUTHENTICATED NUM=16 CODE=200 PATH=/g-unauth
+    - method: get
+      path: /g-unauth
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 4 — POSITIVE. `direct_response.status: 403` → 403 → 7.
+    #   GS=PermissionDenied SNAKE=PERMISSION_DENIED NUM=7 CODE=200 PATH=/g-denied
+    - method: get
+      path: /g-denied
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 5 — POSITIVE. `direct_response.status: 404` → 404 → 12.
+    #   GS=Unimplemented SNAKE=UNIMPLEMENTED NUM=12 CODE=200 PATH=/g-unimpl
+    - method: get
+      path: /g-unimpl
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 6 — POSITIVE. `direct_response.status: 503` → 503 → 14.
+    #   GS=Unavailable SNAKE=UNAVAILABLE NUM=14 CODE=200 PATH=/g-unavail
+    - method: get
+      path: /g-unavail
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 7 — POSITIVE. `direct_response.status: 501` → 501 → 2 — the OTHER counter-intuitive default cell (501 is NOT in the sparse map, so it falls through to 2).
+    #   GS=Unknown SNAKE=UNKNOWN NUM=2 CODE=200 PATH=/g-default
+    - method: get
+      path: /g-default
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 8 — POSITIVE. `direct_response.status: 404` → The `application/grpc+` PREFIX cell: the `+proto` suffix DOES open the gate.
+    #   GS=Unimplemented SNAKE=UNIMPLEMENTED NUM=12 CODE=200 PATH=/g-proto
+    - method: get
+      path: /g-proto
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc+proto"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 9 — NEGATIVE. The transform does NOT fire because a `; charset=utf-8` PARAMETER defeats the gate.
+    # The status therefore stays 404 and the three gRPC columns render the `-`
+    # sentinel:
+    #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-param
+    - method: get
+      path: /g-param
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc; charset=utf-8"]
+      expected_status: 404
+      expect_logged: true
+    # Probe 10 — NEGATIVE. The transform does NOT fire because `application/grpc-web` is NOT a gRPC content-type — the `-web` suffix is not the `+` suffix.
+    # The status therefore stays 404 and the three gRPC columns render the `-`
+    # sentinel:
+    #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-web
+    - method: get
+      path: /g-web
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc-web"]
+      expected_status: 404
+      expect_logged: true
+    # Probe 11 — NEGATIVE. The transform does NOT fire because the content-type comparison is CASE-SENSITIVE.
+    # The status therefore stays 404 and the three gRPC columns render the `-`
+    # sentinel:
+    #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-upper
+    - method: get
+      path: /g-upper
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "APPLICATION/GRPC"]
+      expected_status: 404
+      expect_logged: true
+    # Probe 12 — NEGATIVE. The transform does NOT fire because no `content-type` header at all.
+    # The status therefore stays 404 and the three gRPC columns render the `-`
+    # sentinel:
+    #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-plain
+    - method: get
+      path: /g-plain
+      host: envoy-rust.test
+      expected_status: 404
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`), plus a per-side
+  # count of exactly TWELVE lines. The measured lines, byte-identical on
+  # upstream Envoy v1.33.0 and envoy-rust, in probe order:
+  #
+  #   GS=Unknown SNAKE=UNKNOWN NUM=2 CODE=200 PATH=/g-ok
+  #   GS=Internal SNAKE=INTERNAL NUM=13 CODE=200 PATH=/g-internal
+  #   GS=Unauthenticated SNAKE=UNAUTHENTICATED NUM=16 CODE=200 PATH=/g-unauth
+  #   GS=PermissionDenied SNAKE=PERMISSION_DENIED NUM=7 CODE=200 PATH=/g-denied
+  #   GS=Unimplemented SNAKE=UNIMPLEMENTED NUM=12 CODE=200 PATH=/g-unimpl
+  #   GS=Unavailable SNAKE=UNAVAILABLE NUM=14 CODE=200 PATH=/g-unavail
+  #   GS=Unknown SNAKE=UNKNOWN NUM=2 CODE=200 PATH=/g-default
+  #   GS=Unimplemented SNAKE=UNIMPLEMENTED NUM=12 CODE=200 PATH=/g-proto
+  #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-param
+  #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-web
+  #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-upper
+  #   GS=- SNAKE=- NUM=- CODE=404 PATH=/g-plain
+  #
+  # ⚠ WHAT THIS FIXTURE DOES **NOT** WITNESS — read `README.md` before citing it
+  # as coverage. It CANNOT witness the operator's request-side gate. Deleting
+  # the gate and rebuilding `envoy-bin` leaves this fixture GREEN, because on
+  # the local-reply surface the ONLY producer of a response `grpc-status` header
+  # is the phase-110 transform, which is gated on the SAME predicate: with the
+  # gate shut there is no header to read either way. The gate's only witness is
+  # `hcm::grpc_status_access_log_tests::gate_stays_shut_on_the_four_measured_negative_spellings`.
+  # (`ADR-0193` DECISION 2; carry-forward CF-113-6.)
+  #
+  # The only route action is `direct_response` → `clusters: []`, no backend
+  # spawns, so this fixture is verifiable on a development host.

@@ -643,3 +643,135 @@ $ git add -A && git ls-files crates/envoy-accesslog/fuzz/corpus/accesslog_format
 of the three was then re-checked individually with the plain `git check-ignore`
 form and all three now report NOT ignored. `ls` would have shown the files
 whether or not git could see them — the whole point of this task's trap.
+
+---
+
+## Task 9 — differential fixture `0093-accesslog-grpc-status`
+
+**Status: COMPLETE.** Commit: `phase 113 task 9: differential fixture 0093 — the %GRPC_STATUS% family, 12 probes`.
+
+### Step 1-2 — the runner, RUN and SEEN to fail
+
+```
+Caused by:
+    No such file or directory (os error 2)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+### Step 3 — the four fixture files
+
+Numbering re-derived: `tests/fixtures/` holds **92** directories, highest
+`0092-tls-alpn-server-preference`, so `0093` is correct.
+
+The two YAMLs were diffed against each other and differ in **exactly the four
+harness-mandated ways**, none semantic:
+
+```
+2d1
+< admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+6c5
+<       address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
+---
+>       address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+14d12
+<                 generate_request_id: false
+19c17
+<                       path: /tmp/0093-envoy-mount/access.log
+---
+>                       path: /tmp/0093-envoy-rust-mount/access.log
+```
+
+`expectations.yaml` was parsed back with a YAML loader and its twelve probes
+enumerated, rather than eyeballed — all twelve match `PLAN.md`'s table on path,
+content-type and `expected_status`, including the four explicit `404`s on
+probes 9-12 that the driver's `200` default would otherwise have broken.
+
+### Step 4 — GREEN, and TWO independent mutations
+
+**The rebuild discipline was honoured on every run.** `cargo test -p
+differential` spawns a PRE-BUILT `envoy-bin`; every proxy-side change below was
+followed by `cargo build -p envoy-bin` and gated on the `Compiling` lines
+appearing, never on the exit code.
+
+Docker was confirmed up and the image identity asserted against the pin before
+any conclusion was drawn:
+
+```
+$ docker image inspect envoyproxy/envoy:v1.33.0 --format '{{index .RepoDigests 0}}'
+envoyproxy/envoy@sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2
+```
+
+which is byte-for-byte the `ENVOY_TARGET.md` digest.
+
+**Baseline:** `test result: ok. 1 passed; 0 failed; ... finished in 10.81s`.
+
+**Mutation A — the canonical table (non-vacuity + the upstream positive
+control).** The anchor census ran first: the bare form
+`    ("Unauthenticated", "UNAUTHENTICATED"),` occurs **2** times — once in the
+`const` table and once in the test's own `EXPECT` table — so a naive `sed` would
+have mutated impl AND expectation together and read as "vacuous tests". The
+disambiguated form (trailing `];`) occurs **1** time and was used. After the
+mutation, `grep -n` confirmed only line 131 (the const) changed and line 1240
+(the test table) did not.
+
+```
+fixture green: access log byte-exact mismatch: line 2 not byte-identical:
+  envoy="GS=Unauthenticated SNAKE=UNAUTHENTICATED NUM=16 CODE=200 PATH=/g-unauth"
+  envoy-rust="GS=Unauthenticatd SNAKE=UNAUTHENTICATED NUM=16 CODE=200 PATH=/g-unauth"
+test result: FAILED. 0 passed; 1 failed; ... finished in 10.72s
+```
+
+RED on a ONE-CHARACTER change. **The `envoy=` side is the positive control**: it
+proves a real upstream Envoy container ran, served the probe and wrote that line
+itself — the fixture's expectations are not being compared against themselves.
+It also independently corroborates the measured canonical table's
+`Unauthenticated` cell from upstream's own output.
+
+Reverted (`grep -c Unauthenticatd` = 0), rebuilt, GREEN again in 10.72s.
+
+**Mutation B — the gate deleted (re-verifying `CF-113-6` at THIS commit).**
+`ADR-0193` DECISION 2 claims fixture `0093` cannot witness the request-side
+gate. That is a banked conclusion, so it was re-measured rather than inherited.
+The gate was removed from `build_access_log_record`, `envoy-bin` rebuilt, and
+BOTH witnesses run against the same compiled tree:
+
+| witness | result under gate deletion |
+|---|---|
+| fixture `0093` | **`test result: ok. 1 passed; 0 failed`** — GREEN |
+| `hcm::grpc_status_access_log_tests` | **`test result: FAILED. 4 passed; 1 failed`** — RED |
+
+**`ADR-0193` DECISION 2 is CONFIRMED and `SPEC.md` §6 is REFUTED at this
+commit.** The fixture is blind to the gate, exactly as predicted, because on the
+local-reply surface the only producer of a response `grpc-status` header is the
+phase-110 transform and it shares the same predicate. The single RED test is
+`gate_stays_shut_on_the_four_measured_negative_spellings` — the gate's sole
+witness. The fixture `README.md` and `expectations.yaml` both state this
+explicitly, so a reviewer cannot record the fixture as covering the gate.
+
+Reverted; `git diff --stat` on both mutated files is EMPTY (byte-identical to
+`HEAD`), and the full set re-run green:
+
+```
+envoy-http1 grpc_status_access_log : ok. 5 passed; 0 failed; 233 filtered out
+fixture 0093                       : ok. 1 passed; 0 failed; finished in 10.69s
+```
+
+### PV-8 — the untouchable set
+
+```
+$ git diff --numstat 1ff03ba4 -- Cargo.toml Cargo.lock .github/workflows/ci.yml tests/differential/src/lib.rs
+(no output)
+```
+
+All four untouched across the whole phase, as §5 non-goal 5 requires. No new
+dependency, no new workspace crate, no new config surface, no new harness
+driver, no new fuzz target.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
+| fixture `0093` against BOTH real proxies | **GREEN** |
