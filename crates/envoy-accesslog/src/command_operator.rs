@@ -86,6 +86,76 @@ pub enum Op {
     DynamicMetadata { namespace: String, key: String },
 }
 
+/// The rendering format of a `%GRPC_STATUS%` operator. `CamelString` is the
+/// default (`%GRPC_STATUS%` with no argument renders `NotFound`, not `5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcStatusFormat {
+    /// `CAMEL_STRING` — upstream's `Grpc::Utility::grpcStatusToString` spelling.
+    CamelString,
+    /// `SNAKE_STRING` — the SCREAMING_SNAKE_CASE spelling.
+    SnakeString,
+    /// `NUMBER` — the integer code.
+    Number,
+}
+
+/// The canonical gRPC status code table, MEASURED against
+/// `envoyproxy/envoy:v1.33.0` by driving codes 0-16 through an access log.
+///
+/// Two cells are counter-intuitive and are the reason this table is measured
+/// rather than derived: code 0 is `OK` in BOTH spellings (not `Ok`), and code 1
+/// is `Canceled` (one L) in camel but `CANCELLED` (two Ls) in snake.
+const GRPC_STATUS_NAMES: &[(&str, &str)] = &[
+    ("OK", "OK"),
+    ("Canceled", "CANCELLED"),
+    ("Unknown", "UNKNOWN"),
+    ("InvalidArgument", "INVALID_ARGUMENT"),
+    ("DeadlineExceeded", "DEADLINE_EXCEEDED"),
+    ("NotFound", "NOT_FOUND"),
+    ("AlreadyExists", "ALREADY_EXISTS"),
+    ("PermissionDenied", "PERMISSION_DENIED"),
+    ("ResourceExhausted", "RESOURCE_EXHAUSTED"),
+    ("FailedPrecondition", "FAILED_PRECONDITION"),
+    ("Aborted", "ABORTED"),
+    ("OutOfRange", "OUT_OF_RANGE"),
+    ("Unimplemented", "UNIMPLEMENTED"),
+    ("Internal", "INTERNAL"),
+    ("Unavailable", "UNAVAILABLE"),
+    ("DataLoss", "DATA_LOSS"),
+    ("Unauthenticated", "UNAUTHENTICATED"),
+];
+
+/// Normalise a raw wire `grpc-status` value to the integer upstream renders.
+/// MEASURED: surrounding whitespace is tolerated (` 5` and `5 ` both render
+/// `NotFound`), `+5` and `05` both parse to 5, and anything unparseable (e.g.
+/// `5.0`, `notanumber`) renders the literal `-1` in EVERY format.
+pub(crate) fn grpc_status_code(raw: &str) -> i64 {
+    raw.trim().parse::<i64>().unwrap_or(-1)
+}
+
+/// Render a raw wire `grpc-status` value in the requested format. An
+/// out-of-enum numeric renders as the NUMBER in every format (MEASURED: `99`
+/// renders `99` under CAMEL_STRING, not `Unknown` and not an error).
+pub(crate) fn render_grpc_status(raw: &str, format: GrpcStatusFormat) -> String {
+    let code = grpc_status_code(raw);
+    match format {
+        GrpcStatusFormat::Number => code.to_string(),
+        GrpcStatusFormat::CamelString | GrpcStatusFormat::SnakeString => {
+            match usize::try_from(code)
+                .ok()
+                .and_then(|i| GRPC_STATUS_NAMES.get(i))
+            {
+                Some((camel, snake)) => if format == GrpcStatusFormat::CamelString {
+                    camel
+                } else {
+                    snake
+                }
+                .to_string(),
+                None => code.to_string(),
+            }
+        }
+    }
+}
+
 /// REQ-side header names (lowercased) that have a backing field on
 /// [`crate::record::AccessLogRecord`]. A `%REQ(...)%` operator is only valid if
 /// its `name` (or `alt`) appears here.
@@ -1072,5 +1142,95 @@ mod tests {
         // exact-case `Tier` matches → `prod`.
         let f = parse_format("%DYNAMIC_METADATA(envoy.test:Tier)%").unwrap();
         assert_eq!(CompiledFormat::new(f).render(&r), "prod");
+    }
+
+    // The full canonical table, all 17 codes, both spellings. MEASURED against
+    // envoyproxy/envoy:v1.33.0 by driving grpc-status 0..16 through an access
+    // log. Codes 0 and 1 are the reason this is measured and not derived: 0 is
+    // `OK` in BOTH spellings (not `Ok`), and 1 is `Canceled` (one L) in camel
+    // but `CANCELLED` (two Ls) in snake.
+    #[test]
+    fn grpc_status_canonical_table_all_seventeen_codes() {
+        const EXPECT: [(&str, &str); 17] = [
+            ("OK", "OK"),
+            ("Canceled", "CANCELLED"),
+            ("Unknown", "UNKNOWN"),
+            ("InvalidArgument", "INVALID_ARGUMENT"),
+            ("DeadlineExceeded", "DEADLINE_EXCEEDED"),
+            ("NotFound", "NOT_FOUND"),
+            ("AlreadyExists", "ALREADY_EXISTS"),
+            ("PermissionDenied", "PERMISSION_DENIED"),
+            ("ResourceExhausted", "RESOURCE_EXHAUSTED"),
+            ("FailedPrecondition", "FAILED_PRECONDITION"),
+            ("Aborted", "ABORTED"),
+            ("OutOfRange", "OUT_OF_RANGE"),
+            ("Unimplemented", "UNIMPLEMENTED"),
+            ("Internal", "INTERNAL"),
+            ("Unavailable", "UNAVAILABLE"),
+            ("DataLoss", "DATA_LOSS"),
+            ("Unauthenticated", "UNAUTHENTICATED"),
+        ];
+        for (code, (camel, snake)) in EXPECT.iter().enumerate() {
+            let raw = code.to_string();
+            assert_eq!(
+                render_grpc_status(&raw, GrpcStatusFormat::CamelString),
+                *camel,
+                "camel code {code}"
+            );
+            assert_eq!(
+                render_grpc_status(&raw, GrpcStatusFormat::SnakeString),
+                *snake,
+                "snake code {code}"
+            );
+            assert_eq!(
+                render_grpc_status(&raw, GrpcStatusFormat::Number),
+                raw,
+                "number code {code}"
+            );
+        }
+    }
+
+    // An OUT-OF-ENUM numeric falls back to the NUMBER in EVERY format — not
+    // `-`, not `Unknown`, not an error. MEASURED: `99` renders `99` under
+    // CAMEL_STRING.
+    #[test]
+    fn grpc_status_out_of_enum_numeric_renders_the_number_in_every_format() {
+        for raw in ["17", "99", "-1"] {
+            for f in [
+                GrpcStatusFormat::CamelString,
+                GrpcStatusFormat::SnakeString,
+                GrpcStatusFormat::Number,
+            ] {
+                assert_eq!(render_grpc_status(raw, f), raw, "raw {raw} format {f:?}");
+            }
+        }
+    }
+
+    // An UNPARSEABLE value renders the literal `-1` in every format — two
+    // characters, NOT the `-` absent-sentinel and NOT the raw string.
+    #[test]
+    fn grpc_status_unparseable_renders_minus_one_in_every_format() {
+        for raw in ["notanumber", "5.0", ""] {
+            for f in [
+                GrpcStatusFormat::CamelString,
+                GrpcStatusFormat::SnakeString,
+                GrpcStatusFormat::Number,
+            ] {
+                assert_eq!(render_grpc_status(raw, f), "-1", "raw {raw:?} format {f:?}");
+            }
+        }
+    }
+
+    // MEASURED wire-value tolerances: surrounding whitespace is stripped, and
+    // `+5` / `05` both parse to 5.
+    #[test]
+    fn grpc_status_wire_value_tolerances() {
+        for raw in [" 5", "5 ", "  5  ", "05", "+5"] {
+            assert_eq!(
+                render_grpc_status(raw, GrpcStatusFormat::CamelString),
+                "NotFound",
+                "raw {raw:?}"
+            );
+        }
     }
 }
