@@ -899,6 +899,144 @@ asserting on them:
 Neither is caused by the gRPC transform and neither is fixed by it. A later
 session touching either must not read this section as evidence about them.
 
+### §I — `%GRPC_STATUS%` in the access log: the REQUEST-SIDE GATE (phase 113)
+
+Phase 113 (ADR-0192 pick, ADR-0193 PLAN-write) added the access-log operator
+family `%GRPC_STATUS%`, `%GRPC_STATUS(CAMEL_STRING|SNAKE_STRING|NUMBER)%` and
+the alias `%GRPC_STATUS_NUMBER%`. Differential witness: fixture
+`tests/fixtures/0093-accesslog-grpc-status`, 12 probes, cluster-free and
+backend-free.
+
+**The operator is GATED on the REQUEST, not on the response.** It renders the
+`-` sentinel (json `null`) unless the request is a gRPC request — **even when
+the response demonstrably carries a `grpc-status` header**. MEASURED against
+the pin with `%RESP(grpc-status)%` in the SAME log line as a witness that the
+header was present on every row:
+
+| request `content-type` | `%GRPC_STATUS%` | `%RESP(grpc-status)%` |
+|---|---|---|
+| *(none)* | `-` | `5` |
+| `application/grpc` | `NotFound` | `5` |
+| `application/grpc+proto` | `NotFound` | `5` |
+| `application/grpc; charset=utf-8` | `-` | `5` |
+| `application/grpc-web` | `-` | `5` |
+| `APPLICATION/GRPC` | `-` | `5` |
+
+The `%RESP(grpc-status)%` column reads `5` on **every** row, so the `-` rows are
+the gate firing and not a missing value.
+
+**The predicate is EXACTLY §B's** — `content-type` exactly `application/grpc` or
+beginning `application/grpc+`, case-sensitive, a parameter defeats it. All four
+of §B's negative spellings are negative here too. This is a MEASURED reuse, not
+an assumed one, and envoy-rust implements it by calling the same
+`is_grpc_request` function the §B transform uses, so the two cannot drift apart.
+
+⚠ **The gate is NOT witnessable by any differential fixture on the local-reply
+surface, and fixture `0093` does NOT witness it.** MEASURED by mutation at the
+phase-113 implementation: delete the gate, rebuild `envoy-bin`, and `0093`
+stays **GREEN** while the in-process test
+`hcm::grpc_status_access_log_tests::gate_stays_shut_on_the_four_measured_negative_spellings`
+goes **RED**. The reason is structural — on this surface the only producer of a
+response `grpc-status` header is the §A/§B transform, which shares the same
+predicate, so with the gate shut there is no header to read either way.
+**Whenever the only producer of an observable shares a predicate with the
+consumer under test, no fixture on that surface can distinguish that predicate
+from no predicate at all.** Banked as **CF-113-6**; witnessing it needs a
+PROXIED gRPC response, blocked behind **CF-111-2** / **CF-113-3**.
+
+### §J — the canonical gRPC status name table
+
+MEASURED by driving codes 0-16 through an upstream access log. All 17 canonical
+codes, in both spellings:
+
+| code | `CAMEL_STRING` | `SNAKE_STRING` | code | `CAMEL_STRING` | `SNAKE_STRING` |
+|---|---|---|---|---|---|
+| 0 | `OK` | `OK` | 9 | `FailedPrecondition` | `FAILED_PRECONDITION` |
+| 1 | `Canceled` | `CANCELLED` | 10 | `Aborted` | `ABORTED` |
+| 2 | `Unknown` | `UNKNOWN` | 11 | `OutOfRange` | `OUT_OF_RANGE` |
+| 3 | `InvalidArgument` | `INVALID_ARGUMENT` | 12 | `Unimplemented` | `UNIMPLEMENTED` |
+| 4 | `DeadlineExceeded` | `DEADLINE_EXCEEDED` | 13 | `Internal` | `INTERNAL` |
+| 5 | `NotFound` | `NOT_FOUND` | 14 | `Unavailable` | `UNAVAILABLE` |
+| 6 | `AlreadyExists` | `ALREADY_EXISTS` | 15 | `DataLoss` | `DATA_LOSS` |
+| 7 | `PermissionDenied` | `PERMISSION_DENIED` | 16 | `Unauthenticated` | `UNAUTHENTICATED` |
+| 8 | `ResourceExhausted` | `RESOURCE_EXHAUSTED` | | | |
+
+**Two cells cannot be recalled correctly and must not be "corrected":**
+
+1. **Code 0 is `OK` in BOTH spellings** — not `Ok` in camel. It is the only row
+   where the two columns are identical for a non-trivial reason.
+2. **Code 1 is `Canceled` with ONE `l` in camel but `CANCELLED` with TWO in
+   snake.** The two columns genuinely disagree on spelling. ADR-0154 already
+   recorded the one-L form as a live trap.
+
+**The default format is `CAMEL_STRING`.** `%GRPC_STATUS%` with no argument
+renders `NotFound`, not `5` and not `NOT_FOUND`. `%GRPC_STATUS_NUMBER%` and
+`%GRPC_STATUS(NUMBER)%` are the SAME operator — MEASURED byte-identical
+upstream in both the text and the JSON format.
+
+### §K — fallbacks, wire-value tolerance, and JSON typing
+
+**Fallbacks.** Neither is `-`, and neither is an error:
+
+| raw wire value | `CAMEL_STRING` | `SNAKE_STRING` | `NUMBER` |
+|---|---|---|---|
+| `99` *(numeric, outside the enum)* | `99` | `99` | `99` |
+| `notanumber` *(unparseable)* | `-1` | `-1` | `-1` |
+| `5.0` *(unparseable — NOT a truncation)* | `-1` | `-1` | `-1` |
+
+An **out-of-enum numeric renders the NUMBER in every format**, including the two
+string formats. An **unparseable value renders the literal two characters
+`-1`** in every format — which is NOT the `-` absent sentinel, and the two must
+not be conflated.
+
+**Wire-value tolerance.** The value is TRIMMED before parsing, so ` 5`, `5 ` and
+`  5  ` all render `NotFound`; `+5` and `05` both parse to 5. But `5.0` is
+unparseable — the parse is integral, not lenient-numeric.
+
+**JSON typing.** Under the single-operator typed carve-out:
+
+| format | present | out-of-enum | unparseable | gate shut |
+|---|---|---|---|---|
+| `CAMEL_STRING` / `SNAKE_STRING` | `"NotFound"` | `"99"` | `"-1"` | `null` |
+| `NUMBER` | `5` | `99` | `-1` | `null` |
+
+The two string formats stay **QUOTED even when the value falls back** to the
+number or the sentinel; the NUMBER format is an **UNQUOTED number in exactly
+those same cells**; and all four spellings are `null` when the gate is shut. A
+MULTI-SEGMENT leaf leaves the carve-out and becomes a quoted string, with an
+absent value rendering the `-` sentinel INSIDE the quotes (`"x-"`).
+
+### §L — an EMPTY `()` argument is accepted on EVERY no-arg operator
+
+⚠ **This changes the contract for ELEVEN pre-existing operators, not just the
+phase-113 ones.** MEASURED with `--mode validate` plus a negative control:
+`%GRPC_STATUS()%`, `%GRPC_STATUS_NUMBER()%`, `%RESPONSE_CODE()%` and
+`%PROTOCOL()%` all load `configuration ... OK` on the pinned image, while
+`%RESPONSE_CODE(FOO)%` is **rejected**. envoy-rust rejected all four empty forms
+before phase 113 — a previously-undiscovered boot-level divergence in the
+landed command-operator engine, now closed.
+
+The rule: **an empty `()` on a no-arg operator means "no argument" and is
+accepted; a NON-empty argument on a no-arg operator remains fatal.** The
+tolerance is scoped to the no-arg keyword set and does NOT reach `REQ`, `RESP`
+or `DYNAMIC_METADATA`, which require an argument — `%REQ()%`, `%RESP()%` and
+`%DYNAMIC_METADATA()%` are all still rejected.
+
+**`%GRPC_STATUS(...)%` reject set**, MEASURED (upstream:
+`GrpcStatusFormatter only supports CAMEL_STRING, SNAKE_STRING or NUMBER.`): the
+argument is case-SENSITIVE (`camel_string`, `Camel_String`, `number` all
+rejected), tolerates NO surrounding whitespace (`( CAMEL_STRING )`,
+`(CAMEL_STRING )`, `( CAMEL_STRING)` and `(  )` all rejected — note `(  )` with
+spaces is NOT the accepted empty `()`), and admits no comma-separated pair. A
+trailing `:N` length is separately fatal (`GRPC_STATUS does not allow length to
+be specified.`), as is any argument on the alias (`GRPC_STATUS_NUMBER does not
+take any parameters or length`).
+
+**HTTP/2 renders the `-` sentinel unconditionally** — the operator has no H2
+data path, because the trailer block is not live at the H2 record build.
+Banked as **CF-113-2**; pinned in-process by
+`h2_grpc_status_boundary_tests::h2_grpc_status_is_absent`.
+
 ---
 
 ## Response trailers

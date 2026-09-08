@@ -775,3 +775,52 @@ driver, no new fuzz target.
 | `cargo fmt --all -- --check` | exit **0** |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
 | fixture `0093` against BOTH real proxies | **GREEN** |
+
+---
+
+## Task 10 — `BEHAVIOR_CONTRACT.md`: extend the `## gRPC` section
+
+**Status: COMPLETE.** Commit: `phase 113 task 10: BEHAVIOR_CONTRACT gRPC section — the %GRPC_STATUS% gate, table and typing`.
+
+The only `docs/` change in the phase, and excluded from the §6.1 LoC gate.
+
+### Step 1 — locate
+
+`grep -c '^## gRPC'` = **1**, at line 644, section running to `## Response
+trailers` at line 904. Asserted unique before editing, as `PLAN.md` requires.
+
+### Step 2 — four new subsections appended after §H
+
+`PLAN.md` asks for three; four were written because the empty-`()` rule earns
+its own heading rather than a paragraph buried in the typing section — it
+changes the contract for ELEVEN pre-existing operators and a reader looking for
+`%RESPONSE_CODE()%` will not find it under a `%GRPC_STATUS%` typing heading.
+The content is exactly the three items `PLAN.md` enumerates, plus that
+promotion.
+
+- **§I — the request-side gate.** The measured 6-row table with the
+  `%RESP(grpc-status)%` witness column, the statement that the predicate is
+  exactly §B's, and — stated explicitly — that **fixture `0093` does NOT witness
+  the gate**, with the mutation result and the generalised rule (when the only
+  producer of an observable shares a predicate with the consumer under test, no
+  fixture on that surface can distinguish that predicate from no predicate).
+- **§J — the canonical name table**, all 17 codes in both spellings, with the
+  two uncorrectable cells (0 = `OK` in both; 1 = `Canceled`/`CANCELLED`) called
+  out as traps.
+- **§K — fallbacks, wire tolerance and JSON typing**, including that `-1` is two
+  literal characters and is NOT the `-` absent sentinel.
+- **§L — the empty `()` rule**, with its scope limit (does not reach
+  `REQ`/`RESP`/`DYNAMIC_METADATA`), the full measured reject set, and the note
+  that `(  )` with spaces is NOT the accepted empty `()`. Closes with the H2
+  boundary (CF-113-2).
+
+### Step 3 — no other section disturbed
+
+```
+$ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
+138	0	docs/envoy-rust/BEHAVIOR_CONTRACT.md
+```
+
+**Additions only, deletions 0**, exactly as `PLAN.md` Step 3 requires. The `## `
+heading count is unchanged against `HEAD` and the `## gRPC` section's `### `
+count went 8 → 12, i.e. the four new subsections and nothing else.
