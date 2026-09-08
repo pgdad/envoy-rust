@@ -467,3 +467,90 @@ predictions at Tasks 6 and 7.
 | `cargo build --workspace --all-targets` | exit **0** |
 | `cargo fmt --all -- --check` | exit **0** |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |
+
+---
+
+## Task 6 — the HTTP/1.1 population site and the in-process gate pins
+
+**Status: COMPLETE.** Commit: `phase 113 task 6: populate grpc_status at the H1 record build, gated on is_grpc_request`.
+
+This task carries the phase's only behavioural risk, and its tests are the ONLY
+witness of the request-side gate anywhere in the tree.
+
+### Step 1-2 — the failing tests, and a PLAN prediction that did NOT hold
+
+Module `grpc_status_access_log_tests` appended to
+`crates/envoy-http1/src/hcm.rs`, five tests.
+
+⚠ **`PLAN.md` Task 6 Step 2 predicts "FAIL — 5 failures, every
+`grpc_status_for(...)` returning `None`". THREE failed, not five:**
+
+```
+test hcm::grpc_status_access_log_tests::gate_stays_shut_on_the_four_measured_negative_spellings ... ok
+test hcm::grpc_status_access_log_tests::open_gate_with_no_header_is_none ... ok
+test hcm::grpc_status_access_log_tests::gate_opens_on_grpc_content_types ... FAILED
+test hcm::grpc_status_access_log_tests::raw_wire_value_is_stored_verbatim ... FAILED
+test hcm::grpc_status_access_log_tests::header_name_lookup_is_case_insensitive ... FAILED
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+```
+
+The reasoning behind the prediction is right but its conclusion is not: two of
+the five assert that the value is **absent**, and Task 2's placeholder produces
+absence unconditionally, so they pass **VACUOUSLY** rather than failing. A test
+that asserts `None` cannot be made RED by a site that always returns `None`.
+
+**This matters more than a miscount, because one of the two vacuous passers is
+`gate_stays_shut_on_the_four_measured_negative_spellings` — the test
+`ADR-0193` DECISION 2 designates as the gate's sole witness.** Its RED evidence
+therefore cannot come from the absence of the implementation; it has to come
+from the presence of a WRONG one. That check is Step 4 below.
+
+### Step 3 — the implementation
+
+The placeholder at `build_access_log_record` replaced with the gated extract
+`PLAN.md` specifies, calling the existing `pub(crate) crate::grpc::is_grpc_request`
+from inside `envoy-http1`. **No visibility was widened** — PV-3's requirement —
+and none could be: `envoy-accesslog` is a leaf crate and calling into
+`envoy-http1` would be a dependency cycle.
+
+### Step 4 — GREEN, then the NON-VACUITY check that the gate actually needs
+
+```
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+```
+
+Whole crate: `test result: ok. 238 passed; 0 failed` — **exactly the 238
+`PLAN.md` predicts for `envoy-http1`.**
+
+**The gate-deletion mutation, run here rather than inherited from `ADR-0193`.**
+The gate was deleted — `grpc_status` made an unconditional read of the response
+header — and the module re-run:
+
+```
+test hcm::grpc_status_access_log_tests::open_gate_with_no_header_is_none ... ok
+test hcm::grpc_status_access_log_tests::header_name_lookup_is_case_insensitive ... ok
+test hcm::grpc_status_access_log_tests::gate_opens_on_grpc_content_types ... ok
+test hcm::grpc_status_access_log_tests::raw_wire_value_is_stored_verbatim ... ok
+test hcm::grpc_status_access_log_tests::gate_stays_shut_on_the_four_measured_negative_spellings ... FAILED
+assertion `left == right` failed: content-type Some("application/grpc; charset=utf-8") must NOT open the gate
+  left: Some("5")
+ right: None
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+```
+
+**EXACTLY ONE test discriminates the gate from no gate, and it is the one
+`ADR-0193` DECISION 2 names.** The other four stay green under the mutation —
+which is the point: they pin the VALUE path, not the GATE. This independently
+re-verifies the in-process half of `CF-113-6` at this commit rather than
+inheriting it as a banked claim. The fixture half is re-verified at Task 9.
+
+Mutation reverted; `grep -c 'if crate::grpc::is_grpc_request(&request.req.headers)'`
+= **1**, and the crate is back to 238 passed.
+
+### Gates at this boundary
+
+| gate | result |
+|---|---|
+| `cargo build --workspace --all-targets` | exit **0** |
+| `cargo fmt --all -- --check` | exit **0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit **0** |

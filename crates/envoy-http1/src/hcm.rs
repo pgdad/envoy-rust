@@ -1753,7 +1753,19 @@ fn build_access_log_record(
         // set per response-path (direct_response / via_upstream).
         response_code_details: response.response_code_details,
         dynamic_metadata: request.dynamic_metadata.clone(),
-        grpc_status: None,
+        // phase 113: %GRPC_STATUS%. GATED on the REQUEST being a gRPC request
+        // — MEASURED upstream, which renders `-` even when the response
+        // carries `grpc-status`, unless the request content-type is gRPC. The
+        // gate is the SAME predicate the phase-110 local-reply transform uses,
+        // so the two can never disagree. `response.headers` is the
+        // POST-transform header vec (`apply_grpc_local_reply` runs at the
+        // single call site before this build and `outgoing` is read-only
+        // between), so the transform's own `grpc-status` is visible here.
+        grpc_status: if crate::grpc::is_grpc_request(&request.req.headers) {
+            access_log_header_value(response.headers, crate::headers::GRPC_STATUS)
+        } else {
+            None
+        },
     }
 }
 
@@ -11630,6 +11642,125 @@ static_resources:
             stats.downstream_rq_4xx.value(),
             0,
             "the original 404 must NOT tick"
+        );
+    }
+}
+
+// ── Phase 113: the %GRPC_STATUS% population gate at the H1 record build ─────
+// These are IN-PROCESS backstops. `gate_stays_shut_on_the_four_measured_negative_spellings`
+// is the ONLY witness of the request-side gate anywhere in the tree: fixture
+// 0093 cannot express it, because on the local-reply surface the sole producer
+// of a response `grpc-status` header is the phase-110 transform, which is gated
+// on the SAME predicate. Verified by mutation at the PLAN-write: deleting the
+// gate leaves fixture 0093 GREEN and turns this module RED.
+#[cfg(test)]
+mod grpc_status_access_log_tests {
+    use super::*;
+
+    fn req_with_content_type(ct: Option<&str>) -> Request {
+        Request {
+            method: "POST".to_string(),
+            path: "/g".to_string(),
+            version: HttpVersion::Http11,
+            headers: match ct {
+                Some(v) => vec![(headers::CONTENT_TYPE.to_string(), v.to_string())],
+                None => vec![],
+            },
+            bytes_consumed: 0,
+            body: None,
+        }
+    }
+
+    fn grpc_status_for(ct: Option<&str>, resp_headers: &[(String, String)]) -> Option<String> {
+        let req = req_with_content_type(ct);
+        let dm = std::collections::BTreeMap::new();
+        let record = build_access_log_record(
+            AccessLogRequestInfo {
+                req: &req,
+                start_time: std::time::UNIX_EPOCH,
+                bytes_received: 0,
+                matched_route: None,
+                dynamic_metadata: &dm,
+            },
+            AccessLogResponseInfo {
+                status: 200,
+                bytes_sent: 0,
+                duration: std::time::Duration::from_millis(0),
+                headers: resp_headers,
+                upstream_host: None,
+                upstream_cluster: None,
+                response_code_details: None,
+                retry_limit_exceeded: false,
+                connect_failure: false,
+            },
+        );
+        record.grpc_status
+    }
+
+    fn gs_header(v: &str) -> Vec<(String, String)> {
+        vec![(headers::GRPC_STATUS.to_string(), v.to_string())]
+    }
+
+    // The gate OPENS on the two content-types `is_grpc_request` accepts.
+    #[test]
+    fn gate_opens_on_grpc_content_types() {
+        for ct in ["application/grpc", "application/grpc+proto"] {
+            assert_eq!(
+                grpc_status_for(Some(ct), &gs_header("5")),
+                Some("5".to_string()),
+                "content-type {ct} must open the gate"
+            );
+        }
+    }
+
+    // The gate STAYS SHUT on the four measured negative spellings, EVEN THOUGH
+    // the response carries `grpc-status`. An implementation that ignored the
+    // gate would return `Some("5")` on all four.
+    #[test]
+    fn gate_stays_shut_on_the_four_measured_negative_spellings() {
+        for ct in [
+            Some("application/grpc; charset=utf-8"),
+            Some("application/grpc-web"),
+            Some("APPLICATION/GRPC"),
+            None,
+        ] {
+            assert_eq!(
+                grpc_status_for(ct, &gs_header("5")),
+                None,
+                "content-type {ct:?} must NOT open the gate"
+            );
+        }
+    }
+
+    // The gate can be open and the header still absent — the record then holds
+    // `None`, which renders the `-` sentinel. (SPEC §2.4: unreachable on the
+    // local-reply surface, but the path must not panic or invent a value.)
+    #[test]
+    fn open_gate_with_no_header_is_none() {
+        assert_eq!(grpc_status_for(Some("application/grpc"), &[]), None);
+    }
+
+    // The RAW wire value is stored verbatim — parsing happens at RENDER time,
+    // which is what lets the renderer reproduce upstream's `99` and `-1` cells.
+    #[test]
+    fn raw_wire_value_is_stored_verbatim() {
+        for raw in ["0", "99", "notanumber", " 5 "] {
+            assert_eq!(
+                grpc_status_for(Some("application/grpc"), &gs_header(raw)),
+                Some(raw.to_string()),
+                "raw {raw:?} must be stored unparsed"
+            );
+        }
+    }
+
+    // The header NAME lookup is CASE-INSENSITIVE (HTTP/1.1 §3.2), even though
+    // the content-type gate is case-SENSITIVE on the VALUE.
+    #[test]
+    fn header_name_lookup_is_case_insensitive() {
+        let hs = vec![("GRPC-Status".to_string(), "7".to_string())];
+        assert_eq!(
+            grpc_status_for(Some("application/grpc"), &hs),
+            Some("7".to_string())
         );
     }
 }
