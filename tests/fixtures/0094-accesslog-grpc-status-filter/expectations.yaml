@@ -1,0 +1,100 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0094-envoy-mount/access.log
+    envoy_rust: /tmp/0094-envoy-rust-mount/access.log
+  # The sink's filter is `grpc_status_filter: { statuses: [UNIMPLEMENTED,
+  # INTERNAL] }` = codes 12 and 13. Eight probes, EACH ON A DISTINCT PATH
+  # because identical paths cannot attribute a kept log line. Five are KEPT.
+  #
+  # ⚠ Probes 1-4 send `content-type: application/grpc`, so the phase-110
+  # local-reply transform REWRITES the status to 200 and emits a
+  # `grpc-status` header — `expected_status` is therefore 200 on all four,
+  # NOT the route's `direct_response.status`. That was MEASURED on both
+  # proxies at the PLAN-write; the landed SPEC §6 table says otherwise and
+  # ADR-0197 corrects it.
+  probes:
+    # Probe 1 — KEPT via the HEADER leg. 404 + gRPC content-type -> the
+    # transform emits `grpc-status: 12` and rewrites the code to 200. The
+    # filter reads 12, which is in [12, 13]. Had it derived from the LOGGED
+    # response code instead, it would have computed 2 and dropped this row.
+    - method: get
+      path: /g-unimpl
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 2 — KEPT via the HEADER leg. 400 -> `grpc-status: 13`.
+    - method: get
+      path: /g-internal
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 3 — SUPPRESSED. 200 -> `grpc-status: 2` (upstream's map has NO
+    # `200 => 0` arm; 2 is the `_ => 2` default). 2 is not in [12, 13].
+    - method: get
+      path: /g-unknown
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 4 — SUPPRESSED. 503 -> `grpc-status: 14`.
+    - method: get
+      path: /g-unavail
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 5 — KEPT, and THE DECISIVE CELL. A plain HTTP 404 with no gRPC
+    # content-type. `%GRPC_STATUS%` renders `-` for it (phase 113's field is
+    # GATED and absent), yet the filter still derives 12 and KEEPS the row.
+    # An implementation that reuses `AccessLogRecord.grpc_status` goes RED
+    # here. MEASURED on both proxies.
+    - method: get
+      path: /p-unimpl
+      host: envoy-rust.test
+      expected_status: 404
+      expect_logged: true
+    # Probe 6 — KEPT via the DERIVATION leg, plain HTTP. 400 -> 13.
+    - method: get
+      path: /p-internal
+      host: envoy-rust.test
+      expected_status: 400
+      expect_logged: true
+    # Probe 7 — SUPPRESSED. Plain HTTP 200 -> 2.
+    - method: get
+      path: /p-unknown
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: false
+    # Probe 8 — KEPT, and LAST so the fixture pays the SHORT suppression
+    # settle. `application/grpc; charset=utf-8` is NOT gRPC to the phase-110
+    # detector (a parameter defeats it), so the transform does NOT fire, the
+    # status stays 404 and `%GRPC_STATUS%` renders `-` — yet the filter still
+    # derives 12 and KEEPS the row. The second witness that the filter's gate
+    # is not the formatter's.
+    - method: get
+      path: /g-param
+      host: envoy-rust.test
+      extra_headers:
+        - ["content-type", "application/grpc; charset=utf-8"]
+      expected_status: 404
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static literal:
+  # the `http1_access_log_byte_exact` driver asserts each emitted line is
+  # byte-identical between upstream Envoy v1.33.0 and envoy-rust, and that each
+  # side emits EXACTLY the kept count. Both proxies must agree on BOTH halves of
+  # every filter decision — a one-sided suppression fails the line-count
+  # assertion before the byte compare is reached. Five lines per side, MEASURED
+  # at the PLAN-write against both real proxies:
+  #   PATH=/g-unimpl CODE=200 GS=Unimplemented
+  #   PATH=/g-internal CODE=200 GS=Internal
+  #   PATH=/p-unimpl CODE=404 GS=-
+  #   PATH=/p-internal CODE=400 GS=-
+  #   PATH=/g-param CODE=404 GS=-
+  # Every route is a direct_response -> `clusters: []`, no backend spawns.

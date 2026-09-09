@@ -1046,5 +1046,186 @@ cancel across separate crates.
 Per-file numstat at this task's commit:
 
 ```
-41	7	crates/envoy-http1/src/hcm.rs
+51	12	crates/envoy-http1/src/hcm.rs
 ```
+
+⚠ **Corrected during Task 9.** This line first read `41	7`, a figure TYPED rather
+than read off the `git diff --numstat` that had just printed `51	12` immediately
+above it in the same shell. Nothing about the code changed; the record was wrong
+and is now what was measured. A transcribed number is a claim like any other.
+
+---
+
+## Task 9 — differential fixture `0094-accesslog-grpc-status-filter`
+
+**Status: COMPLETE.** Commit: `phase 114 task 9: differential fixture 0094 — the grpc_status_filter arm, 8 probes`.
+
+### Numbering and environment, re-derived
+
+`tests/fixtures/` holds **93** directories; `git ls-files` agrees at **93**;
+`tests/differential/tests/` holds **92** runners. So `0094` is free and this
+phase takes the counts to **94 / 93**. Docker healthy; the pinned image is
+present locally with the digest `ENVOY_TARGET.md` names,
+`sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`.
+Seventeen foreign containers from the parallel workstream were running
+throughout; the harness picks ephemeral ports, and none collided.
+
+### Steps 1–3 — the two YAMLs and `expectations.yaml`
+
+`envoy.yaml` was GENERATED from `envoy-rust.yaml` by applying exactly the four
+harness hunks, each located by a uniqueness-asserted predicate rather than a line
+number. The resulting diff is exactly four hunks, at exactly the offsets
+`PLAN.md` Step 2 predicts:
+
+```
+$ diff envoy.yaml envoy-rust.yaml
+2d1    < admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+6c5    <       address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
+       >       address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+14d12  <                 generate_request_id: false
+22c20  <                       path: /tmp/0094-envoy-mount/access.log
+       >                       path: /tmp/0094-envoy-rust-mount/access.log
+```
+
+**The `filter:` block is byte-identical on both sides**, asserted by md5 over the
+block rather than by eye — both `ed76347273f1dade0ad7ad32f7f0df9c`. `ADMIN_PORT`
+occurs **0** times in either file.
+
+Line counts land on `PLAN.md`'s measured table exactly: `envoy.yaml` **93**,
+`envoy-rust.yaml` **91**, `expectations.yaml` **100**, runner **24**.
+
+### Step 6 — GREEN against BOTH real proxies
+
+```
+$ cargo build -p envoy-bin        # the harness uses the DEBUG binary
+$ cargo test -p differential --test accesslog_grpc_status_filter -- --nocapture
+running 1 test
+test accesslog_grpc_status_filter ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.73s
+```
+
+**The green was audited, not trusted.** Both log files were deleted with `rm -f`
+BEFORE the run, so their contents afterwards are produced evidence:
+
+```
+/tmp/0094-envoy-mount/access.log        5 lines, 167 bytes, md5 15e3707efd6a476098b64976932db1ac
+/tmp/0094-envoy-rust-mount/access.log   5 lines, 167 bytes, md5 15e3707efd6a476098b64976932db1ac
+
+PATH=/g-unimpl CODE=200 GS=Unimplemented
+PATH=/g-internal CODE=200 GS=Internal
+PATH=/p-unimpl CODE=404 GS=-
+PATH=/p-internal CODE=400 GS=-
+PATH=/g-param CODE=404 GS=-
+```
+
+Byte-identical across the two proxies, and **byte-identical to the five lines
+`PLAN.md` Step 6 states were measured at the PLAN-write** — an independent
+reproduction on a different day from a different tree. 12.73 s is a normal
+backend-free duration, not the ~1 s that would suggest the harness short-circuited.
+
+Note what the last three lines are: the record was KEPT while `%GRPC_STATUS%`
+rendered the `-` sentinel. That is the formatter's gated value and the filter's
+ungated value disagreeing about the same record, visible in the log file itself.
+
+### Step 7 — THE MUTATION, with its control (PV-7)
+
+Run in a scratch worktree created by `git worktree add --detach` at `c39f7a3`,
+with its **own `CARGO_TARGET_DIR`** (sharing the main tree's poisons the test
+binary), SEEDED with this task's still-uncommitted fixture files. The main tree
+was verified clean of the mutation work afterwards.
+
+Target asserted unique immediately before editing (`grep -cF` → `1`), and a
+pristine copy + md5 taken first.
+
+**The mutation** — the derivation gated on `is_grpc_request`, i.e. the shape an
+implementation reusing `record.grpc_status` would produce:
+
+```rust
+grpc_status_code: if crate::grpc::is_grpc_request(&request.req.headers) {
+    effective_grpc_status(response.headers, response.status)
+} else {
+    2
+},
+```
+
+Rebuild confirmed real, not cached:
+
+```
+   Compiling envoy-http1 v0.0.0 (/.../wt-mut/crates/envoy-http1)
+   Compiling envoy-bin v0.0.0 (/.../wt-mut/crates/envoy-bin)
+```
+
+**RED, and byte-for-byte the failure `PLAN.md` predicts:**
+
+```
+thread 'accesslog_grpc_status_filter' panicked at tests/differential/tests/accesslog_grpc_status_filter.rs:23:10:
+fixture green: envoy-rust emitted 2 access-log lines but 5 were expected to be logged;
+lines: ["PATH=/g-unimpl CODE=200 GS=Unimplemented", "PATH=/g-internal CODE=200 GS=Internal"]
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.29s
+```
+
+The two survivors are probes 1 and 2 — the gRPC-content-type ones the gate lets
+through. **The three lost are exactly probes 5, 6 and 8**, the ungated cells,
+which is the specific prediction and not merely "some lines went missing".
+
+**THE CONTROL.** File restored from the pristine copy and the restore verified by
+md5, not assumed:
+
+```
+2c549cbb2a3313cc9813e36ae5468588  (pre-edit)
+2c549cbb2a3313cc9813e36ae5468588  (post-restore)      RESTORE EXACT: True
+```
+
+Rebuilt (1 `Compiling envoy-http1` line), logs deleted, re-run **from the same
+tree**:
+
+```
+CONTROL_EXIT=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.72s
+5 /tmp/0094-envoy-mount/access.log   5 /tmp/0094-envoy-rust-mount/access.log   BYTE-IDENTICAL
+```
+
+A mutation RED without its control is not evidence; this one has it, from the
+same worktree, same target dir, same fixture. **PV-7 is discharged.** The scratch
+worktree was then removed; the four `.claude/worktrees/agent-*` worktrees belong
+to a parallel workstream and were left alone.
+
+### PV-9 — and a positive control that initially proved nothing
+
+`PLAN.md` requires `Cargo.toml`, `Cargo.lock`, `.github/workflows/ci.yml` and
+`tests/differential/src/lib.rs` to be untouched. The first probe used
+`git diff --stat HEAD -- <files>` and returned empty — **but so did its positive
+control**, because at that moment the touched files were already committed (no
+diff vs `HEAD`) and the fixture was untracked (invisible to `git diff`). An
+empty result from a probe whose control is also empty says nothing at all.
+
+Re-run over the whole phase arc, where the control does discriminate:
+
+```
+$ git diff --numstat c9136ae..HEAD -- Cargo.toml Cargo.lock .github/workflows/ci.yml tests/differential/src/lib.rs
+[empty]
+
+$ git diff --numstat c9136ae..HEAD -- crates/envoy-config/src/bootstrap.rs crates/envoy-accesslog/src/filter.rs
+178	79	crates/envoy-accesslog/src/filter.rs
+260	9	crates/envoy-config/src/bootstrap.rs
+```
+
+Identical command shape, non-empty on files that ARE touched. **PV-9 holds.**
+
+### A NINTH finding: the README is 166 lines against a measured 73
+
+`PLAN.md` specifies the fixture README as a **section list** rather than verbatim
+text — the one code block in the plan that is not quoted in full — and its
+measured LoC table carries **73** lines for it. The README written here is
+**166**, +93 over the prototype.
+
+**This is the single largest contributor to this phase landing above its measured
+938**, and it is a deliberate choice rather than drift: every one of the nine
+sections `PLAN.md` Step 5 enumerates is present, and the extra length is the
+probe table, the four MEASURED rules, the six authoring constraints and the
+quoted four-hunk diff — content the plan asks for but did not size. The closest
+landed comparator, `0093`'s README, is 110 lines. Trimming documentation to hit a
+LoC figure would be optimising the wrong quantity; the reconciliation is stated
+in full at the end of this document instead.
