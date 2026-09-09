@@ -610,3 +610,140 @@ Cumulative for `envoy-config` across Tasks 3+4: `bootstrap.rs` 261/10 and
 `lib.rs` 26/19, against `PLAN.md`'s measured 249/4 and 26/19. `lib.rs` matches
 exactly. `bootstrap.rs` runs +12 insertions and +6 deletions over the prototype —
 the three stale doc-count corrections above, which the prototype did not make.
+
+---
+
+## Task 5 — the UNGATED derivation: `effective_grpc_status` and both record builds
+
+**Status: COMPLETE.** Commit: `phase 114 task 5: the UNGATED effective-gRPC-status derivation on both codecs (PV-4)`.
+
+This is the phase's real derivation work. The field is `u8`, **not** `Option<u8>`:
+a status is defined on EVERY request, including plain HTTP, which is the whole
+finding of the phase.
+
+### PV-4 re-verified on disk before writing any code
+
+`PLAN.md` asserts the response-header map IS live at the H2 record build, against
+`SPEC.md` §5 non-goal 3 which left it open. Confirmed structurally in
+`crates/envoy-http2/src/hcm.rs`:
+
+```
+1105:    let response_status_for_log: u16 = resp.status;
+1108:    let response_headers_for_log: &[(String, String)] = &response_headers_for_log_owned;
+...
+1182:            upstream_service_time: extract_upstream_service_time(response_headers_for_log),
+```
+
+The borrow taken at 1108 is still being read at 1182, **inside the record
+literal**. So the borrow is alive at the record build by construction, and
+`h2_grpc_status()`'s "not live at the record build" doc is true of **trailers**
+only. H2 therefore gets BOTH legs, through the same helper H1 uses.
+
+Also confirmed before writing: `pub mod hcm;` at `crates/envoy-http1/src/lib.rs:22`,
+so `envoy_http1::hcm::effective_grpc_status` is a reachable path;
+`access_log_header_value` at `hcm.rs:1972`; `headers::GRPC_STATUS` at
+`crates/envoy-http1/src/headers.rs:18`.
+
+### Steps 1–2 — the failing tests, RUN and SEEN to fail
+
+Four tests appended to `envoy-http1`'s `hcm.rs`, and the Task-2 placeholder in
+`envoy-http2`'s `hcm.rs` REPLACED by the real H2 pin.
+
+```
+$ cargo test -p envoy-http1 -p envoy-http2 --lib grpc_status
+error[E0425]: cannot find function `effective_grpc_status` in this scope
+error[E0425]: cannot find function `effective_grpc_status` in module `envoy_http1::hcm`
+error: could not compile `envoy-http1` (lib test) due to 5 previous errors; 1 warning emitted
+error: could not compile `envoy-http2` (lib test) due to 2 previous errors
+```
+
+RED on BOTH codecs, for exactly the reason `PLAN.md` Task 5 Step 2 predicts.
+
+### Steps 3–5 — the field, the shared helper, both record builds
+
+`AccessLogRecord.grpc_status_code: u8` added immediately after
+`grpc_status: Option<String>`, with the doc spelling out that the two fields are
+NOT the same value; `grpc_status_code: 2,` added to `test_baseline`.
+`effective_grpc_status` added immediately above `build_access_log_record`. Both
+production record builds populated, verbatim from the plan.
+
+### Step 6 — a SIXTH finding: the plan's E0063 COUNT is four, its ENUMERATION is five
+
+`PLAN.md`'s Global Constraints say *"There are exactly FOUR such literals"*, and
+Task 5 Step 6 says *"The four are: the H1 production build, the H2 production
+build, `record.rs`'s `test_baseline`, and one test literal each in
+`file_sink.rs` and `envoy-http1/src/hcm.rs`"* — which **enumerates FIVE**.
+
+**The enumeration is right and the count is wrong.** Measured, the exhaustive
+`AccessLogRecord` literals are:
+
+```
+crates/envoy-accesslog/src/record.rs:170      grpc_status_code: 2,          (test_baseline)
+crates/envoy-accesslog/src/file_sink.rs:190   grpc_status_code: 2,          (test literal)
+crates/envoy-http1/src/hcm.rs:1791            effective_grpc_status(...)    (H1 production)
+crates/envoy-http1/src/hcm.rs:2651            grpc_status_code: 2,          (test literal)
+crates/envoy-http2/src/hcm.rs:1202            effective_grpc_status(...)    (H2 production)
+```
+
+**FIVE.** The sweep was driven to a FIXPOINT from the compiler's own error list,
+never from a text match, and it took **two rounds** — not because a site was
+missed, but because `cargo` stops at the first failing crate, so
+`envoy-http1/src/hcm.rs:2630` was invisible until `envoy-accesslog` compiled:
+
+```
+round 0: crates/envoy-accesslog/src/file_sink.rs -> 1 site(s) [169]
+round 0: crates/envoy-http1/src/hcm.rs           -> 1 site(s) [2630]
+round 1: no E0063 sites left
+build_exit=0
+```
+
+A single-pass sweep that trusted round 0 alone would have been complete only by
+luck. **Loop the compiler-driven sweep to a fixpoint.**
+
+### Step 7 — GREEN, and the per-crate arithmetic converges on the prototype
+
+```
+$ cargo test -p envoy-accesslog -p envoy-http1 -p envoy-http2 --lib
+test hcm::grpc_status_filter_tests::derivation_prefers_the_response_header ... ok
+test hcm::grpc_status_filter_tests::derivation_falls_back_to_the_phase_110_map ... ok
+test hcm::grpc_status_filter_tests::derivation_is_ungated_and_differs_from_the_phase_113_field ... ok
+test hcm::grpc_status_filter_tests::derivation_ignores_an_unparseable_or_out_of_range_header ... ok
+test hcm::h2_grpc_status_code_tests::h2_uses_the_shared_effective_status ... ok
+test hcm::h2_grpc_status_boundary_tests::h2_grpc_status_is_absent ... ok
+
+envoy-accesslog  test result: ok. 129 passed; 0 failed; 0 ignored
+envoy-http1      test result: ok. 242 passed; 0 failed; 0 ignored
+envoy-http2      test result: ok. 126 passed; 0 failed; 1 ignored
+```
+
+**These reconcile with `PLAN.md`'s prototype end-of-phase figures of 133 / 243 /
+126+1 ignored, exactly:**
+
+| crate | now | still to come | predicted end |
+|---|---:|---|---:|
+| `envoy-accesslog` | 129 | Task 6's neutrality pin (1) + Task 7's arm tests (3) | **133** ✓ |
+| `envoy-http1` | 242 | Task 8's compile test (1) | **243** ✓ |
+| `envoy-http2` | 126 (+1 ignored) | nothing | **126 (+1)** ✓ |
+
+`envoy-config` already closed at **722** ✓ at Task 4. All four per-crate targets
+are now either met or account for exactly.
+
+Boundary gates:
+
+```
+build_exit=0    clippy_exit=0    fmt_exit=0
+```
+
+Per-file numstat at this task's commit:
+
+```
+1	0	crates/envoy-accesslog/src/file_sink.rs
+11	0	crates/envoy-accesslog/src/record.rs
+91	0	crates/envoy-http1/src/hcm.rs
+24	3	crates/envoy-http2/src/hcm.rs
+```
+
+`record.rs` 11/0 against `PLAN.md`'s measured 12/0 — one line, and the plan's
+figure is the whole-phase total for a file no later task touches. Re-checked: the
+plan's block is 10 doc/field lines plus a blank; the blank was absorbed by the
+existing separator here.

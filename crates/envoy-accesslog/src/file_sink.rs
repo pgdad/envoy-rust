@@ -187,6 +187,7 @@ mod tests {
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
             grpc_status: None,
+            grpc_status_code: 2,
         }
     }
 

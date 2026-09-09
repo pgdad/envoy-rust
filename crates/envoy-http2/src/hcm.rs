@@ -1195,6 +1195,14 @@ async fn finalize_h2_stream(
             response_code_details: response_code_details_for_log_h2,
             dynamic_metadata,
             grpc_status: h2_grpc_status(),
+            // Phase 114: the UNGATED effective status. Unlike `grpc_status`
+            // above (a TRAILER-sourced value that CF-113-2 leaves absent on H2),
+            // this reads the RESPONSE HEADERS, which ARE live at this point:
+            // `response_headers_for_log_owned` is cloned before the `resp` move.
+            grpc_status_code: envoy_http1::hcm::effective_grpc_status(
+                response_headers_for_log,
+                response_status_for_log,
+            ),
         };
         for sink in &config.inner.access_log {
             // Phase 70: the per-sink emit gate. A sink with no filter always
@@ -7763,9 +7771,22 @@ mod h2_grpc_status_boundary_tests {
 // ── Phase 114: the H2 arm of the ungated derivation (CF-114-3) ──────────────
 #[cfg(test)]
 mod h2_grpc_status_code_tests {
+    // Pins that H2 uses the SAME derivation as H1 — one function, one map. The
+    // H2 arm has NO differential witness (CF-114-3), so this in-process test is
+    // its sole witness and a phase that changes H2's behaviour must edit it.
     #[test]
-    fn the_phase_110_map_is_reachable_from_http2() {
-        assert_eq!(envoy_http1::http_to_grpc_status(404), 12);
-        assert_eq!(envoy_http1::http_to_grpc_status(200), 2);
+    fn h2_uses_the_shared_effective_status() {
+        assert_eq!(
+            envoy_http1::hcm::effective_grpc_status(&[], 404),
+            12,
+            "H2 derives through the same helper H1 does"
+        );
+        assert_eq!(
+            envoy_http1::hcm::effective_grpc_status(
+                &[("grpc-status".to_string(), "3".to_string())],
+                200
+            ),
+            3
+        );
     }
 }

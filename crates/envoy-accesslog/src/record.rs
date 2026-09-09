@@ -121,6 +121,16 @@ pub struct AccessLogRecord {
     /// `%GRPC_STATUS(CAMEL_STRING|SNAKE_STRING|NUMBER)%` / `%GRPC_STATUS_NUMBER%`
     /// — absent → `-` sentinel / json `null`.
     pub grpc_status: Option<String>,
+    /// Phase 114: the UNGATED effective gRPC status code the `grpc_status_filter`
+    /// access-log filter arm evaluates. MEASURED rule: the response `grpc-status`
+    /// header if present, ELSE `http_to_grpc_status(response_code)`.
+    ///
+    /// This is NOT `grpc_status` above. That field is GATED on the REQUEST being
+    /// a gRPC request and holds a raw string; this one is defined on EVERY
+    /// request, including plain HTTP, which is the measured upstream behaviour of
+    /// the filter. A plain 404 with no gRPC content-type has `grpc_status: None`
+    /// and `grpc_status_code: 12`.
+    pub grpc_status_code: u8,
 }
 
 /// Shared test-fixture constructor. Lives on the type (not in a test module)
@@ -157,6 +167,7 @@ impl AccessLogRecord {
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
             grpc_status: None,
+            grpc_status_code: 2,
         }
     }
 }

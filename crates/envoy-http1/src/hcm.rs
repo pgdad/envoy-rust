@@ -1655,6 +1655,23 @@ struct AccessLogResponseInfo<'a> {
 /// Build the per-request access-log record (extracted verbatim from
 /// `serve_connection`'s factored access-log dispatch site, including the
 /// `%RESPONSE_FLAGS%` derive block).
+/// Phase 114: the UNGATED effective gRPC status. MEASURED on both proxies: the
+/// response `grpc-status` header if present and parseable, else the phase-110
+/// `http_to_grpc_status` map over the response code. Shared by both codecs.
+///
+/// An unparseable or out-of-range header value falls back to the response-code
+/// map — upstream's own source of the value is an optional parse, and a fixture
+/// cannot set an arbitrary `grpc-status` on either proxy (CF-114-5).
+pub fn effective_grpc_status(response_headers: &[(String, String)], status: u16) -> u8 {
+    match access_log_header_value(response_headers, crate::headers::GRPC_STATUS)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| (0..=16).contains(n))
+    {
+        Some(n) => n as u8,
+        None => crate::grpc::http_to_grpc_status(status),
+    }
+}
+
 fn build_access_log_record(
     request: AccessLogRequestInfo<'_>,
     response: AccessLogResponseInfo<'_>,
@@ -1766,6 +1783,12 @@ fn build_access_log_record(
         } else {
             None
         },
+        // phase 114: the UNGATED effective status the `grpc_status_filter` arm
+        // reads. Deliberately NOT gated on `is_grpc_request` — MEASURED: a plain
+        // 404 with no gRPC content-type is KEPT by a sink filtered on
+        // UNIMPLEMENTED. The header leg wins when present; otherwise the
+        // phase-110 map over the response code.
+        grpc_status_code: effective_grpc_status(response.headers, response.status),
     }
 }
 
@@ -2625,6 +2648,7 @@ mod tests {
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
             grpc_status: None,
+            grpc_status_code: 2,
         }
     }
 
@@ -11773,5 +11797,72 @@ mod grpc_status_access_log_tests {
             grpc_status_for(Some("application/grpc"), &hs),
             Some("7".to_string())
         );
+    }
+}
+
+// ── Phase 114: the ungated effective-gRPC-status derivation ─────────────────
+#[cfg(test)]
+mod grpc_status_filter_tests {
+    use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn derivation_prefers_the_response_header() {
+        // MEASURED: a gRPC request against a 404 direct_response is rewritten by
+        // the phase-110 transform to HTTP 200 + `grpc-status: 12`, and the filter
+        // reads 12 — NOT `http_to_grpc_status(200)` = 2.
+        assert_eq!(
+            effective_grpc_status(&hdrs(&[("grpc-status", "12")]), 200),
+            12
+        );
+        assert_eq!(
+            effective_grpc_status(&hdrs(&[("Grpc-Status", "0")]), 200),
+            0
+        );
+    }
+
+    #[test]
+    fn derivation_falls_back_to_the_phase_110_map() {
+        // MEASURED on plain-HTTP probes, which carry NO grpc-status header:
+        // 404 -> 12, 400 -> 13, 200 -> 2 (the `_ => 2` default; upstream's map
+        // has NO `200 => 0` arm).
+        for (status, want) in [
+            (404u16, 12u8),
+            (400, 13),
+            (200, 2),
+            (503, 14),
+            (401, 16),
+            (403, 7),
+        ] {
+            assert_eq!(effective_grpc_status(&[], status), want, "status {status}");
+        }
+    }
+
+    #[test]
+    fn derivation_is_ungated_and_differs_from_the_phase_113_field() {
+        // THE governing finding. A plain 404 with no gRPC content-type has
+        // `record.grpc_status == None` (phase 113's GATED field) but an
+        // effective status of 12. An implementation that reuses the phase-113
+        // field cannot express this row.
+        let req = hdrs(&[("host", "x")]); // no content-type at all
+        assert!(!crate::grpc::is_grpc_request(&req));
+        assert_eq!(effective_grpc_status(&[], 404), 12);
+    }
+
+    #[test]
+    fn derivation_ignores_an_unparseable_or_out_of_range_header() {
+        for bad in ["", "abc", "99", "-1", "1.0"] {
+            assert_eq!(
+                effective_grpc_status(&hdrs(&[("grpc-status", bad)]), 404),
+                12,
+                "unparseable/out-of-range {bad:?} must fall back to the map"
+            );
+        }
     }
 }
