@@ -747,3 +747,138 @@ Per-file numstat at this task's commit:
 figure is the whole-phase total for a file no later task touches. Re-checked: the
 plan's block is 10 doc/field lines plus a blank; the blank was absorbed by the
 existing separator here.
+
+---
+
+## Task 6 — the fifth `should_log` widening (behaviour-neutral)
+
+**Status: COMPLETE.** Commit: `phase 114 task 6: widen should_log with the effective gRPC status (behavior-neutral)`.
+
+### `ADR-0197` SPEC correction 1 re-verified on disk
+
+`SPEC.md` says the production `should_log` call sites are TWO and the other 125
+are mechanical test edits. `ADR-0197` says FIVE and 122. **Measured here, the
+plan is right:**
+
+```
+crates/envoy-accesslog/src/filter.rs      68
+crates/envoy-accesslog/src/file_sink.rs    5
+crates/envoy-http1/src/hcm.rs             53
+crates/envoy-http2/src/hcm.rs              1
+                                    total 127
+```
+
+and a workspace-wide sweep of `crates/` + `tests/` finds `.should_log(` in **no
+other file**, so 127 is the whole population. The five production sites, located
+by TEXT:
+
+```
+crates/envoy-accesslog/src/file_sink.rs:114   the FileSink -> LogFilter delegation
+crates/envoy-accesslog/src/filter.rs:148      the And recursion
+crates/envoy-accesslog/src/filter.rs:151      the Or  recursion
+crates/envoy-http1/src/hcm.rs:1575            the H1 dispatch
+crates/envoy-http2/src/hcm.rs:1217            the H2 dispatch
+```
+
+The three the SPEC missed are none of them a mechanical test edit.
+
+### Steps 1–3 — the definitions, the production sites, the 122-site sweep
+
+Both definitions and both docs widened (now `Phase 70/71/72/73/74/114`), the two
+recursion arms and the `FileSink` delegation threaded, and both production
+dispatch sites given one more argument line.
+
+**The sweep was a paren-matching pass, not a `sed`** — the plan warns the last
+argument has eight spellings, three with nested parentheses, and that ten sites
+are already multiline. Each `.should_log(` was brace-matched to its own closing
+paren; a site whose inner text already contained `grpc_status_code` was skipped,
+which is what makes the pass idempotent and self-checking:
+
+```
+crates/envoy-accesslog/src/filter.rs          widened  66
+crates/envoy-accesslog/src/file_sink.rs       widened   4
+crates/envoy-http1/src/hcm.rs                 widened  52
+crates/envoy-http2/src/hcm.rs                 widened   0
+seen=127 widened=122 already-widened(production)=5
+```
+
+**127 = 122 + 5 exactly**, and the per-file split 66 / 4 / 52 / 0 matches
+`PLAN.md`'s own Task-6 file list cell-for-cell ("2 production recursion sites +
+66 test sites", "1 production delegation + 4 test sites", "1 production site + 52
+test sites", "1 production site"). `cargo fmt --all` was run as part of THIS
+task, per the plan and the phase-72 precedent.
+
+### A SEVENTH finding: Step 5's expected counts predate Step 4
+
+`PLAN.md` Task 6 Step 5 says *"Expected counts: `68`, `5`, `53`, `1` — unchanged
+from before the sweep, because the sweep adds arguments and not call sites."*
+The reasoning is right and the number is stale: **Step 4 of the same task adds a
+neutrality pin containing FOUR `.should_log(` calls.** Measured after Step 4:
+
+```
+crates/envoy-accesslog/src/filter.rs      72     (68 + the pin's 4)
+crates/envoy-accesslog/src/file_sink.rs    5     ✓
+crates/envoy-http1/src/hcm.rs             53     ✓
+crates/envoy-http2/src/hcm.rs              1     ✓
+```
+
+Three of the four match; `filter.rs` is 68 + 4 = 72 and the sweep is still
+argument-only. The expected-count line was written against the pre-Step-4 file.
+
+### The `only_used_in_recursion` gate — the plan's contingency, taken as written
+
+`PLAN.md` Task 6 says: *"Do NOT add `#[allow(clippy::only_used_in_recursion)]` …
+If the executor gates Task 6 in isolation and clippy fires that lint, add the
+allow with a comment saying it is TRANSIENT and REMOVE it in Task 7."*
+
+**It fired.** Gating this task in isolation is exactly the case the plan's
+contingency covers:
+
+```
+error: parameter is only used in recursion
+   --> crates/envoy-accesslog/src/filter.rs:117:9
+117 |         grpc_status_code: u8,
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore
+note: parameter used here
+   --> crates/envoy-accesslog/src/filter.rs:155:21  (the And arm)
+   ...  164  (the Or arm)
+```
+
+The cause is structural and temporary: Task 6 threads the parameter through the
+And/Or recursion while the arm that CONSUMES it is Task 7's. So the allow was
+added on the plan's own instruction, carrying a six-line note naming itself
+TRANSIENT, the task that must delete it, and the check that will prove it gone.
+
+⚠ **This is the one suppression in the phase, and Task 7 removes it.** The
+Task-3 `-D warnings` deferral was handled the other way — by deferring the gate
+rather than suppressing the lint — because no plan instruction covered it there.
+Here the plan makes the call explicitly, so it is followed, with the removal
+made checkable rather than remembered.
+
+### Step 5 — verification
+
+```
+build_exit=0    clippy_exit=0    fmt_exit=0
+
+$ cargo test -p envoy-accesslog -p envoy-http1 -p envoy-http2 --lib
+test filter::tests::existing_arms_ignore_the_grpc_status_argument ... ok
+test filter::tests::existing_arms_ignore_the_dynamic_metadata_argument ... ok
+
+envoy-accesslog  test result: ok. 130 passed; 0 failed; 0 ignored
+envoy-http1      test result: ok. 242 passed; 0 failed; 0 ignored
+envoy-http2      test result: ok. 126 passed; 0 failed; 1 ignored
+```
+
+The new pin passes over all four probe codes × four arms, and the phase-74 pin it
+is modelled on still passes beside it — the widening is behaviour-neutral in both
+directions. `envoy-accesslog` moves 129 → **130**; Task 7's three arm tests take
+it to the plan's **133**.
+
+Per-file numstat at this task's commit:
+
+```
+16	9	crates/envoy-accesslog/src/file_sink.rs
+121	79	crates/envoy-accesslog/src/filter.rs
+61	52	crates/envoy-http1/src/hcm.rs
+1	0	crates/envoy-http2/src/hcm.rs
+```

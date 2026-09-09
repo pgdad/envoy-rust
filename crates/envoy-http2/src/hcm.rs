@@ -1219,6 +1219,7 @@ async fn finalize_h2_stream(
                 &record.response_flags,
                 &envoy_req.headers,
                 &record.dynamic_metadata,
+                record.grpc_status_code,
             ) {
                 continue;
             }

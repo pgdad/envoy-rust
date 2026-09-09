@@ -99,19 +99,29 @@ pub enum LogFilter {
 }
 
 impl LogFilter {
-    /// Returns `true` iff a record with the given final response `status`,
-    /// `response_flags` token, request `headers`, and per-request
-    /// `dynamic_metadata` should be emitted. The `StatusCode` arm reads only
-    /// `status`; the `ResponseFlag` arm only `response_flags`; the `Header` arm
-    /// only `headers`; the phase-74 `Metadata` arm only `dynamic_metadata`. The
-    /// status comparison is widened to `u32` (lossless; status is always in
-    /// `u16` range).
+    /// Phase 70/71/72/73/74/114: returns `true` iff a record with the given
+    /// final response `status`, `response_flags` token, request `headers`,
+    /// per-request `dynamic_metadata` and UNGATED effective `grpc_status_code`
+    /// should be emitted. The `StatusCode` arm reads only `status`; the
+    /// `ResponseFlag` arm only `response_flags`; the `Header` arm only
+    /// `headers`; the phase-74 `Metadata` arm only `dynamic_metadata`; the
+    /// phase-114 `GrpcStatus` arm only `grpc_status_code`. The status
+    /// comparison is widened to `u32` (lossless; status is always in `u16`
+    /// range).
+    // ⚠ TRANSIENT, PHASE-114 TASK 6 ONLY — REMOVE IN TASK 7.
+    // `grpc_status_code` is threaded through the And/Or recursion here but no
+    // arm CONSUMES it until Task 7 lands `LogFilter::GrpcStatus`, so
+    // `only_used_in_recursion` fires at THIS task boundary and only here.
+    // `PLAN.md` Task 6 requires this allow be added with exactly this note and
+    // deleted by Task 7; Task 7 Step 4 re-runs `-D warnings` to prove it.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn should_log(
         &self,
         status: u16,
         response_flags: &str,
         headers: &[(String, String)],
         dynamic_metadata: &BTreeMap<String, BTreeMap<String, String>>,
+        grpc_status_code: u8,
     ) -> bool {
         match self {
             LogFilter::StatusCode(c) => {
@@ -143,12 +153,24 @@ impl LogFilter {
             // config validator's `min_items = 2` makes the empty-vec edge
             // (all→true, any→false) unreachable at runtime; the semantics are
             // pinned in-process regardless.
-            LogFilter::And(filters) => filters
-                .iter()
-                .all(|f| f.should_log(status, response_flags, headers, dynamic_metadata)),
-            LogFilter::Or(filters) => filters
-                .iter()
-                .any(|f| f.should_log(status, response_flags, headers, dynamic_metadata)),
+            LogFilter::And(filters) => filters.iter().all(|f| {
+                f.should_log(
+                    status,
+                    response_flags,
+                    headers,
+                    dynamic_metadata,
+                    grpc_status_code,
+                )
+            }),
+            LogFilter::Or(filters) => filters.iter().any(|f| {
+                f.should_log(
+                    status,
+                    response_flags,
+                    headers,
+                    dynamic_metadata,
+                    grpc_status_code,
+                )
+            }),
             // Phase 74: the MEASURED decision rule (SPEC §0 R-0.3/R-0.4) —
             // resolve `dynamic_metadata[filter][path[0].key]`; unresolved (or no
             // matcher at all) → `match_if_key_not_found`; resolved →
@@ -198,9 +220,9 @@ mod tests {
 
     #[test]
     fn ge_500_boundary() {
-        assert!(!ge(500).should_log(499, "-", &[], &Default::default()));
-        assert!(ge(500).should_log(500, "-", &[], &Default::default()));
-        assert!(ge(500).should_log(503, "-", &[], &Default::default()));
+        assert!(!ge(500).should_log(499, "-", &[], &Default::default(), 2));
+        assert!(ge(500).should_log(500, "-", &[], &Default::default(), 2));
+        assert!(ge(500).should_log(503, "-", &[], &Default::default(), 2));
     }
 
     #[test]
@@ -208,70 +230,70 @@ mod tests {
         // AND = all children match; OR = any child matches. Uses status-code
         // children (ge/le) so the test needs no header stub.
         let and = LogFilter::And(vec![ge(200), le(299)]); // 2xx band
-        assert!(and.should_log(200, "-", &[], &Default::default())); // both true
-        assert!(and.should_log(299, "-", &[], &Default::default()));
-        assert!(!and.should_log(500, "-", &[], &Default::default())); // le(299) false → AND false
+        assert!(and.should_log(200, "-", &[], &Default::default(), 2)); // both true
+        assert!(and.should_log(299, "-", &[], &Default::default(), 2));
+        assert!(!and.should_log(500, "-", &[], &Default::default(), 2)); // le(299) false → AND false
 
         let or = LogFilter::Or(vec![le(199), ge(500)]); // 1xx OR 5xx
-        assert!(or.should_log(100, "-", &[], &Default::default())); // le(199) true
-        assert!(or.should_log(503, "-", &[], &Default::default())); // ge(500) true
-        assert!(!or.should_log(200, "-", &[], &Default::default())); // neither → OR false
+        assert!(or.should_log(100, "-", &[], &Default::default(), 2)); // le(199) true
+        assert!(or.should_log(503, "-", &[], &Default::default(), 2)); // ge(500) true
+        assert!(!or.should_log(200, "-", &[], &Default::default(), 2)); // neither → OR false
 
         // Nested composition recurses.
         let nested = LogFilter::Or(vec![LogFilter::And(vec![ge(200), le(299)]), ge(500)]);
-        assert!(nested.should_log(204, "-", &[], &Default::default())); // AND-child true
-        assert!(nested.should_log(500, "-", &[], &Default::default())); // leaf true
-        assert!(!nested.should_log(404, "-", &[], &Default::default())); // AND-child false, leaf false
+        assert!(nested.should_log(204, "-", &[], &Default::default(), 2)); // AND-child true
+        assert!(nested.should_log(500, "-", &[], &Default::default(), 2)); // leaf true
+        assert!(!nested.should_log(404, "-", &[], &Default::default(), 2)); // AND-child false, leaf false
 
         // Empty-vec boundary (unreachable via config's min_items=2, pinned as a
         // semantic invariant): all([]) = true, any([]) = false.
-        assert!(LogFilter::And(vec![]).should_log(200, "-", &[], &Default::default()));
-        assert!(!LogFilter::Or(vec![]).should_log(200, "-", &[], &Default::default()));
+        assert!(LogFilter::And(vec![]).should_log(200, "-", &[], &Default::default(), 2));
+        assert!(!LogFilter::Or(vec![]).should_log(200, "-", &[], &Default::default(), 2));
     }
 
     #[test]
     fn eq_404_boundary() {
-        assert!(!eq(404).should_log(403, "-", &[], &Default::default()));
-        assert!(eq(404).should_log(404, "NR", &[], &Default::default()));
-        assert!(!eq(404).should_log(405, "-", &[], &Default::default()));
+        assert!(!eq(404).should_log(403, "-", &[], &Default::default(), 2));
+        assert!(eq(404).should_log(404, "NR", &[], &Default::default(), 2));
+        assert!(!eq(404).should_log(405, "-", &[], &Default::default(), 2));
     }
 
     #[test]
     fn le_200_boundary() {
-        assert!(le(200).should_log(200, "-", &[], &Default::default()));
-        assert!(!le(200).should_log(201, "-", &[], &Default::default()));
-        assert!(le(200).should_log(100, "-", &[], &Default::default()));
+        assert!(le(200).should_log(200, "-", &[], &Default::default(), 2));
+        assert!(!le(200).should_log(201, "-", &[], &Default::default(), 2));
+        assert!(le(200).should_log(100, "-", &[], &Default::default(), 2));
     }
 
     #[test]
     fn response_flag_membership() {
         // The ResponseFlag arm ignores `status`; pass any value.
-        assert!(rf(&["NR"]).should_log(404, "NR", &[], &Default::default()));
-        assert!(rf(&["UH", "NR"]).should_log(404, "NR", &[], &Default::default()));
-        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &Default::default()));
+        assert!(rf(&["NR"]).should_log(404, "NR", &[], &Default::default(), 2));
+        assert!(rf(&["UH", "NR"]).should_log(404, "NR", &[], &Default::default(), 2));
+        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &Default::default(), 2));
     }
 
     #[test]
     fn response_flag_dash_sentinel_never_matches_nonempty() {
         // "-" ∉ the 29-token set, so a non-empty `flags` never matches it.
-        assert!(!rf(&["NR"]).should_log(503, "-", &[], &Default::default()));
-        assert!(!rf(&["UH", "UF"]).should_log(503, "-", &[], &Default::default()));
+        assert!(!rf(&["NR"]).should_log(503, "-", &[], &Default::default(), 2));
+        assert!(!rf(&["UH", "UF"]).should_log(503, "-", &[], &Default::default(), 2));
     }
 
     #[test]
     fn response_flag_empty_matches_any_flag_set() {
         // MEASURED (ADR-0145 PV-6): empty `flags` keeps records WITH a flag,
         // drops the "-" no-flag sentinel.
-        assert!(rf(&[]).should_log(404, "NR", &[], &Default::default()));
-        assert!(rf(&[]).should_log(503, "UF", &[], &Default::default()));
-        assert!(!rf(&[]).should_log(503, "-", &[], &Default::default()));
+        assert!(rf(&[]).should_log(404, "NR", &[], &Default::default(), 2));
+        assert!(rf(&[]).should_log(503, "UF", &[], &Default::default(), 2));
+        assert!(!rf(&[]).should_log(503, "-", &[], &Default::default(), 2));
     }
 
     #[test]
     fn response_flag_inert_token_never_matches_produced() {
         // A config may carry an inert token (`DI`); envoy-rust never renders it.
-        assert!(!rf(&["DI"]).should_log(404, "NR", &[], &Default::default()));
-        assert!(!rf(&["DI"]).should_log(503, "-", &[], &Default::default()));
+        assert!(!rf(&["DI"]).should_log(404, "NR", &[], &Default::default(), 2));
+        assert!(!rf(&["DI"]).should_log(503, "-", &[], &Default::default(), 2));
     }
 
     #[test]
@@ -280,9 +302,9 @@ mod tests {
             op: FilterOp::Ge,
             threshold: 500,
         });
-        assert!(f.should_log(503, "-", &[], &Default::default()));
-        assert!(f.should_log(503, "NR", &[], &Default::default()));
-        assert!(!f.should_log(200, "NR", &[], &Default::default()));
+        assert!(f.should_log(503, "-", &[], &Default::default(), 2));
+        assert!(f.should_log(503, "NR", &[], &Default::default(), 2));
+        assert!(!f.should_log(200, "NR", &[], &Default::default(), 2));
     }
 
     // --- phase 72: LogFilter::Header delegates to the injected HeaderMatch ---
@@ -311,15 +333,17 @@ mod tests {
             200,
             "-",
             &[("x-log".to_string(), "yes".to_string())],
-            &Default::default()
+            &Default::default(),
+            2,
         ));
         assert!(!f.should_log(
             200,
             "-",
             &[("x-log".to_string(), "no".to_string())],
-            &Default::default()
+            &Default::default(),
+            2,
         ));
-        assert!(!f.should_log(200, "-", &[], &Default::default()));
+        assert!(!f.should_log(200, "-", &[], &Default::default(), 2));
     }
 
     /// Phase 74 T3: `should_log` carries the per-request dynamic-metadata store
@@ -335,28 +359,34 @@ mod tests {
         let empty: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
         // StatusCode arm: identical verdict with and without metadata.
-        assert!(ge(500).should_log(503, "-", &[], &md));
-        assert!(ge(500).should_log(503, "-", &[], &empty));
-        assert!(!ge(500).should_log(499, "-", &[], &md));
+        assert!(ge(500).should_log(503, "-", &[], &md, 2));
+        assert!(ge(500).should_log(503, "-", &[], &empty, 2));
+        assert!(!ge(500).should_log(499, "-", &[], &md, 2));
 
         // ResponseFlag arm.
-        assert!(rf(&["NR"]).should_log(404, "NR", &[], &md));
-        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &md));
+        assert!(rf(&["NR"]).should_log(404, "NR", &[], &md, 2));
+        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &md, 2));
 
         // Header arm (via the local stub).
         let h = LogFilter::Header {
             matcher: std::sync::Arc::new(HasHeaderValue("x-log", "yes")),
         };
-        assert!(h.should_log(200, "-", &[("x-log".to_string(), "yes".to_string())], &md));
-        assert!(!h.should_log(200, "-", &[], &md));
+        assert!(h.should_log(
+            200,
+            "-",
+            &[("x-log".to_string(), "yes".to_string())],
+            &md,
+            2
+        ));
+        assert!(!h.should_log(200, "-", &[], &md, 2));
 
         // Composition arms thread the new argument through the recursion.
         let and = LogFilter::And(vec![ge(200), le(299)]);
-        assert!(and.should_log(204, "-", &[], &md));
-        assert!(!and.should_log(500, "-", &[], &md));
+        assert!(and.should_log(204, "-", &[], &md, 2));
+        assert!(!and.should_log(500, "-", &[], &md, 2));
         let or = LogFilter::Or(vec![le(199), ge(500)]);
-        assert!(or.should_log(503, "-", &[], &md));
-        assert!(!or.should_log(200, "-", &[], &md));
+        assert!(or.should_log(503, "-", &[], &md, 2));
+        assert!(!or.should_log(200, "-", &[], &md, 2));
     }
 
     // --- phase 74: LogFilter::Metadata + the injected MetadataMatch seam ---
@@ -407,29 +437,29 @@ mod tests {
 
         // Value MATCHES → KEEP, regardless of the not-found policy.
         let hit = md(&[("com.example", "k", "1")]);
-        assert!(keep_default.should_log(200, "-", &[], &hit));
-        assert!(drop_default.should_log(200, "-", &[], &hit));
+        assert!(keep_default.should_log(200, "-", &[], &hit, 2));
+        assert!(drop_default.should_log(200, "-", &[], &hit, 2));
 
         // Value MISMATCH → DROP, regardless of the not-found policy (the value
         // matcher is only consulted when the path RESOLVES).
         let miss = md(&[("com.example", "k", "2")]);
-        assert!(!keep_default.should_log(200, "-", &[], &miss));
-        assert!(!drop_default.should_log(200, "-", &[], &miss));
+        assert!(!keep_default.should_log(200, "-", &[], &miss, 2));
+        assert!(!drop_default.should_log(200, "-", &[], &miss, 2));
 
         // KEY absent inside a PRESENT namespace → the not-found policy decides.
         let other_key = md(&[("com.example", "other", "1")]);
-        assert!(keep_default.should_log(200, "-", &[], &other_key));
-        assert!(!drop_default.should_log(200, "-", &[], &other_key));
+        assert!(keep_default.should_log(200, "-", &[], &other_key, 2));
+        assert!(!drop_default.should_log(200, "-", &[], &other_key, 2));
 
         // NAMESPACE absent behaves IDENTICALLY to a missing key (MEASURED R-0.4).
         let other_ns = md(&[("com.other", "k", "1")]);
-        assert!(keep_default.should_log(200, "-", &[], &other_ns));
-        assert!(!drop_default.should_log(200, "-", &[], &other_ns));
+        assert!(keep_default.should_log(200, "-", &[], &other_ns, 2));
+        assert!(!drop_default.should_log(200, "-", &[], &other_ns, 2));
 
         // Wholly empty store → same not-found path.
         let empty = md(&[]);
-        assert!(keep_default.should_log(200, "-", &[], &empty));
-        assert!(!drop_default.should_log(200, "-", &[], &empty));
+        assert!(keep_default.should_log(200, "-", &[], &empty, 2));
+        assert!(!drop_default.should_log(200, "-", &[], &empty, 2));
 
         // MATCHER-LESS filter (upstream accepts `metadata_filter: {}`, R-0.2):
         // every record takes the not-found policy.
@@ -441,11 +471,11 @@ mod tests {
             matcher: None,
             match_if_key_not_found: false,
         };
-        assert!(no_matcher_keep.should_log(200, "-", &[], &hit));
-        assert!(!no_matcher_drop.should_log(200, "-", &[], &hit));
+        assert!(no_matcher_keep.should_log(200, "-", &[], &hit, 2));
+        assert!(!no_matcher_drop.should_log(200, "-", &[], &hit, 2));
 
         // The arm ignores status / response_flags / headers.
-        assert!(keep_default.should_log(503, "UF", &[("x-a".into(), "1".into())], &hit));
+        assert!(keep_default.should_log(503, "UF", &[("x-a".into(), "1".into())], &hit, 2));
     }
 
     #[test]
@@ -457,13 +487,25 @@ mod tests {
         };
         let and = LogFilter::And(vec![meta.clone(), ge(500)]);
         let hit = md(&[("com.example", "k", "1")]);
-        assert!(and.should_log(503, "-", &[], &hit)); // both true
-        assert!(!and.should_log(200, "-", &[], &hit)); // status false
-        assert!(!and.should_log(503, "-", &[], &md(&[]))); // metadata false
+        assert!(and.should_log(503, "-", &[], &hit, 2)); // both true
+        assert!(!and.should_log(200, "-", &[], &hit, 2)); // status false
+        assert!(!and.should_log(503, "-", &[], &md(&[]), 2)); // metadata false
 
         let or = LogFilter::Or(vec![meta, ge(500)]);
-        assert!(or.should_log(200, "-", &[], &hit)); // metadata true
-        assert!(or.should_log(503, "-", &[], &md(&[]))); // status true
-        assert!(!or.should_log(200, "-", &[], &md(&[]))); // neither
+        assert!(or.should_log(200, "-", &[], &hit, 2)); // metadata true
+        assert!(or.should_log(503, "-", &[], &md(&[]), 2)); // status true
+        assert!(!or.should_log(200, "-", &[], &md(&[]), 2)); // neither
+    }
+
+    #[test]
+    fn existing_arms_ignore_the_grpc_status_argument() {
+        // The phase-74 T3 behaviour-neutrality pin, repeated for the fifth
+        // parameter: every pre-phase-114 arm must be blind to it.
+        for code in [0u8, 2, 12, 16] {
+            assert!(ge(500).should_log(503, "-", &[], &Default::default(), code));
+            assert!(!ge(500).should_log(499, "-", &[], &Default::default(), code));
+            assert!(rf(&["NR"]).should_log(404, "NR", &[], &Default::default(), code));
+            assert!(!rf(&["NR"]).should_log(404, "UH", &[], &Default::default(), code));
+        }
     }
 }
