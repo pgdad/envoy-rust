@@ -960,3 +960,91 @@ Boundary gates:
 ```
 build_exit=0    clippy_exit=0    fmt_exit=0
 ```
+
+---
+
+## Task 8 — `compile_access_log_filter` grows to seven arms
+
+**Status: COMPLETE.** Commit: `phase 114 task 8: compile_access_log_filter grows to seven arms`.
+
+### An EIGHTH finding: a filtered-out test run is a FALSE GREEN
+
+The first attempt at Step 1 aborted on a mis-written guard, so the test was never
+inserted — and the Step-2 run then reported, with **exit code 0**:
+
+```
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.00s
+```
+
+`cargo test -p <pkg> <name>` exits **0** when the name filter matches nothing.
+Had this step been judged by exit code, a test that does not exist would have
+read as a passing test. Every RED/GREEN claim in this document was therefore
+taken from the `running N tests` line and the named result row, never from `$?`.
+The guard was corrected and the insert redone.
+
+### Steps 1–2 — the failing test, RUN and SEEN to fail
+
+```
+$ cargo test -p envoy-http1 --lib compile_produces_the_seventh_arm
+running 1 test
+test hcm::grpc_status_filter_tests::compile_produces_the_seventh_arm_with_resolved_codes ... FAILED
+
+thread '...' panicked at crates/envoy-http1/src/hcm.rs:1902:14:
+internal error: entered unreachable code: validated by validate_access_logs: exactly one filter arm is set
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 242 filtered out; finished in 0.00s
+```
+
+`running 1 test` proves it ran, and it is RED as a **panic** rather than a
+compile error — exactly the failure mode `PLAN.md` Task 8 Step 2 predicts, and
+for the right reason: the six-tuple does not yet include `grpc_status_filter`, so
+the `_ =>` fallback catches it.
+
+The test's three tokens deliberately cover all three input shapes the grammar
+accepts — a canonical NAME (`UNIMPLEMENTED` → 12), a bare INTEGER (`13`), and a
+string-spelled integer (`"14"`) — so a compile step that resolved only one shape
+would go RED here.
+
+### Step 3 — the match
+
+The scrutinee tuple grew to seven, a seventh `None` was added to each of the six
+existing patterns, and the new arm was inserted immediately before the `_ =>`
+fallback. The compile step may `expect()` because the validator (Task 4) has
+already proved every token resolves — the same posture the `header_filter` and
+`metadata_filter` arms take with their pre-compiled `SafeRegex`.
+
+The doc comment's *"SIX arms ship"* was updated to SEVEN and now names
+`grpc_status_filter` (phase 114).
+
+### Step 4 — GREEN, and all four per-crate targets met
+
+```
+$ cargo test -p envoy-http1 --lib
+test hcm::grpc_status_filter_tests::compile_produces_the_seventh_arm_with_resolved_codes ... ok
+test result: ok. 243 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+build_exit=0    clippy_exit=0    fmt_exit=0
+```
+
+**`243 passed; 0 failed` is exactly `PLAN.md` Task 8 Step 4's stated prototype
+figure**, and it is the last of the four. Every affected crate has now landed on
+the number the prototype measured, independently reached:
+
+| crate | measured here | `PLAN.md` prototype |
+|---|---:|---:|
+| `envoy-accesslog` | 133 | 133 ✓ |
+| `envoy-config` | 722 | 722 ✓ |
+| `envoy-http1` | 243 | 243 ✓ |
+| `envoy-http2` | 126 (+1 ignored) | 126 (+1 ignored) ✓ |
+| **sum** | **1224** | **1224** ✓ |
+
+Four independent numbers agreeing is meaningful corroboration in a way one
+aggregate would not be: a compensating error in either direction would have to
+cancel across separate crates.
+
+Per-file numstat at this task's commit:
+
+```
+41	7	crates/envoy-http1/src/hcm.rs
+```
