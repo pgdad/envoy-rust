@@ -986,16 +986,6 @@ async fn handle_one_stream(
     .await
 }
 
-/// 06.2 Task 7: factored per-stream finalization — sends the
-/// downstream response via `send_envoy_response`, then (if the HCM
-/// config carries access-log sinks) builds an `AccessLogRecord` and
-/// emits it once per sink. Mirrors the H1 factored join-point at
-/// `envoy_http1::serve_connection`'s tail.
-///
-/// Per PLAN-write SPEC correction 2 the access-log dispatch lands
-/// AFTER `send_envoy_response` returns (covers both the empty-body
-/// `send_response(.., end_of_stream=true)` branch and the non-empty
-/// `send_data(.., end_of_stream=true)` branch uniformly).
 /// The `%GRPC_STATUS%` backing value for the HTTP/2 access-log record.
 ///
 /// ALWAYS `None` (CF-113-2). H2's gRPC status would have to come from the
@@ -1010,6 +1000,16 @@ fn h2_grpc_status() -> Option<String> {
     None
 }
 
+/// 06.2 Task 7: factored per-stream finalization — sends the
+/// downstream response via `send_envoy_response`, then (if the HCM
+/// config carries access-log sinks) builds an `AccessLogRecord` and
+/// emits it once per sink. Mirrors the H1 factored join-point at
+/// `envoy_http1::serve_connection`'s tail.
+///
+/// Per PLAN-write SPEC correction 2 the access-log dispatch lands
+/// AFTER `send_envoy_response` returns (covers both the empty-body
+/// `send_response(.., end_of_stream=true)` branch and the non-empty
+/// `send_data(.., end_of_stream=true)` branch uniformly).
 #[allow(clippy::too_many_arguments)]
 async fn finalize_h2_stream(
     config: &Arc<HCMConfig>,
