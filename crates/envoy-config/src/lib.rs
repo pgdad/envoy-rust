@@ -494,6 +494,12 @@ pub enum ConfigError {
     #[error("response_flag_filter flags must be a known response-flag token: {token}")]
     UnknownResponseFlag { token: String },
 
+    /// Phase 114: a `grpc_status_filter.statuses` entry is neither a canonical
+    /// gRPC status name (case-insensitive, underscores required) nor an integer
+    /// in 0..=16. Upstream rejects the same class at load.
+    #[error("grpc_status_filter statuses must be a known gRPC status token: {token}")]
+    UnknownGrpcStatus { token: String },
+
     /// Phase 74: an access-log `metadata_filter.matcher` (`MetadataMatcher`) is
     /// malformed — an empty `filter` namespace (upstream PGV `min_len 1`), a
     /// `path` whose length is not exactly 1 (upstream accepts multi-segment;

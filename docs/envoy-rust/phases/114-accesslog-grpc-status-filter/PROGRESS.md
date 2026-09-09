@@ -488,3 +488,125 @@ Per-file numstat at this task's commit:
 
 `lib.rs`'s 19 deletions are rustfmt re-flowing the `pub use bootstrap::{…}`
 block around the three new names, not removed exports.
+
+---
+
+## Task 4 — validation: the seventh arm and a fail-loud bad-token error
+
+**Status: COMPLETE.** Commit: `phase 114 task 4: validate the seventh AccessLogFilter arm fail-loud on a bad status token`.
+
+### A FIFTH trap, hit and recovered: an anchor that is NOT unique
+
+The first scripted edit aborted on its own uniqueness assertion:
+
+```
+AssertionError: ('        assert!(matches!(\n            err,\n            crate::ConfigEr', 2)
+```
+
+That `assert!(matches!(…AmbiguousAccessLogFilter…))` run occurs **twice** in
+`bootstrap.rs`. The script asserts `count == 1` **before** any write and writes
+only at the end, so nothing was modified — `git status --porcelain` was re-checked
+empty afterwards. The anchor was extended to include the preceding all-arms
+literal tail and the `validate_access_logs(…)` call, which is unique, and the
+edit was redone. **Assert the anchor occurs exactly once, and do the write last.**
+
+### Steps 1–2 — the failing tests, RUN and SEEN to fail
+
+`six_arm_cardinality_counts_every_arm` → `seven_arm_cardinality_counts_every_arm`,
+a seventh entry in its `single_arms` vector, `assert_eq!(single_arms.len(), 7)`,
+and the all-arms literal's `grpc_status_filter` flipped `None` → `Some(…)` (the
+binding renamed `all_six` → `all_seven` to match). Plus the two new tests.
+
+```
+$ cargo test -p envoy-config --lib grpc_status_filter_bad_token
+error[E0599]: no variant named `UnknownGrpcStatus` found for enum `ConfigError`
+error: could not compile `envoy-config` (lib test) due to 1 previous error; 1 warning emitted
+```
+
+RED for exactly the reason `PLAN.md` Task 4 Step 2 predicts. (The trailing
+"1 warning emitted" is the Task-3 unused destructure binding, still outstanding
+at this point and discharged below.)
+
+### Steps 3–4 — the error variant, the validator, and three stale doc counts
+
+`ConfigError::UnknownGrpcStatus { token: String }` added immediately after
+`UnknownResponseFlag`, its exact analogue. In `validate_access_log_filter`:
+`grpc_status_filter.is_some(),` appended to the `set_arms` array, and the token
+loop spliced before the closing `Ok(())`. The seventh destructure binding was
+already present — Task 3 was forced to add it by `E0027`.
+
+**The `set_arms` growth is the load-bearing half of this task**, and it is the
+one the compiler does NOT force: the array is not length-checked, so an arm
+present in the struct but missing from the array counts as ZERO and turns a
+valid single-arm filter into `AmbiguousAccessLogFilter{"no filter variant is
+set"}`. `seven_arm_cardinality_counts_every_arm` is what catches that, and it
+passes.
+
+Splice location verified structurally rather than by line number: the loop sits
+at line 5899 and `validate_access_log_filter` closes at 5915.
+
+**Beyond what the plan names, THREE doc statements became factually false** the
+moment the seventh arm landed, and all three were corrected:
+
+| site | was | now |
+|---|---|---|
+| the `AccessLogFilter` struct doc | *"This type models SIX oneof arms"* | SEVEN, naming `grpc_status_filter` (phase 114) |
+| `validate_access_logs`' contract doc item 3 | *"Phases 70/71/72/73/74 give SIX arms"* | *"Phases 70/71/72/73/74/114 give SEVEN arms"* |
+| `validate_access_log_filter`'s own doc | *"cardinality, all SIX arms"* | *"all SEVEN arms"* |
+
+`PLAN.md` Step 4 names only the second. The other two sit in the same two files
+this task edits and would otherwise have been left asserting a count the code
+contradicts.
+
+### Step 5 — GREEN, and the Task-3 deferral discharged
+
+```
+$ cargo test -p envoy-config --lib grpc_status
+running 6 tests
+test bootstrap::tests::grpc_status_filter_accepts_every_measured_token ... ok
+test bootstrap::tests::grpc_status_filter_rejects_every_measured_reject ... ok
+test bootstrap::tests::grpc_status_filter_exclude_defaults_false ... ok
+test bootstrap::tests::grpc_status_filter_mixed_token_list_deserializes ... ok
+test bootstrap::tests::grpc_status_filter_bad_token_is_fail_loud ... ok
+test bootstrap::tests::grpc_status_filter_empty_statuses_loads ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 716 filtered out; finished in 0.00s
+
+$ cargo test -p envoy-config --lib seven_arm_cardinality
+running 1 test
+test bootstrap::tests::seven_arm_cardinality_counts_every_arm ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 721 filtered out; finished in 0.00s
+
+$ cargo test -p envoy-config --lib
+test result: ok. 722 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+```
+
+**`722 passed; 0 failed` is exactly the figure `PLAN.md` §6.1 states the
+prototype measured for this crate at the end of the phase.** The crate is now
+complete for this phase (Tasks 5–10 touch other crates), so the two numbers are
+measuring the same thing and they agree.
+
+Boundary gates — **all three green, including `-D warnings`**:
+
+```
+build_exit=0
+clippy_exit=0     <- the Task-3 unused-binding deferral is DISCHARGED IN FULL
+fmt_exit=0
+```
+
+No `#[allow]` was added at Task 3 and none was removed here; the warning went
+away because its consumer landed, which is the only correct way for it to go
+away.
+
+Per-file numstat at this task's commit:
+
+```
+59	10	crates/envoy-config/src/bootstrap.rs
+6	0	crates/envoy-config/src/lib.rs
+```
+
+Cumulative for `envoy-config` across Tasks 3+4: `bootstrap.rs` 261/10 and
+`lib.rs` 26/19, against `PLAN.md`'s measured 249/4 and 26/19. `lib.rs` matches
+exactly. `bootstrap.rs` runs +12 insertions and +6 deletions over the prototype —
+the three stale doc-count corrections above, which the prototype did not make.

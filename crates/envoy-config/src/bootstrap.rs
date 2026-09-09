@@ -718,10 +718,11 @@ pub struct AccessLog {
 }
 
 /// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
-/// predicate carried by an `AccessLog` entry. This type models SIX oneof arms —
+/// predicate carried by an `AccessLog` entry. This type models SEVEN oneof arms —
 /// `status_code_filter` (phase 70), `response_flag_filter` (phase 71),
 /// `header_filter` (phase 72), the recursive `and_filter` / `or_filter`
-/// composition (phase 73), and `metadata_filter` (phase 74); future
+/// composition (phase 73), `metadata_filter` (phase 74) and
+/// `grpc_status_filter` (phase 114); future
 /// filter-family phases add further `Option` arms here rather than reshaping the
 /// type. Cardinality (exactly one arm set) is enforced by `validate_access_logs`
 /// (`ConfigError::AmbiguousAccessLogFilter`), NOT by serde — mirroring the
@@ -5724,7 +5725,8 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      below. When a `filter` is present it must set EXACTLY ONE arm. Zero arms
 ///      (`filter: {}`) and more-than-one arm BOTH surface as
 ///      `ConfigError::AmbiguousAccessLogFilter { detail }` (the `detail`
-///      distinguishes the two). Phases 70/71/72/73/74 give SIX arms, so the
+///      distinguishes the two). Phases 70/71/72/73/74/114 give SEVEN arms
+///      (phase 114's is `grpc_status_filter`), so the
 ///      more-than-one branch is REACHABLE. Cardinality lives in the helper
 ///      (mirroring the `SubstitutionFormatString` / `AmbiguousLogFormat`
 ///      precedent), not serde. Phase 73's composition arms (`and_filter`/
@@ -5806,7 +5808,7 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
 }
 
 /// Phase 73: recursively validate one `AccessLogFilter` oneof. Enforces exactly
-/// one arm is set (cardinality, all SIX arms — no `..`, so a future arm cannot
+/// one arm is set (cardinality, all SEVEN arms — no `..`, so a future arm cannot
 /// be added without updating this [M70-R1]), the per-leaf checks (status-code
 /// runtime_key, response-flag token membership, header-matcher compile-in-place),
 /// and — for the composition arms — `filters.len() >= 2` plus a recursive descent
@@ -5829,6 +5831,7 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         and_filter.is_some(),
         or_filter.is_some(),
         metadata_filter.is_some(),
+        grpc_status_filter.is_some(),
     ]
     .iter()
     .filter(|set| **set)
@@ -5893,6 +5896,21 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
     {
         validate_access_log_metadata_matcher(mm)?;
     }
+    // Phase 114: every `statuses` token must resolve. Fail-loud, first offender
+    // wins, mirroring `UnknownResponseFlag`.
+    if let Some(gsf) = grpc_status_filter {
+        for token in &gsf.statuses {
+            if resolve_grpc_status_token(token).is_none() {
+                return Err(crate::ConfigError::UnknownGrpcStatus {
+                    token: match token {
+                        GrpcStatusToken::Num(n) => n.to_string(),
+                        GrpcStatusToken::Name(s) => s.clone(),
+                    },
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -14857,12 +14875,12 @@ metadata_filter:
     }
 
     #[test]
-    fn six_arm_cardinality_counts_every_arm() {
+    fn seven_arm_cardinality_counts_every_arm() {
         // PV-3: the destructure is compiler-forced (no `..`), but the `set_arms`
         // ARRAY is not length-checked — an arm present in the struct yet missing
         // from the array would count as ZERO, turning a valid single-arm filter
         // into `AmbiguousAccessLogFilter{"no filter variant is set"}`. Assert
-        // each of the SIX arms ALONE validates, and that all six together are
+        // each of the SEVEN arms ALONE validates, and that all seven together are
         // "more than one".
         let single_arms: Vec<AccessLogFilter> = vec![
             AccessLogFilter {
@@ -14900,14 +14918,21 @@ metadata_filter:
                 metadata_filter: Some(MetadataFilter::default()),
                 ..AccessLogFilter::default()
             },
+            AccessLogFilter {
+                grpc_status_filter: Some(GrpcStatusFilter {
+                    statuses: vec![GrpcStatusToken::Name("NOT_FOUND".into())],
+                    exclude: false,
+                }),
+                ..AccessLogFilter::default()
+            },
         ];
-        assert_eq!(single_arms.len(), 6, "six arms must be covered");
+        assert_eq!(single_arms.len(), 7, "seven arms must be covered");
         for (idx, f) in single_arms.into_iter().enumerate() {
             validate_access_logs(&mut file_log_with_filter(f))
                 .unwrap_or_else(|e| panic!("arm {idx} alone must validate, got {e:?}"));
         }
 
-        let all_six = AccessLogFilter {
+        let all_seven = AccessLogFilter {
             status_code_filter: Some(StatusCodeFilter {
                 comparison: ComparisonFilter {
                     op: ComparisonOp::Ge,
@@ -14934,13 +14959,37 @@ metadata_filter:
                 filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
             }),
             metadata_filter: Some(MetadataFilter::default()),
-            grpc_status_filter: None,
+            grpc_status_filter: Some(GrpcStatusFilter {
+                statuses: vec![GrpcStatusToken::Name("NOT_FOUND".into())],
+                exclude: false,
+            }),
         };
-        let err = validate_access_logs(&mut file_log_with_filter(all_six)).expect_err("ambiguous");
+        let err =
+            validate_access_logs(&mut file_log_with_filter(all_seven)).expect_err("ambiguous");
         assert!(matches!(
             err,
             crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
         ));
+    }
+
+    #[test]
+    fn grpc_status_filter_bad_token_is_fail_loud() {
+        let yaml = access_log_filter_yaml(
+            "grpc_status_filter:\n                        statuses: [NOT_FOUND, CANCELLED]",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("CANCELLED must be rejected");
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownGrpcStatus { token } if token == "CANCELLED"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn grpc_status_filter_empty_statuses_loads() {
+        // MEASURED: `grpc_status_filter: {}` VALIDATES upstream (it keeps
+        // nothing at runtime, which is a RUNTIME rule, not a load rule).
+        let yaml = access_log_filter_yaml("grpc_status_filter: {}");
+        crate::parse_bootstrap(&yaml).expect("empty grpc_status_filter must load");
     }
 
     // --- phase 74 t2: access-log-scoped MetadataMatcher validation ---
