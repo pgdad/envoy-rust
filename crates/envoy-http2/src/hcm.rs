@@ -7759,3 +7759,13 @@ mod h2_grpc_status_boundary_tests {
         assert_eq!(super::h2_grpc_status(), None);
     }
 }
+
+// ── Phase 114: the H2 arm of the ungated derivation (CF-114-3) ──────────────
+#[cfg(test)]
+mod h2_grpc_status_code_tests {
+    #[test]
+    fn the_phase_110_map_is_reachable_from_http2() {
+        assert_eq!(envoy_http1::http_to_grpc_status(404), 12);
+        assert_eq!(envoy_http1::http_to_grpc_status(200), 2);
+    }
+}

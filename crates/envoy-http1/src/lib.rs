@@ -31,6 +31,7 @@ pub mod uring; // EXPERIMENTAL io_uring data-plane worker (perf prototype).
 pub use client::{Client, ClientStream};
 pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
+pub use grpc::http_to_grpc_status; // 114: the ONE HTTP->gRPC map, shared with envoy-http2.
 pub use hcm::{BuildOutcome, HCM, HCMConfig, HCMStats, build_response};
 pub use pool::{H1Pool, H1PoolManager, PoolError, PoolGuard}; // 13.1 NEW (Task 3)
 pub use rds_watcher::{RdsCounters, RdsWatcher, WatchTarget}; // 26 NEW (Task 3/4)

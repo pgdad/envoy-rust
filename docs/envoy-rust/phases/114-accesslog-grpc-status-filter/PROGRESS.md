@@ -212,3 +212,113 @@ the phase-113 state-3 precedent (`abbe107` … `0b0c7ea`) carried it in all ten
 task commits. The commit MESSAGE is the plan's, verbatim.
 
 **`CF-113-7` is CONSUMED.**
+
+---
+
+## Task 2 — widen `http_to_grpc_status` to `pub`, narrowly (PV-3)
+
+**Status: COMPLETE.** Commit: `phase 114 task 2: narrow pub on http_to_grpc_status so both codecs share ONE map (PV-3)`.
+
+This **DEPARTS** from phase 113's `ADR-0193` DECISION 6, deliberately and on a
+scope argument: that decision refused a visibility widening because
+`envoy-accesslog` is a LEAF crate and calling `envoy_http1::grpc` from it would
+be a dependency **cycle**. The caller here is `envoy-http2`, which already
+depends on `envoy-http1`, so no cycle exists on this edge.
+
+### Steps 1–2 — the failing test, RUN and SEEN to fail
+
+```
+$ cargo test -p envoy-http2 --lib the_phase_110_map_is_reachable
+   Compiling envoy-http2 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http2)
+error[E0425]: cannot find function `http_to_grpc_status` in crate `envoy_http1`
+    --> crates/envoy-http2/src/hcm.rs:7768:33
+     |
+7768 |         assert_eq!(envoy_http1::http_to_grpc_status(404), 12);
+     |                                 ^^^^^^^^^^^^^^^^^^^ not found in `envoy_http1`
+
+error[E0425]: cannot find function `http_to_grpc_status` in crate `envoy_http1`
+    --> crates/envoy-http2/src/hcm.rs:7769:33
+     |
+7769 |         assert_eq!(envoy_http1::http_to_grpc_status(200), 2);
+     |                                 ^^^^^^^^^^^^^^^^^^^ not found in `envoy_http1`
+
+error: could not compile `envoy-http2` (lib test) due to 2 previous errors
+```
+
+RED for exactly the reason `PLAN.md` Task 2 Step 2 predicts.
+
+### A SECOND PLAN correction — the `pub use` insertion point
+
+**`PLAN.md` Task 2 Step 3 says to add the re-export line "immediately above
+`pub use response::{Http1Response, Response};`". Doing that literally FAILS the
+plan's own `cargo fmt --all -- --check` gate.** rustfmt sorts the `pub use`
+block alphabetically, and `grpc` sorts between `error` and `hcm`, not above
+`response`:
+
+```
+$ cargo fmt --all -- --check
+Diff in /home/esa/git/envoy-rust/crates/envoy-http1/src/lib.rs:31:
+ pub use error::Http1Error;
++pub use grpc::http_to_grpc_status; // 114: the ONE HTTP->gRPC map, shared with envoy-http2.
+ pub use hcm::{BuildOutcome, HCM, HCMConfig, HCMStats, build_response};
+Diff in /home/esa/git/envoy-rust/crates/envoy-http1/src/lib.rs:37:
+-pub use grpc::http_to_grpc_status; // 114: the ONE HTTP->gRPC map, shared with envoy-http2.
+ pub use response::{Http1Response, Response};
+fmt_exit=1
+```
+
+`cargo fmt --all` was run and the line moved to the sorted position. **This is
+consistent with the prototype rather than a divergence from it**, and the
+numstat proves it: `PLAN.md`'s own measured LoC table lists
+`crates/envoy-http1/src/lib.rs` at **1 insertion / 0 deletions**, and the
+post-`fmt` diff here reads exactly `1	0`. Had the prototype's line stayed above
+`pub use response::`, that file would have shown a deletion too. So the plan's
+*prose* mis-describes where its own *measured* line ended up. `PLAN.md` is landed
+and is NOT edited; this is the forward correction.
+
+### Step 3 — the widening, item-level only
+
+`pub(crate) fn http_to_grpc_status` → `pub fn`, with the five-line comment
+`PLAN.md` specifies, and ONE `pub use` in `lib.rs`. The module declaration and
+both mutating/gating items were left exactly as they were — a `pub use`
+re-exports an item out of a `pub(crate)` module without widening the module.
+
+### Step 4 — GREEN, and nothing else leaked
+
+```
+$ cargo test -p envoy-http2 --lib the_phase_110_map_is_reachable
+running 1 test
+test hcm::h2_grpc_status_code_tests::the_phase_110_map_is_reachable_from_http2 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 126 filtered out; finished in 0.00s
+```
+
+The three leak checks, which are the load-bearing half of this task:
+
+```
+pub(crate) mod grpc;                 = 1
+pub(crate) fn is_grpc_request        = 1
+pub(crate) fn apply_grpc_local_reply = 1
+```
+
+`1`, `1`, `1` as `PLAN.md` predicts. `is_grpc_request` and
+`apply_grpc_local_reply` — the two items the module doc's hazard is actually
+about — remain unreachable from outside `envoy-http1`.
+
+### Boundary gates
+
+```
+$ cargo build --workspace --all-targets   -> build_exit=0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings -> clippy_exit=0
+$ cargo fmt --all -- --check              -> fmt_exit=0
+```
+
+Per-file numstat at this task's commit:
+
+```
+6	1	crates/envoy-http1/src/grpc.rs
+1	0	crates/envoy-http1/src/lib.rs
+10	0	crates/envoy-http2/src/hcm.rs
+```
+
+`grpc.rs` 6/1 and `lib.rs` 1/0 match `PLAN.md`'s measured table cell-for-cell.

@@ -61,7 +61,12 @@ pub(crate) fn is_grpc_request(headers: &[(String, String)]) -> bool {
 /// Do NOT "improve" this with a range arm (e.g. `500..=599 => 13`). The
 /// measurement says otherwise and the full-range sweep in the tests will
 /// catch it.
-pub(crate) fn http_to_grpc_status(status: u16) -> u8 {
+// Phase 114: item-level `pub` so `envoy-http2`'s access-log record build can
+// reuse ONE map rather than copy the table. The MODULE stays `pub(crate)`; only
+// this pure `u16 -> u8` lookup is re-exported (see `lib.rs`). The module doc's
+// hazard is about reachability from the shared `build_response` route-decision
+// path, which `apply_grpc_local_reply` is on and this function is not.
+pub fn http_to_grpc_status(status: u16) -> u8 {
     match status {
         400 => 13,
         401 => 16,
