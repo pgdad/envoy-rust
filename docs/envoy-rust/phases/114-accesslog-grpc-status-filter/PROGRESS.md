@@ -322,3 +322,169 @@ Per-file numstat at this task's commit:
 ```
 
 `grpc.rs` 6/1 and `lib.rs` 1/0 match `PLAN.md`'s measured table cell-for-cell.
+
+---
+
+## Task 3 — the `GrpcStatusFilter` config surface and the MEASURED token grammar
+
+**Status: COMPLETE.** Commit: `phase 114 task 3: the GrpcStatusFilter config arm and its MEASURED token grammar`.
+
+### A THIRD PLAN trap, hit and recovered: "add to `mod tests`" is not "append at EOF"
+
+The first insertion of the four tests went to the last column-0 `}` in
+`bootstrap.rs`, on the assumption that it closes `mod tests`. **It does not.**
+The run was RED for the wrong reason:
+
+```
+error[E0425]: cannot find type `AccessLogFilter` in this scope
+```
+
+`AccessLogFilter` is in scope under `mod tests`' `use super::*`, so an
+unresolved `AccessLogFilter` is a *location* failure, not a missing-item
+failure. Censused structurally:
+
+```
+6102:#[cfg(test)]    6103:mod tests {              <- closes at 20338
+20344/20345: mod serialize_roundtrip_tests {
+20898/20899: mod typed_per_filter_config_tests {
+21184/21185: mod per_route_absent_filter_tests {
+21381/21382: mod csrf_validator_tests {
+21617/21618: mod cdn_loop_config_tests {
+21769/21770: mod set_metadata_config_tests {
+21884/21885: mod header_to_metadata_config_tests {
+21974/21975: mod header_to_metadata_validator_tests {
+22103/22104: mod json_format_value_tests {         <- where the tests actually landed
+```
+
+`bootstrap.rs` carries **TEN** column-0 `#[cfg(test)] mod` blocks. `mod tests`
+spans lines **6103–20338**; the file is 22169 lines. The insert was reverted with
+`git checkout --` (the file was otherwise untouched at that point, so the revert
+was total, and `git status --porcelain` was re-checked empty) and redone at the
+FIRST column-0 `}` after `mod tests {`, with the neighbours asserted before the
+splice.
+
+### Steps 1–2 — the failing tests, RUN and SEEN to fail
+
+```
+$ cargo test -p envoy-config --lib grpc_status_filter
+error[E0433]: cannot find type `GrpcStatusToken` in this scope
+error[E0425]: cannot find function `resolve_grpc_status_token` in this scope
+error[E0609]: no field `grpc_status_filter` on type `bootstrap::AccessLogFilter`
+error: could not compile `envoy-config` (lib test) due to 18 previous errors
+```
+
+RED for exactly the two reasons `PLAN.md` Task 3 Step 2 predicts.
+
+### Step 3 — the implementation
+
+The seventh `Option` arm on `AccessLogFilter`, then `GrpcStatusFilter`,
+`GrpcStatusToken` (untagged, `Num` FIRST — arm order is load-bearing),
+`GRPC_STATUS_FILTER_NAMES` (17 entries, index IS the code) and
+`resolve_grpc_status_token`, all verbatim from the plan. Three re-exports added
+to `envoy-config`'s `lib.rs`.
+
+### Step 4 — the `E0063` blast radius, driven from the compiler's error list
+
+**Never from a text match.** The compiler reported **FIFTEEN** exhaustive
+literals across two crates:
+
+```
+crates/envoy-config/src/bootstrap.rs   4   (14616, 14654, 14714, 14906)
+crates/envoy-http1/src/hcm.rs         11   (4837, 4991, 5074, 5114, 5130,
+                                            5151, 5158, 5298, 5463, 5483, 10754)
+```
+
+The `envoy-http1` set is why `PLAN.md`'s Task 3 `git add` list names that file —
+adding a `pub` field to `AccessLogFilter` is a cross-crate change. Each literal
+was located by brace-matching from the compiler-reported column to its own
+closing brace, and `grpc_status_filter: None,` inserted at that literal's indent.
+
+A guard was then run over both files asserting that **no** inserted line sits
+inside a literal carrying `..AccessLogFilter::default()` / `..Default::default()`
+— those absorb the field silently and must NOT be edited:
+
+```
+suspect functional-update literals touched: 0
+grpc_status_filter: None,  ->  crates/envoy-http1/src/hcm.rs:11
+                               crates/envoy-config/src/bootstrap.rs:4
+```
+
+By construction this could not have gone wrong: `rustc` only reports the
+exhaustive ones. The guard exists because the plan names four textual
+false-positive classes that a `grep`-driven sweep would have hit.
+
+### A FOURTH finding — `E0027`, which the plan does not name
+
+Beyond the fifteen `E0063`s the compiler also raised, at the Task-3 boundary:
+
+```
+error[E0027]: pattern does not mention field `grpc_status_filter`
+    --> crates/envoy-config/src/bootstrap.rs:5816:9
+5816 |       let AccessLogFilter {
+```
+
+`validate_access_log_filter`'s destructure has **no `..`**, so the seventh
+binding is compiler-forced at the moment the field appears — at Task 3 — while
+the plan schedules the destructure growth in Task **4**. The binding was
+therefore added here, as the minimal edit that makes the crate compile.
+
+**Its consumer is Task 4's token loop, so at THIS boundary it is unused:**
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+error: unused variable: `grpc_status_filter`
+    --> crates/envoy-config/src/bootstrap.rs:5823:9
+5823 |         grpc_status_filter,
+     |         ^^^^^^^^^^^^^^^^^^ help: try ignoring the field: `grpc_status_filter: _`
+     = note: `-D unused-variables` implied by `-D warnings`
+clippy_exit=101
+```
+
+**This needs no new ADR — `PLAN.md`'s own Global Constraints already govern it**,
+citing `ADR-0194` DECISION 2: *"a whole-slice prototype validates the SLICE,
+never a TASK BOUNDARY — these are the plan's gates for the executor to run, not a
+measured claim about each boundary."* This is the same failure class phase 113
+measured at its Task-1 boundary, recurring for the same structural reason.
+
+**The deferral, and its limits.** Only the `unused_variables` arm of `-D warnings`
+is deferred, from Task 3 to Task 4 — the first boundary at which a consumer
+exists. `cargo build --workspace --all-targets`, `cargo fmt --all -- --check` and
+the task's own tests are required green HERE and were:
+
+```
+build_exit=0        (sole warning: the unused binding above)
+fmt_exit=0
+```
+
+**Nothing is suppressed.** No `#[allow(unused_variables)]` and no
+`grpc_status_filter: _` was added anywhere, precisely so that a forgotten
+attribute cannot outlive the gap. Task 4 discharges `-D warnings` in full.
+
+### Step 5 — GREEN
+
+```
+$ cargo test -p envoy-config --lib grpc_status_filter
+running 4 tests
+test bootstrap::tests::grpc_status_filter_rejects_every_measured_reject ... ok
+test bootstrap::tests::grpc_status_filter_accepts_every_measured_token ... ok
+test bootstrap::tests::grpc_status_filter_exclude_defaults_false ... ok
+test bootstrap::tests::grpc_status_filter_mixed_token_list_deserializes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 716 filtered out; finished in 0.00s
+```
+
+4 passed, as predicted. The arithmetic corroborates `PLAN.md`'s end-of-phase
+target independently: `4 + 716 = 720`, and the plan's Task 4 Step 5 states the
+baseline is **716** and the crate finishes at **722** after the six tests Tasks 3
+and 4 add. Four are here; Task 4 adds two.
+
+Per-file numstat at this task's commit:
+
+```
+202	0	crates/envoy-config/src/bootstrap.rs
+20	19	crates/envoy-config/src/lib.rs
+11	0	crates/envoy-http1/src/hcm.rs
+```
+
+`lib.rs`'s 19 deletions are rustfmt re-flowing the `pub use bootstrap::{…}`
+block around the three new names, not removed exports.

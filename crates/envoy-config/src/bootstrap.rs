@@ -750,6 +750,82 @@ pub struct AccessLogFilter {
     /// Phase 74: the SIXTH `AccessLogFilter` arm — gates emission on the
     /// request's DYNAMIC METADATA. Mutually exclusive with the other arms.
     pub metadata_filter: Option<MetadataFilter>,
+    /// Phase 114: the SEVENTH `AccessLogFilter` arm — gates emission on the
+    /// request's EFFECTIVE gRPC status (response `grpc-status` header if
+    /// present, else the phase-110 HTTP->gRPC map over the response code).
+    /// Mutually exclusive with the other arms.
+    pub grpc_status_filter: Option<GrpcStatusFilter>,
+}
+
+/// Phase 114: `envoy.config.accesslog.v3.GrpcStatusFilter`. `statuses` holds
+/// canonical SCREAMING_SNAKE names (case-insensitively) or integers 0-16;
+/// `exclude` inverts the membership test. An EMPTY `statuses` keeps NOTHING.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GrpcStatusFilter {
+    pub statuses: Vec<GrpcStatusToken>,
+    pub exclude: bool,
+}
+
+/// One `GrpcStatusFilter.statuses` entry as it arrives from YAML. Untagged, and
+/// the arm ORDER is load-bearing exactly as `RuntimeValue`'s is: a bare YAML
+/// integer must bind to `Num` before `Name` is tried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GrpcStatusToken {
+    Num(i64),
+    Name(String),
+}
+
+/// The `GrpcStatusFilter.Status` canonical names, MEASURED against
+/// `envoyproxy/envoy:v1.33.0` via `--mode validate` over all 17 names plus a
+/// reject set. Index IS the code.
+///
+/// Code 1 is `CANCELED` with ONE L here. That is the OPPOSITE of the
+/// `%GRPC_STATUS(SNAKE_STRING)%` rendering table in
+/// `crates/envoy-accesslog/src/command_operator.rs`, whose code-1 snake cell is
+/// `CANCELLED` with TWO. They are two different upstream enums; `CANCELLED` is
+/// REJECTED here (MEASURED). Do NOT unify the two tables.
+pub(crate) const GRPC_STATUS_FILTER_NAMES: [&str; 17] = [
+    "OK",
+    "CANCELED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+];
+
+/// Resolve one `statuses` token to its code, or `None` if it is not a legal
+/// token. MEASURED rule: an integer (YAML-native or string-spelled) must be in
+/// 0..=16; the string form is parsed PERMISSIVELY with `trim().parse::<i64>()`,
+/// so `" 5"`, `"5 "`, `"05"` and `"+5"` all ACCEPT upstream. A non-numeric
+/// string matches a canonical name case-INSENSITIVELY, underscores required
+/// (`not_found` ACCEPTS, `NotFound` REJECTS).
+pub fn resolve_grpc_status_token(tok: &GrpcStatusToken) -> Option<u8> {
+    let as_code = |n: i64| -> Option<u8> { (0..=16).contains(&n).then_some(n as u8) };
+    match tok {
+        GrpcStatusToken::Num(n) => as_code(*n),
+        GrpcStatusToken::Name(s) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return as_code(n);
+            }
+            GRPC_STATUS_FILTER_NAMES
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(s))
+                .map(|i| i as u8)
+        }
+    }
 }
 
 /// Phase 73: `and_filter` — a boolean-AND composition of nested `AccessLogFilter`
@@ -5744,6 +5820,7 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         and_filter,
         or_filter,
         metadata_filter,
+        grpc_status_filter,
     } = filter;
     let set_arms = [
         status_code_filter.is_some(),
@@ -14552,6 +14629,7 @@ or_filter: null
                 }),
                 or_filter: None,
                 metadata_filter: None,
+                grpc_status_filter: None,
             }),
         }];
         let err = validate_access_logs(&mut logs).expect_err("ambiguous");
@@ -14588,6 +14666,7 @@ or_filter: null
             and_filter: None,
             or_filter: None,
             metadata_filter: None,
+            grpc_status_filter: None,
         }
     }
 
@@ -14648,6 +14727,7 @@ or_filter: null
             and_filter: None,
             or_filter: None,
             metadata_filter: None,
+            grpc_status_filter: None,
         };
         let f = AccessLogFilter {
             or_filter: Some(OrFilter {
@@ -14854,6 +14934,7 @@ metadata_filter:
                 filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
             }),
             metadata_filter: Some(MetadataFilter::default()),
+            grpc_status_filter: None,
         };
         let err = validate_access_logs(&mut file_log_with_filter(all_six)).expect_err("ambiguous");
         assert!(matches!(
@@ -20334,6 +20415,127 @@ layered_runtime:
             matches!(err, crate::ConfigError::DuplicateRuntimeLayerName { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn grpc_status_filter_accepts_every_measured_token() {
+        // MEASURED against envoyproxy/envoy:v1.33.0 with `--mode validate`, one
+        // run per token, against a negative control that REJECTS a bogus arm
+        // name. All 17 canonical names, their case-insensitive spellings, the
+        // integers 0-16, and the PERMISSIVE string-numeric forms.
+        for tok in [
+            "OK",
+            "CANCELED",
+            "UNKNOWN",
+            "INVALID_ARGUMENT",
+            "DEADLINE_EXCEEDED",
+            "NOT_FOUND",
+            "ALREADY_EXISTS",
+            "PERMISSION_DENIED",
+            "RESOURCE_EXHAUSTED",
+            "FAILED_PRECONDITION",
+            "ABORTED",
+            "OUT_OF_RANGE",
+            "UNIMPLEMENTED",
+            "INTERNAL",
+            "UNAVAILABLE",
+            "DATA_LOSS",
+            "UNAUTHENTICATED",
+            "not_found",
+            "ok",
+            "Ok",
+            "oK",
+            "0",
+            "5",
+            "16",
+            "05",
+            "+5",
+            " 5",
+            "5 ",
+        ] {
+            assert!(
+                resolve_grpc_status_token(&GrpcStatusToken::Name(tok.into())).is_some(),
+                "MEASURED ACCEPT upstream, must resolve here: {tok:?}"
+            );
+        }
+        for n in 0..=16i64 {
+            assert!(resolve_grpc_status_token(&GrpcStatusToken::Num(n)).is_some());
+        }
+        // Index IS the code, and code 1 is CANCELED with ONE L.
+        assert_eq!(
+            resolve_grpc_status_token(&GrpcStatusToken::Name("CANCELED".into())),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_grpc_status_token(&GrpcStatusToken::Name("unauthenticated".into())),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn grpc_status_filter_rejects_every_measured_reject() {
+        // MEASURED REJECT upstream. `CANCELLED` (two Ls) is the standing trap:
+        // it is the code-1 SNAKE spelling of the %GRPC_STATUS% renderer and is
+        // NOT a legal filter token.
+        for tok in [
+            "CANCELLED",
+            "NotFound",
+            "0x5",
+            "",
+            "1.0",
+            "TRUE",
+            "on",
+            "y",
+            "BOGUS_XYZ",
+        ] {
+            assert!(
+                resolve_grpc_status_token(&GrpcStatusToken::Name(tok.into())).is_none(),
+                "MEASURED REJECT upstream, must not resolve here: {tok:?}"
+            );
+        }
+        for n in [-1i64, 17, 99] {
+            assert!(resolve_grpc_status_token(&GrpcStatusToken::Num(n)).is_none());
+        }
+    }
+
+    #[test]
+    fn grpc_status_filter_mixed_token_list_deserializes() {
+        // PV-2: ONE list holding a bare identifier, a bare integer and a QUOTED
+        // integer. Bare ints bind to `Num`; quoted ints arrive as `Name` and are
+        // resolved by the permissive numeric parse.
+        let yaml = r#"
+grpc_status_filter:
+  statuses: [NOT_FOUND, 5, "7"]
+  exclude: true
+"#;
+        let f: AccessLogFilter = serde_yaml::from_str(yaml).expect("deserializes");
+        let gsf = f
+            .grpc_status_filter
+            .as_ref()
+            .expect("grpc_status_filter present");
+        assert_eq!(
+            gsf.statuses,
+            vec![
+                GrpcStatusToken::Name("NOT_FOUND".into()),
+                GrpcStatusToken::Num(5),
+                GrpcStatusToken::Name("7".into()),
+            ]
+        );
+        assert!(gsf.exclude);
+        assert_eq!(
+            gsf.statuses
+                .iter()
+                .map(|t| resolve_grpc_status_token(t).unwrap())
+                .collect::<Vec<_>>(),
+            vec![5u8, 5, 7]
+        );
+    }
+
+    #[test]
+    fn grpc_status_filter_exclude_defaults_false() {
+        let f: AccessLogFilter =
+            serde_yaml::from_str("grpc_status_filter:\n  statuses: [OK]\n").expect("deserializes");
+        assert!(!f.grpc_status_filter.as_ref().unwrap().exclude);
     }
 }
 
