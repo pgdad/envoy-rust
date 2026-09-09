@@ -1453,3 +1453,331 @@ CLOSED**, **`CF-112-8` Consequence 2 BANKED as structurally unwitnessable**.
 - `cargo deny check` and the fuzz targets, neither run here.
 - That the four PV-9 files are still untouched — with a positive control that
   actually discriminates (the first one tried here did not).
+
+---
+
+# §5 STATE 4 — the §7.5 verification gate
+
+**One commit: this state-advance commit.** The state-3 CI record (`5902fb9`)
+closed the previous chain and the `%s` correction (`e722d06`) opened none, so
+this session entered owing no CI record. **No `ADR` fired: the gate adjudicated
+every leg without needing a new decision.** `ROADMAP.md` was NOT touched — row
+`114` stays `planned` until the state-6 close-out. **Nothing was fixed** (§6.3;
+`ADR-0165`), and no carry-forward was consumed.
+
+⚠ **§7.5 leg (f) — `REVIEW.md` is approved — is OUT OF SCOPE and is adjudicated
+as such, not as a pass.** It is state 5's product. `114/REVIEW.md` does not
+exist, which is the correct state at the end of a state-4 gate.
+
+## Stop condition — all three legs re-measured from disk, all three FALSE
+
+```
+LEG (i)   rows=122  done=121  planned=1     SUM 122==122 -> True
+          not-done: row 114 at ROADMAP.md line 196
+          field-count histogram on ' | ': {6: 120, 7: 1, 10: 1}
+          the FORBIDDEN NF==6 filter reads 120, dropping lines 168 and 169
+LEG (ii)  crates=14   tracked manifests=28 (git ls-files '*Cargo.toml')
+          envoy-http3/grpc/wasm/protos/runtime: all five absent by test -d
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0  of 28
+          POSITIVE CONTROL, identical invocation: tokio=19 of 28
+          gauge over crates/ = 365 occurrences; histogram over crates/ = 0
+LEG (iii) headings=11  slices=10/5/3/14/3/4/6/31/6/0/13  pre-heading=27
+          SUM=122   zero-row family: ['WASM host family']
+```
+
+**No `stop` file exists and none was created**; `ls stop` returns `No such file
+or directory`.
+
+## Leg (e) — the five `cargo` commands
+
+The first run of `build` and `clippy` exited 0 **against a warm cache** — one
+`Compiling` line and one `Checking` line for a fourteen-crate workspace. That is
+a cached no-op, not evidence, so the whole workspace was made dirty by an
+**mtime-only `touch` of the tracked crate roots** (the path list driven from
+`git ls-files`, never from a glob, because `touch` CREATES files) and both were
+re-run. `git status` stayed clean throughout: an mtime is not content.
+
+```
+                            warm cache        forced dirty set
+cargo build  --workspace --all-targets       exit 0, 1 Compiling   exit 0, 16 Compiling
+cargo clippy --workspace --all-targets
+             --all-features -- -D warnings   exit 0, 1 Checking    exit 0, 16 Checking
+cargo fmt    --all -- --check                exit 0
+cargo deny   check                           exit 0
+```
+
+The dirty-set clippy re-checked **all fourteen** `envoy-*` crates by name and
+emitted **zero** `warning`/`error` lines. `cargo deny` printed:
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(`cargo deny` also emits a pre-existing `license-not-encountered` WARNING for an
+unmatched `Zlib` allowance in `deny.toml`. It is a warning, not a finding, the
+four checks all read `ok`, and it predates this phase.)
+
+**`cargo test --workspace` is reported under legs (a)/(b) below**, since on this
+repo that one command carries the differential corpus.
+
+## Legs (a) and (b) — the differential corpus
+
+```
+cargo test --workspace --no-fail-fast
+  binaries=170  ok_rows=165  FAILED_rows=5  passed=2310  failed=5   (exit 101)
+```
+
+**The flake-vs-regression identity closes exactly.** Local `passed + failed`
+= 2310 + 5 = **2315**, which is the CI `passed` at the identical code tree, and
+the binary count is **170** on both sides. If this phase had broken something,
+that sum would not close.
+
+### Leg (a) — fixture `0094`, this phase's own witness
+
+```
+     Running tests/accesslog_grpc_status_filter.rs (target/debug/deps/accesslog_grpc_status_filter-8601c0f697ce0980)
+test accesslog_grpc_status_filter ... ok
+```
+
+GREEN locally, and GREEN in CI at this exact commit (`Running
+tests/accesslog_grpc_status_filter.rs` followed by `test
+accesslog_grpc_status_filter ... ok`).
+
+The fixture's two configs differ in exactly **four** hunks (`2d1`, `6c5`,
+`14d12`, `22c20`) and **the `filter:` block is byte-identical on both sides** —
+md5 `f9a631dd075ec5946d6dcb352e1d679e`, **129 bytes, 3 lines**. ⚠ The first
+attempt at that span returned md5 `d41d8cd98f00b204e9800998ecf8427e` on **0
+bytes** — the EMPTY-file md5, from an `awk` span that matched nothing. It looked
+like a clean cross-proxy identity. **The byte-count assertion is what caught
+it**, which is exactly why the span's size must be stated beside its hash. Note
+this md5 is not the one state 3 recorded for the same property: an md5 over a
+hand-chosen span is SPAN-dependent, so the property (identical on both sides) is
+the claim, and the span is stated with it.
+
+### Leg (b) — the other 92, and the five local reds
+
+Censused from the `---- <name> stdout ----` markers, never by indentation:
+
+```
+access_log_h2_rcd_upstream_reset
+access_log_h2_uc_upstream_reset
+access_log_rcd_upstream_reset
+access_log_rf_upstream_reset
+admin_config_dump_server_info
+```
+
+⚠ **`PROGRESS.md` §8 flagged four of these as SUSPECT rather than known flakes,
+because this phase touched the access-log filter path.** That suspicion is
+discharged on four independent grounds, in ascending order of strength.
+
+**(1) The arm is not reachable in any of them.** Each of the five fixtures
+contains **zero** files mentioning `grpc_status_filter`, against a positive
+control of **4** such files in `0094`. The probe discriminates, so the zero
+means absence and not a blind probe.
+
+**(2) The diverging cell is not an emission decision.** In all four access-log
+reds each side emitted **exactly one** line; they differ in `rf`/`rcd`
+(`UF` + `remote_connection_failure|immediate_connect_error:_Network_is_unreachable`
+upstream versus `UC` + `connection_termination` here). The phase-114 arm decides
+**whether** to log. Both sides logged. The arm agreed.
+
+**(3) Isolation classifies them, and the classification is the host family.**
+
+```
+access_log_h2_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rf_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+admin_config_dump_server_info | exit=101 | test result: FAILED. 0 passed; 1 failed
+ISOLATION DONE 2026-09-09T19:01:28-04:00
+```
+
+All five fail **deterministically alone**. That is the signature of the
+host-networking family, *not* of the parallel-load family, whose tell is passing
+in isolation. Two of the five runners carry a LANDED in-repo declaration of it:
+`access_log_rf_upstream_reset.rs` says *"Backend-spawning → LOCAL-RED on the dev
+host (bridge-IP flake), GREEN on CI."*
+
+**(4) The causal control — the same five at the commit BEFORE any phase-114
+code.** A detached worktree at `c9136ae` with its OWN `CARGO_TARGET_DIR`, built
+`--workspace --all-targets` (a `-p` build false-REDs), verified to hold none of
+this phase's work (`0094` absent there) and to produce a genuinely different
+binary (`00fb0d741ed4cae25b791eeb845c616c` vs `5a4cef8eff7494615088aabc4510e221`):
+
+```
+access_log_h2_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rf_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+admin_config_dump_server_info | exit=101 | test result: FAILED. 0 passed; 1 failed
+CONTROL DONE 2026-09-09T19:04:33-04:00
+```
+
+**All five fail at the control too, and with the SAME failure message** — the
+panic texts are byte-identical between the two trees once the ephemeral port
+digits are masked (raw texts differ only in the port). A test that fails
+identically before the phase existed was not broken by the phase.
+
+**And CI at this exact code tree reports `failed=0`**, which is what the
+bridge-IP declaration predicts.
+
+## Leg (c) — conformance
+
+⚠ **The local gate SELF-SKIPS, and I nearly mis-read CI as doing the same.**
+`h2spec` is on neither of the runner's two lookup paths on this host (`which
+h2spec` fails and `tools/` does not exist), so `cargo test --workspace` takes
+the `eprintln!`-skip branch and reports a **vacuous** pass. The local sweep's
+h2spec row is therefore worth nothing and is not counted here.
+
+In CI the binary IS provisioned — the install step prints `Version: 2.6.0
+(70ac2294010887f48b18e2d64f5cccd48421fad1)` — so the skip branch cannot fire,
+and `h2spec_runner` reports `3 passed; 0 failed`.
+
+⚠ **That CI row finishes in 0.16s, which I first took as proof it had NOT run.**
+It is not. Measured directly on this host against the same pinned binary
+(downloaded outside the repo, same build hash as CI) and a spawned debug
+`envoy-bin` on the rendered `h2spec.yaml`:
+
+```
+Finished in 0.0228 seconds
+146 tests, 145 passed, 1 skipped, 0 failed
+```
+
+**h2spec runs the whole 146-test suite in ~23 milliseconds**, so 0.16s for the
+binary is entirely consistent with a genuine run. The suspicion was mine, and
+measuring the suite's real runtime is what dissolved it.
+
+Pass rate here is **145/145 = 1.0000**, far above the `PASS_RATE_GATE` of 0.95.
+
+⚠ **`known-failures.txt` must NOT be trimmed on this evidence.** Its single
+non-comment entry is `3.5/2` ("Sends invalid connection preface"), and on this
+host that test **passes** (`✔`, 0 `✖` marks in the whole run). The runner's third
+assertion requires every listed entry to actually fail, so a local gate run would
+trip *"known-failures.txt has stale entries (now passing)"*. That is the recorded
+host-sensitivity of the h2spec preface behaviour, and CI — where the entry does
+fail — is authoritative. **Nothing was trimmed.**
+
+## Leg (d) — fuzzing
+
+⚠ **Phase 114 added NO new fuzz target**, verified rather than assumed: `git
+diff --name-status c9136ae..HEAD -- '*fuzz*'` is empty. So the letter of leg (d)
+("any NEW fuzzer has run clean") is discharged vacuously. **A vacuous pass is not
+worth recording, so all five pre-existing targets were run anyway**, byte-for-byte
+the CI contract (`cargo +nightly fuzz run <target> -- -max_total_time=30`, from
+the CRATE directory, because `cargo fuzz` does not run from the repo root):
+
+```
+parse_bootstrap | exit=0 | Done 24053 runs in 93 second(s)
+jwt_parse | exit=0 | Done 9108800 runs in 31 second(s)
+cdn_loop_parse | exit=0 | Done 10221276 runs in 31 second(s)
+accesslog_format_parse | exit=0 | Done 4470824 runs in 31 second(s)
+grpc_health_decode | exit=0 | Done 39412099 runs in 31 second(s)
+```
+
+This matters beyond the letter: the phase added a config-parsing surface (the
+seventh `AccessLogFilter` arm and its token grammar), and `parse_bootstrap` is
+the target that covers it.
+
+## PV-9 — the four files that had to stay untouched
+
+```
+Cargo.toml                                UNTOUCHED
+Cargo.lock                                UNTOUCHED
+.github/workflows/ci.yml                  UNTOUCHED
+tests/differential/src/lib.rs             UNTOUCHED
+POSITIVE CONTROL (same probe, files the phase DID touch):
+crates/envoy-accesslog/src/filter.rs      178  79
+crates/envoy-config/src/bootstrap.rs      260   9
+```
+
+State 3 recorded that its first PV-9 probe was vacuous because its control was
+empty too. This one discriminates, so the four blanks mean UNTOUCHED.
+
+## The SPEC's nine deliverables, checked one at a time
+
+All nine are on disk. `AccessLogFilter` carries **7** `Option` arms;
+`GrpcStatusFilter` has `statuses` + `exclude`; `GRPC_STATUS_FILTER_NAMES` is
+`[&str; 17]` and spells code 1 **`CANCELED`** while the phase-113 formatter table
+spells it **`CANCELLED`** — the two enums remain separate, as required;
+`ConfigError::UnknownGrpcStatus` exists; `AccessLogRecord.grpc_status_code` is a
+plain `u8`; `effective_grpc_status` is called at the record build on **both**
+codecs; `http_to_grpc_status` is item-level `pub` while `mod grpc` stays
+`pub(crate)`; `LogFilter::GrpcStatus` exists with its `should_log` arm and
+`envoy-accesslog` still depends only on `tokio`/`bytes`/`tracing`/`thiserror`;
+`compile_access_log_filter` matches **7** arms; fixture `0094` has all four
+files; `BEHAVIOR_CONTRACT.md` carries a **135**-line phase-114 section.
+
+⚠ **`ADR-0197` correction 1 is re-confirmed and the landed `SPEC.md` §4 item 6
+remains wrong.** Censused by a column-0 `#[cfg(test)]` boundary walk rather than
+by a name heuristic, `.should_log(` occurs **138** times in `crates/` of which
+exactly **FIVE** are production:
+
+```
+crates/envoy-accesslog/src/file_sink.rs:115
+crates/envoy-accesslog/src/filter.rs:160
+crates/envoy-accesslog/src/filter.rs:169
+crates/envoy-http1/src/hcm.rs:1575
+crates/envoy-http2/src/hcm.rs:1217
+```
+
+The SPEC says "exactly TWO". `ADR-0197` already corrected it; this gate measured
+it independently and the correction holds.
+
+## Doctrine checks
+
+```
+#![forbid(unsafe_code)] present in all 14 crate roots; 0 missing
+added #[allow(   in the phase arc = 0
+added #[expect(  in the phase arc = 0
+added unsafe     in the phase arc = 0
+added #[ignore]  in the phase arc = 0
+only_used_in_recursion in crates/envoy-accesslog/src/ = 0
+'TRANSIENT, PHASE-114' anywhere in crates/            = 0
+```
+
+The transient allow the plan directed at Task 6 was removed at Task 7 and stays
+removed.
+
+## Size, re-measured at this commit
+
+```
+git diff --numstat c9136ae..HEAD -- . ':(exclude)docs/'
+  files=14  insertions=1229  deletions=191  NET=1038   (1.107x the MEASURED 938)
+```
+
+**§6.1 does not fire on either axis at the LANDED number** — 10 tasks against
+~25, and 1038 against ~1500. The state-2 no-split adjudication therefore stands
+on the landed figure, not only on the predicted one.
+
+## A census that returned a believable wrong number, recorded because it nearly landed
+
+Reconciling 94 fixtures against 93 runners, a regex for `tests/fixtures/NNNN-name`
+reported **87** referenced and named **7 "orphan" fixtures**. They are not
+orphans: `echo.rs` reaches its fixture as `../fixtures/0001-tcp-echo`, a path form
+the regex cannot see. **The reliable census is CI's own `Running` lines — 93
+present / 0 missing, with the repo-relative spelling as a negative control reading
+0.** A fixture-to-runner map built from literal paths is not 1:1 and must not be
+reported as one.
+
+## What this session did NOT do
+
+- **No code, no test, no fixture changed.** The gate is docs-only.
+- **`ROADMAP.md` untouched**; row `114` remains `planned`.
+- **No ADR fired**, no carry-forward consumed, nothing fixed.
+- **`known-failures.txt` untouched.**
+- **Leg (f) not attempted** — `REVIEW.md` is state 5's.
+
+## For the state-5 code review
+
+- The five local reds are **fully adjudicated** here with a causal control. Do
+  not re-litigate them; if they appear in your sweep, they are the same host
+  family.
+- **`SPEC.md` §4 item 6's "exactly TWO" production `should_log` sites is wrong
+  on disk (it is FIVE).** `ADR-0197` corrects it and this gate re-measured it.
+  The SPEC is landed and must not be edited.
+- **`CF-114-1` … `CF-114-5` all stand** as `ADR-0197` left them; `CF-113-7` is
+  CONSUMED.
+- **`CF-75-5` is still open and visible here**: `cdn_loop_parse` has **0**
+  TRACKED corpus seeds (the other four targets have 67 / 3 / 11 / 1). The 1520
+  files in its corpus directory are gitignored local artifacts, not seeds.
+- The next free ADR number is **`ADR-0199`**.
