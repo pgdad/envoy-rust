@@ -2402,6 +2402,203 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0198: Phase-114 §5 state-3 implementation — **all TEN `PLAN.md` tasks landed IN ORDER; fixture `0094` GREEN cross-proxy and MUTATION-PROVED; net 1038 against the plan's MEASURED 938 (1.107×), with the overrun reconciled to FOUR files and dominated by one.** **CORRECTS NINE `PLAN.md` claims**, none of them a design error and all applied forward. Records TWO boundary-gate deviations and the ONE transient suppression the plan itself directed, both discharged before the phase ends. `CF-113-7` CONSUMED as the authorised rider.
+
+- **Date:** 2026-09-09
+- **Status:** accepted
+- **Phase:** 114 (`docs/envoy-rust/phases/114-accesslog-grpc-status-filter/`), §5 state-3 implementation
+- **Supersedes:** nothing. **Superseded by:** nothing. It does **not** supersede `ADR-0193`, `ADR-0194`, `ADR-0196` or `ADR-0197`. It **applies** `ADR-0194` DECISION 2 to a second phase and **executes** `ADR-0197`'s plan without amending it. `SPEC.md` and `PLAN.md` are landed and were NOT edited.
+
+**Context.** `PLAN.md` (1567 lines, 10 TDD tasks) was written at the §5 state-2
+PLAN-write and its every code block was measured on a whole-slice scratch
+prototype. This session executed it. The question an ADR has to answer is not
+"did it work" — it did — but **where the plan and reality diverged, and what was
+decided at each divergence**, because the next session grades this work against
+the plan and must not be surprised.
+
+**DECISION 1 — the nine `PLAN.md` corrections are applied FORWARD, in
+`PROGRESS.md`, and `PLAN.md` is not edited.** None is a design error; all are
+mis-predictions about mechanics. In the order they were hit:
+
+1. **Task 1's predicted numstat `14	14` measured `10	10`.** The step's stated
+   invariant is *equal* insertions and deletions, and that HELD. Only the
+   magnitude was wrong: git found a more compact minimal edit than the 14-line
+   block move because four moved lines are bare `///` separators that align
+   against the destination's own text. **A numstat is a rendering of a diff
+   algorithm's choice, not a property of an edit** — so byte-neutrality was
+   proved instead by line-multiset and byte-count identity (7762 lines and
+   352,248 bytes, both invariant, with the text nevertheless changed).
+2. **Task 2's stated `pub use` insertion point fails the plan's own `fmt`
+   gate.** rustfmt sorts that block, so `grpc` lands between `error` and `hcm`,
+   not above `response`. The plan's own measured table gives that file **1
+   insertion / 0 deletions**, which is only achievable at the SORTED position —
+   so the prototype's line went there and the plan's PROSE mis-describes its own
+   MEASUREMENT. Resolved by running `cargo fmt --all`; the numstat then
+   reproduced `1	0` exactly.
+3. **"Add to `bootstrap.rs`'s `mod tests`" is not "append at EOF".** That file
+   carries **TEN** column-0 `#[cfg(test)] mod` blocks; `mod tests` spans lines
+   6103–20338 of 22169. The first insert landed in `mod json_format_value_tests`
+   and went RED with `cannot find type AccessLogFilter` — a LOCATION failure
+   masquerading as a missing-item failure, since `AccessLogFilter` is in scope
+   under `mod tests`' `use super::*`. Reverted with `git checkout --` and redone
+   at the asserted boundary.
+4. **Task 5's `E0063` COUNT is four; its ENUMERATION is five, and the
+   enumeration is right.** The exhaustive `AccessLogRecord` literals are
+   `record.rs`'s `test_baseline`, `file_sink.rs`'s test literal, the H1 and H2
+   production builds, and one further test literal in `envoy-http1/src/hcm.rs` —
+   **FIVE**. The Global Constraints say "exactly FOUR".
+5. **Task 6 Step 5's expected `.should_log(` counts predate Task 6 Step 4.**
+   `68/5/53/1` is the pre-pin census; Step 4 adds a neutrality pin containing
+   four `.should_log(` calls, so the correct post-task census is **72**/5/53/1.
+   The sweep is still argument-only, which is what the line was asserting.
+6. **Task 9's fixture README is specified as a section list, not verbatim, and
+   its measured 73 lines did not survive writing the nine sections it
+   enumerates** — see DECISION 4.
+7. **A `PLAN.md` anchor used in Task 4 is not unique** (the
+   `AmbiguousAccessLogFilter` assertion run occurs twice in `bootstrap.rs`).
+   Caught by the edit script's own pre-write uniqueness assertion, so nothing was
+   written; the anchor was extended and the edit redone.
+8. **Task 8's RED had to be read off the test output, not the exit code.** A
+   mis-written guard meant the test was never inserted, and
+   `cargo test -p envoy-http1 --lib <name>` then reported `0 passed; 242 filtered
+   out` **with exit 0** — a non-existent test reading as a passing one.
+9. **Three doc statements beyond the one the plan names became FALSE** when the
+   seventh arm landed — see DECISION 3.
+
+**DECISION 2 — `-D warnings` was deferred at ONE boundary and suppressed at ONE
+other, both by structural necessity, and BOTH are discharged inside the phase.**
+This is `ADR-0194` DECISION 2 recurring: a whole-slice prototype validates the
+SLICE and never a TASK BOUNDARY, because at the end of a slice every item has its
+consumer.
+
+- **At Task 3**, `validate_access_log_filter`'s destructure has no `..`, so
+  `E0027` forces the seventh binding the moment the field appears — at Task 3 —
+  while the plan schedules the destructure growth at Task 4. The binding was
+  added as the minimal compile fix and is UNUSED until Task 4's token loop, so
+  `unused_variables` fires. **Only that lint arm was deferred, to Task 4.**
+  `build`, `fmt` and the task's own tests were required green at Task 3 and were.
+  **No `#[allow]` and no `_`-prefix was added**, precisely so a forgotten
+  attribute could not outlive the gap. Task 4 discharged it: `clippy_exit=0`.
+- **At Task 6**, `clippy::only_used_in_recursion` fires because that task threads
+  `grpc_status_code` through the `And`/`Or` recursion while the arm that consumes
+  it is Task 7's. **`PLAN.md` Task 6 anticipates this by name and directs the
+  opposite remedy** — add the allow, mark it TRANSIENT, remove it in Task 7 — so
+  the plan's instruction was followed rather than the Task-3 precedent. The allow
+  carried a six-line note naming itself transient, the task that must delete it,
+  and the check that would prove it gone. **Task 7 deleted it**, and `-D
+  warnings` passes WITHOUT it. Asserted, not remembered:
+  `only_used_in_recursion` occurs **0** times in `crates/envoy-accesslog/src/`
+  and the marker `TRANSIENT, PHASE-114` occurs **0** times anywhere in `crates/`.
+  **The phase ends carrying ZERO suppressions.**
+
+The general rule this records: when a plan gives an explicit contingency for a
+boundary lint, follow it and make the removal CHECKABLE; when it does not, defer
+the gate rather than suppress the lint.
+
+**DECISION 3 — three stale arm-count doc statements were corrected, beyond the
+one `PLAN.md` names.** The plan's Task 4 Step 4 names only
+`validate_access_logs`' contract-doc item 3. Two further statements asserted a
+count the code now contradicts: the `AccessLogFilter` struct doc (*"This type
+models SIX oneof arms"*) and `validate_access_log_filter`'s own doc
+(*"cardinality, all SIX arms"*). Both sit in files this task already edits.
+**Leaving a doc asserting SIX beside a struct with SEVEN fields is a silent
+divergence of the kind `ADR-0049` exists to prevent**, so all three were updated
+to SEVEN and to name `grpc_status_filter` (phase 114). `compile_access_log_filter`'s
+*"SIX arms ship"* was likewise updated at Task 8. This is the only place the
+implementation touched text the plan did not schedule, and it accounts for **+6**
+of the size overrun.
+
+**DECISION 4 — the phase lands at 1038 net LoC against a MEASURED 938 (1.107×),
+and the overrun reconciles EXACTLY to four files, one of which dominates.** Same
+**14 files** as the prototype, `docs/` excluded:
+
+| file | landed net | prototype | Δ |
+|---|---:|---:|---:|
+| `tests/fixtures/0094-…/README.md` | 166 | 73 | **+93** |
+| `crates/envoy-config/src/bootstrap.rs` | 251 | 245 | +6 |
+| `crates/envoy-accesslog/src/filter.rs` | 99 | 97 | +2 |
+| `crates/envoy-accesslog/src/record.rs` | 11 | 12 | −1 |
+| the other **TEN** files | — | — | **0 each** |
+| **TOTAL** | **1038** | **938** | **+100** |
+
+**Ten of fourteen files land on the prototype's number exactly**, including all
+three fixture YAMLs (91/93/100), the runner (24) and both HCM files (150/32).
+That is strong evidence the plan's measurement method was sound and that the
+overrun is localised rather than diffuse drift.
+
+**The dominant term is the fixture README**, the one artifact `PLAN.md` specifies
+as a *section list* rather than quoting verbatim, and therefore the one it never
+actually sized. All nine required sections are present; the extra length is the
+probe table, the four measured rules, the six authoring constraints and the
+quoted four-hunk diff. The closest landed comparator, `0093`'s README, is 110
+lines. **Trimming documentation to hit a LoC figure would optimise the wrong
+quantity**, so it was not trimmed and the reconciliation is stated instead.
+
+1.107× sits inside the project's MEASURED-estimate calibration band (`112.1`
+1.00×, `113` 1.07×, `112.2` 1.10×) and nowhere near the PROJECTED band
+(1.33×–1.66×). **The §6.1 gate (~25 tasks OR ~1500) does not fire at 1038
+either**, so the state-2 no-split adjudication stands on the landed number and
+not only on the predicted one.
+
+**DECISION 5 — the plan's four per-crate test targets were reproduced
+independently, and that is treated as corroboration rather than coincidence.**
+`PLAN.md` §6.1 states the prototype passed 1224 unit tests across the four
+affected crates as 133 / 722 / 243 / 126+1 ignored. Measured here at the tasks
+that close each crate: `envoy-accesslog` **133**, `envoy-config` **722**,
+`envoy-http1` **243**, `envoy-http2` **126 (+1 ignored)** — **sum 1224**. Four
+separate numbers reached on different days from a different tree; a compensating
+error would have to cancel across independent crates.
+
+**DECISION 6 — PV-7 is discharged by MUTATION with its control, and PV-9 only
+after its first positive control was found vacuous.**
+
+The mutation ran in a scratch worktree created by `git worktree add --detach`
+with its **own `CARGO_TARGET_DIR`**, seeded with the then-uncommitted fixture.
+The target was asserted to occur exactly once immediately before editing; the
+rebuild was confirmed by a real `Compiling envoy-http1` line. **RED, byte-for-byte
+as `PLAN.md` predicts:** *"envoy-rust emitted 2 access-log lines but 5 were
+expected to be logged"*, the survivors being probes 1 and 2 and **the three lost
+being exactly probes 5, 6 and 8** — the ungated cells, which is the specific
+prediction rather than merely "lines went missing". The file was then restored,
+the restore verified md5-exact against a pre-edit copy, rebuilt, and the
+**unmutated control re-run GREEN from the same tree**.
+
+**PV-9's first probe was vacuous and was caught by its own control.**
+`git diff --stat HEAD -- <the four files>` returned empty — but so did the
+positive control, because the touched files were already committed and the
+fixture was untracked. **An empty result from a probe whose control is also empty
+says nothing.** Re-run over the whole phase arc (`c9136ae..HEAD`), the four files
+report nothing while the identical command shape on
+`bootstrap.rs`/`filter.rs` reports `260 9` and `178 79`. `Cargo.toml`,
+`Cargo.lock`, `.github/workflows/ci.yml` and `tests/differential/src/lib.rs` are
+untouched, as `SPEC.md` §5 non-goal 5 requires.
+
+**DECISION 7 — `CF-113-7` is CONSUMED as the rider, in its own labelled commit,
+and nothing else was fixed.** `SPEC.md` §5 non-goal 6 authorises it because this
+phase touches `crates/envoy-http2/src/hcm.rs`. Taken FIRST, byte-neutrally, in
+commit `2cf0830`, labelled `phase 114 rider:` rather than `task N:` so it is
+distinguishable in the log. **No other carry-forward was consumed** (§6.3;
+`ADR-0165`), and the phase-112 ALPN cleanup was neither taken nor re-costed.
+
+**Consequences.** Ten task commits plus this advance. `ROADMAP.md` is **NOT**
+touched — row `114` stays `planned` until the §5 state-6 close-out. The fixture
+census moves **93 → 94** and the differential runner census **92 → 93**, so
+unlike the six docs-only commits before it this phase **MUST** move the CI
+identity: predicted `binaries=169 → 170` and `passed=2298 → 2315` (+17 tests:
+`envoy-config` +6, `envoy-accesslog` +4, `envoy-http1` +5, `envoy-http2` +1, and
+the new differential runner +1), `failed=0`. **That prediction was derived from
+the diff BEFORE any CI log was read**, by two independent methods that agree — a
+count of added `#[test]`/`#[tokio::test]` attributes (17, with 0 removed) and the
+per-crate arithmetic above. `CF-114-1`, `CF-114-2`, `CF-114-3`, `CF-114-4` and
+`CF-114-5` all stand as `ADR-0197` left them; **`CF-113-7` is CONSUMED**; every
+other banked carry-forward carries forward INTACT. `#![forbid(unsafe_code)]`
+holds; no new crate, dependency, fuzz target or harness driver. **DECISIONS.md
+ledger head: ADR-0198** (next available **ADR-0199**, nothing reserved). The §5
+state-4 verification gate is the next session and is NOT chained here (§5.1;
+`ADR-0127`).
+
+---
+
 ## ADR-0197: Phase-114 §5 state-2 PLAN-write — **`PLAN.md` written as 10 TDD tasks; the §6.1 split gate is MEASURED at 938 net LoC and DOES NOT FIRE, so `ADR-0196`'s reservation of this number for a split is RELEASED and consumed by this ADR.** **CORRECTS FIVE LANDED `SPEC.md` CLAIMS**, the most consequential being that the explicit-`grpc-status`-header leg **IS** expressible in fixture `0094` after all — MEASURED end to end on both proxies, not argued. Discharges PV-1…PV-9; DEPARTS from `ADR-0193` DECISION 6 on a narrow visibility widening; opens **CF-114-5**; takes **CF-113-7** as an authorised rider. No `crates/` change lands at this commit.
 
 - **Date:** 2026-09-09

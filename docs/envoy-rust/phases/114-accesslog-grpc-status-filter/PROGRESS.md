@@ -1287,3 +1287,169 @@ $ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
 Deletions **0**, as `PLAN.md` Step 3 requires — no existing section was
 disturbed. Heading order after the insert: 73 → 74 → **114** → 75, with each
 `### ` heading still unique.
+
+---
+
+# Findings — the whole-phase reconciliation
+
+## 1. All ten tasks landed, in the plan's order, with the plan's commit messages
+
+```
+2cf0830 phase 114 rider: re-attach finalize_h2_stream's stolen doc comment (CF-113-7)
+9a74ac5 phase 114 task 2: narrow pub on http_to_grpc_status so both codecs share ONE map (PV-3)
+1935e8e phase 114 task 3: the GrpcStatusFilter config arm and its MEASURED token grammar
+45be84a phase 114 task 4: validate the seventh AccessLogFilter arm fail-loud on a bad status token
+537d95b phase 114 task 5: the UNGATED effective-gRPC-status derivation on both codecs (PV-4)
+bb4b311 phase 114 task 6: widen should_log with the effective gRPC status (behavior-neutral)
+dabd773 phase 114 task 7: LogFilter::GrpcStatus — plain-integer membership with exclude inversion
+c39f7a3 phase 114 task 8: compile_access_log_filter grows to seven arms
+915bde8 phase 114 task 9: differential fixture 0094 — the grpc_status_filter arm, 8 probes
+ae8cbd4 phase 114 task 10: BEHAVIOR_CONTRACT — the grpc_status_filter grammar and runtime rule
+```
+
+Each `git add` list is the plan's, plus this `PROGRESS.md` (the §5 state machine
+requires appending per task, and all ten phase-113 task commits carried it).
+
+## 2. Size — 1038 net against a MEASURED 938 (1.107×), reconciled to FOUR files
+
+Same **14 files** as the prototype, `docs/` excluded (the §6.1 gate's scope):
+
+| file | landed net | prototype | Δ |
+|---|---:|---:|---:|
+| `tests/fixtures/0094-…/README.md` | 166 | 73 | **+93** |
+| `crates/envoy-config/src/bootstrap.rs` | 251 | 245 | +6 |
+| `crates/envoy-accesslog/src/filter.rs` | 99 | 97 | +2 |
+| `crates/envoy-accesslog/src/record.rs` | 11 | 12 | −1 |
+| `crates/envoy-accesslog/src/file_sink.rs` | 8 | 8 | 0 |
+| `crates/envoy-config/src/lib.rs` | 7 | 7 | 0 |
+| `crates/envoy-http1/src/grpc.rs` | 5 | 5 | 0 |
+| `crates/envoy-http1/src/hcm.rs` | 150 | 150 | 0 |
+| `crates/envoy-http1/src/lib.rs` | 1 | 1 | 0 |
+| `crates/envoy-http2/src/hcm.rs` | 32 | 32 | 0 |
+| `tests/differential/tests/accesslog_grpc_status_filter.rs` | 24 | 24 | 0 |
+| `tests/fixtures/0094-…/envoy-rust.yaml` | 91 | 91 | 0 |
+| `tests/fixtures/0094-…/envoy.yaml` | 93 | 93 | 0 |
+| `tests/fixtures/0094-…/expectations.yaml` | 100 | 100 | 0 |
+| **TOTAL** | **1038** | **938** | **+100** |
+
+`938 + 93 + 6 + 2 − 1 = 1038` ✓ — the reconciliation closes exactly, with no
+residual.
+
+**TEN of the fourteen files land on the prototype's number EXACTLY**, including
+all three fixture YAMLs, the runner and both HCM files. The overrun is localised,
+not diffuse drift, and its dominant term is the one artifact `PLAN.md` specifies
+as a section list rather than quoting — the fixture README, which the plan
+therefore never actually sized. See the Task-9 note; it was not trimmed.
+
+**1.107× sits inside the project's MEASURED-estimate band** (`112.1` 1.00×,
+`113` 1.07×, `112.2` 1.10×) and nowhere near the PROJECTED band (1.33×–1.66×).
+**The §6.1 gate (~25 tasks OR ~1500 net LoC) does not fire at 1038 either**, so
+the state-2 no-split adjudication stands on the LANDED number, not only the
+predicted one.
+
+The `docs/` slice, excluded from the gate, is **+1424 / −0** (`PROGRESS.md`,
+`ADR-0198`, the `BEHAVIOR_CONTRACT.md` section, `STATE.md`, `STATE_HISTORY.md`).
+
+## 3. The four per-crate test targets were reproduced independently
+
+| crate | measured here | `PLAN.md` prototype |
+|---|---:|---:|
+| `envoy-accesslog` | 133 | 133 ✓ |
+| `envoy-config` | 722 | 722 ✓ |
+| `envoy-http1` | 243 | 243 ✓ |
+| `envoy-http2` | 126 (+1 ignored) | 126 (+1 ignored) ✓ |
+| **sum** | **1224** | **1224** ✓ |
+
+Four separate numbers, each reached at the task that closes its crate, on a
+different day and a different tree from the prototype.
+
+## 4. The CI-identity prediction — DERIVED BEFORE ANY LOG WAS READ
+
+The baseline `binaries=169 passed=2298 failed=0` has held byte-identical across
+**six** consecutive docs-only commits. **This phase lands executable lines, so it
+MUST move.** Predicted:
+
+| | baseline | predicted | Δ |
+|---|---:|---:|---:|
+| `binaries` | 169 | **170** | +1 |
+| `passed` | 2298 | **2315** | +17 |
+| `failed` | 0 | **0** | 0 |
+
+**Two independent derivations agree**, which is why this is stated as a
+prediction rather than a guess:
+
+- **By diff:** `git diff BASE..HEAD -- crates/ tests/` adds **17**
+  `#[test]`/`#[tokio::test]` attributes and removes **0**.
+- **By per-crate arithmetic:** `envoy-config` 716→722 (+6), `envoy-accesslog`
+  129→133 (+4), `envoy-http1` 238→243 (+5), `envoy-http2` 126→127 total (+1
+  passed) = **+16** unit tests, plus the new differential runner's **1** test =
+  **+17**.
+
+The `+1` binary is the new `accesslog_grpc_status_filter` runner. Fixture census
+**93 → 94**, differential runner census **92 → 93** — both re-derived on disk.
+
+⚠ **An UNMOVED identity would mean the new tests did not actually run**, not that
+nothing changed.
+
+## 5. Nine `PLAN.md` corrections, applied forward
+
+None is a design error; all are mis-predictions about mechanics, and all are
+recorded in `ADR-0198` DECISION 1.
+
+| # | task | the correction |
+|---|---|---|
+| 1 | 1 | predicted numstat `14	14` measured `10	10`; the *invariant* held, the magnitude did not |
+| 2 | 2 | the stated `pub use` insertion point fails the plan's own `fmt` gate; rustfmt sorts that block |
+| 3 | 3 | "add to `mod tests`" ≠ "append at EOF" — `bootstrap.rs` has TEN column-0 test modules |
+| 4 | 3 | `E0027` forces the validator destructure at Task **3**, not Task 4 |
+| 5 | 4 | a plan-supplied anchor is not unique (occurs twice) |
+| 6 | 5 | the `E0063` **count** says four; the **enumeration** says five, and the enumeration is right |
+| 7 | 6 | Step 5's expected `.should_log(` counts predate Step 4's own pin (`68` → `72`) |
+| 8 | 8 | a name-filtered `cargo test` exits **0** with `0 passed; 242 filtered out` — a false green |
+| 9 | 9 | the fixture README is 166 lines against a measured 73 |
+
+## 6. Gate posture at the end of the phase
+
+```
+cargo build  --workspace --all-targets                            -> 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings -> 0
+cargo fmt    --all -- --check                                     -> 0
+```
+
+**ZERO suppressions survive.** The one `#[allow(clippy::only_used_in_recursion)]`
+the plan directed at Task 6 was removed at Task 7, and its absence is asserted
+(`only_used_in_recursion` = 0 in `crates/envoy-accesslog/src/`; the marker
+`TRANSIENT, PHASE-114` = 0 anywhere in `crates/`). No `#[allow(dead_code)]` and
+no `_`-prefixed binding was added at the Task-3 deferral.
+
+⚠ **This is NOT the §5 state-4 verification gate.** `cargo deny`, `cargo fuzz`,
+the full differential suite and the conformance suites were NOT run here, and no
+§7.5 verdict is claimed. State 4 is a separate session (§5.1; `ADR-0127`).
+
+## 7. Carry-forwards
+
+**`CF-113-7` is CONSUMED** by the Task-1 rider, in its own labelled commit.
+**Nothing else was fixed** (§6.3; `ADR-0165`); the phase-112 ALPN cleanup was
+neither taken nor re-costed.
+
+`CF-114-1` (no TRAILER source, blocked behind `CF-111-2`), `CF-114-2` (five arms
+still unbuilt), `CF-114-3` (no H2 cross-proxy fixture; pinned in-process by
+`h2_uses_the_shared_effective_status`), `CF-114-4` (the `exclude` witness;
+pinned in-process by `grpc_status_arm_exclude_inverts_over_the_same_code` over
+all 17 codes) and `CF-114-5` (a present-but-unparseable `grpc-status` header;
+pinned by `derivation_ignores_an_unparseable_or_out_of_range_header`) all stand
+as `ADR-0197` left them. Every other banked carry-forward carries forward INTACT;
+**`CF-113-4` stays CONSUMED**, **`CF-111-4` consumed only in PART**, **`CF-112-5`
+CLOSED**, **`CF-112-8` Consequence 2 BANKED as structurally unwitnessable**.
+
+## 8. What the state-4 session should check first
+
+- The CI identity against the §4 prediction — **and the reason for any gap**,
+  rather than recording whatever appears.
+- The full differential suite, not just `0094`. Four `access_log_*_upstream_reset`
+  tests are in the known stable-core local RED set **and this phase touched the
+  access-log filter path**, so a RED naming them is a SUSPECT, not a known flake;
+  classify by ISOLATION, never by failure text.
+- `cargo deny check` and the fuzz targets, neither run here.
+- That the four PV-9 files are still untouched — with a positive control that
+  actually discriminates (the first one tried here did not).
