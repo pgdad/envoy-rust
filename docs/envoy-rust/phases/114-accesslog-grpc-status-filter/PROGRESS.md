@@ -882,3 +882,81 @@ Per-file numstat at this task's commit:
 61	52	crates/envoy-http1/src/hcm.rs
 1	0	crates/envoy-http2/src/hcm.rs
 ```
+
+---
+
+## Task 7 — `LogFilter::GrpcStatus` and its `should_log` arm
+
+**Status: COMPLETE.** Commit: `phase 114 task 7: LogFilter::GrpcStatus — plain-integer membership with exclude inversion`.
+
+The arm carries **plain data, not a trait object**. `envoy-accesslog` depends
+only on `tokio`, `bytes`, `tracing` and `thiserror`, so the `Header` and
+`Metadata` arms inject an `Arc<dyn …>` through the `ADR-0150` seam. This arm
+needs no `envoy-config` type at all — the compile step resolves every token to an
+integer before the runtime sees it — so `ADR-0150` is not involved and this arm
+is SIMPLER than phase 72's or phase 74's.
+
+### Steps 1–2 — the failing tests, RUN and SEEN to fail
+
+```
+$ cargo test -p envoy-accesslog --lib grpc_status_arm
+error[E0599]: no variant named `GrpcStatus` found for enum `filter::LogFilter`
+error: could not compile `envoy-accesslog` (lib test) due to 4 previous errors
+```
+
+RED for exactly the reason `PLAN.md` Task 7 Step 2 predicts.
+
+### Step 3 — the variant, the arm, and the removal of Task 6's suppression
+
+`LogFilter::GrpcStatus { codes: Vec<u8>, exclude: bool }` appended after
+`Metadata`, and the predicate added as one expression:
+
+```rust
+LogFilter::GrpcStatus { codes, exclude } => {
+    codes.contains(&grpc_status_code) != *exclude
+}
+```
+
+One expression covers both directions. An empty `codes` makes `contains` false
+for every record, so `exclude: false` keeps nothing and `exclude: true` keeps
+everything — exactly what was MEASURED.
+
+**The TRANSIENT `#[allow(clippy::only_used_in_recursion)]` Task 6 added was
+deleted in this same task**, as `PLAN.md` Task 6 requires. It was not left to be
+noticed later; its removal is asserted:
+
+```
+only_used_in_recursion occurrences in crates/envoy-accesslog/src/ : 0 file(s)
+`TRANSIENT, PHASE-114` occurrences anywhere in crates/           : 0
+clippy_exit=0
+```
+
+`-D warnings` now passes **without** the allow, which is the proof that the lint
+went away because its consumer landed rather than because it was silenced. The
+phase ends carrying **zero** suppressions.
+
+### Step 4 — GREEN
+
+```
+$ cargo test -p envoy-accesslog --lib
+test filter::tests::grpc_status_arm_is_membership_over_the_effective_code ... ok
+test filter::tests::grpc_status_arm_exclude_inverts_over_the_same_code ... ok
+test filter::tests::grpc_status_arm_empty_statuses_keeps_nothing ... ok
+
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+**`133 passed; 0 failed` is exactly the figure `PLAN.md` Task 7 Step 4 states the
+prototype measured for this crate at the end of the phase.** No later task
+touches `envoy-accesslog`, so the crate is closed at its predicted number.
+
+`grpc_status_arm_exclude_inverts_over_the_same_code` is the in-process witness
+`CF-114-4` is banked against: it asserts the inversion over **all 17 codes**,
+which is more than the single bit a second differential fixture would have
+bought.
+
+Boundary gates:
+
+```
+build_exit=0    clippy_exit=0    fmt_exit=0
+```

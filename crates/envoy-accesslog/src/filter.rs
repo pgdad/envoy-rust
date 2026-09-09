@@ -96,6 +96,16 @@ pub enum LogFilter {
         matcher: Option<Arc<dyn MetadataMatch>>,
         match_if_key_not_found: bool,
     },
+    /// Phase 114: emit a record iff its EFFECTIVE gRPC status is in `codes` —
+    /// or, when `exclude` is set, iff it is NOT. `codes` is already resolved to
+    /// integers by the compile step. An EMPTY `codes` with `exclude: false`
+    /// keeps NOTHING (MEASURED); with `exclude: true` it keeps EVERYTHING.
+    /// Carries plain data, not a trait object: this arm needs no `envoy-config`
+    /// type, so the ADR-0150 cycle seam is not involved.
+    GrpcStatus {
+        codes: Vec<u8>,
+        exclude: bool,
+    },
 }
 
 impl LogFilter {
@@ -108,13 +118,6 @@ impl LogFilter {
     /// phase-114 `GrpcStatus` arm only `grpc_status_code`. The status
     /// comparison is widened to `u32` (lossless; status is always in `u16`
     /// range).
-    // ⚠ TRANSIENT, PHASE-114 TASK 6 ONLY — REMOVE IN TASK 7.
-    // `grpc_status_code` is threaded through the And/Or recursion here but no
-    // arm CONSUMES it until Task 7 lands `LogFilter::GrpcStatus`, so
-    // `only_used_in_recursion` fires at THIS task boundary and only here.
-    // `PLAN.md` Task 6 requires this allow be added with exactly this note and
-    // deleted by Task 7; Task 7 Step 4 re-runs `-D warnings` to prove it.
-    #[allow(clippy::only_used_in_recursion)]
     pub fn should_log(
         &self,
         status: u16,
@@ -185,6 +188,12 @@ impl LogFilter {
                     .matches(dynamic_metadata)
                     .unwrap_or(*match_if_key_not_found),
             },
+            // Phase 114: membership over the UNGATED effective status, inverted
+            // by `exclude`. Empty `codes` => contains() is false for every
+            // record, so `exclude: false` keeps nothing (MEASURED).
+            LogFilter::GrpcStatus { codes, exclude } => {
+                codes.contains(&grpc_status_code) != *exclude
+            }
         }
     }
 }
@@ -506,6 +515,54 @@ mod tests {
             assert!(!ge(500).should_log(499, "-", &[], &Default::default(), code));
             assert!(rf(&["NR"]).should_log(404, "NR", &[], &Default::default(), code));
             assert!(!rf(&["NR"]).should_log(404, "UH", &[], &Default::default(), code));
+        }
+    }
+
+    // ── Phase 114: the `GrpcStatus` arm ───────────────────────────────────────
+    #[test]
+    fn grpc_status_arm_is_membership_over_the_effective_code() {
+        let f = LogFilter::GrpcStatus {
+            codes: vec![12, 13],
+            exclude: false,
+        };
+        assert!(f.should_log(200, "-", &[], &Default::default(), 12));
+        assert!(f.should_log(404, "-", &[], &Default::default(), 13));
+        assert!(!f.should_log(200, "-", &[], &Default::default(), 2));
+        assert!(!f.should_log(503, "-", &[], &Default::default(), 14));
+    }
+
+    #[test]
+    fn grpc_status_arm_exclude_inverts_over_the_same_code() {
+        // MEASURED upstream: sink DDD (`exclude: true`) kept every probe whose
+        // derived status was NOT 12 and dropped both whose status WAS 12 —
+        // including a plain-HTTP 404. The inversion is over the SAME value.
+        let inc = LogFilter::GrpcStatus {
+            codes: vec![12],
+            exclude: false,
+        };
+        let exc = LogFilter::GrpcStatus {
+            codes: vec![12],
+            exclude: true,
+        };
+        for code in 0..=16u8 {
+            assert_ne!(
+                inc.should_log(200, "-", &[], &Default::default(), code),
+                exc.should_log(200, "-", &[], &Default::default(), code),
+                "exclude must invert at code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_status_arm_empty_statuses_keeps_nothing() {
+        // MEASURED: sink EEE (`grpc_status_filter: {}`) kept NOTHING on any of
+        // the eight probes. An empty list is not "match everything".
+        let f = LogFilter::GrpcStatus {
+            codes: vec![],
+            exclude: false,
+        };
+        for code in 0..=16u8 {
+            assert!(!f.should_log(200, "-", &[], &Default::default(), code));
         }
     }
 }
