@@ -1229,3 +1229,61 @@ quoted four-hunk diff — content the plan asks for but did not size. The closes
 landed comparator, `0093`'s README, is 110 lines. Trimming documentation to hit a
 LoC figure would be optimising the wrong quantity; the reconciliation is stated
 in full at the end of this document instead.
+
+---
+
+## Task 10 — `BEHAVIOR_CONTRACT.md`: the grammar and the runtime rule
+
+**Status: COMPLETE.** Commit: `phase 114 task 10: BEHAVIOR_CONTRACT — the grpc_status_filter grammar and runtime rule`.
+
+The only `docs/` change in the phase, and EXCLUDED from the §6.1 LoC gate.
+
+### Step 1 — locate the section, asserting uniqueness
+
+`PLAN.md` warns not to guess the heading in a 4694-line file. The access-log
+FILTER arms turn out to occupy six CONTIGUOUS `### ` sections:
+
+```
+2807  ### Phase 70 … status_code_filter — the per-record emission gate
+2923  ### Phase 71 … response_flag_filter — the SECOND emission-gate arm
+3001  ### Phase 72 … header_filter — the THIRD emission-gate arm
+3173  ### Phase 73 … and_filter / or_filter — the FOURTH & FIFTH emission-gate arms
+3221  ### Phase 74 … metadata_filter — the SIXTH emission-gate arm
+3409  ### Phase 75 … HeaderMatcher ABSENCE semantics        <- the next section
+```
+
+So the insertion point is immediately before the phase-75 heading, keeping the
+seven arms contiguous and in arm order. That heading was asserted to occur
+**exactly once** by whole-line match, and the line above it asserted blank,
+before any write.
+
+### Step 2 — the section
+
+`### Phase 114 (ADR-0196/0197): grpc_status_filter — the SEVENTH emission-gate
+arm (the UNGATED gRPC-STATUS gate)`, in the house `§A…§I` style, covering the
+three sub-sections `PLAN.md` requires:
+
+- **§A** the token grammar as a verdict table, including the PERMISSIVE
+  string-numeric forms and the YAML-version note on `y`/`n`/`on`/`off`.
+- **§B** the code-1 asymmetry, recorded EXPLICITLY as the plan requires:
+  `CANCELED` (one L) here versus `CANCELLED` (two Ls) in the
+  `%GRPC_STATUS(SNAKE_STRING)%` table, with the instruction not to unify them.
+- **§C–§F** the runtime rule: the header-then-derivation source, the **ungated**
+  gate (§D, the load-bearing rule), `exclude` inversion, and empty-keeps-nothing.
+- **§G** mutual exclusion as the seventh oneof arm.
+- **§H** the envoy-rust scope: two sources of three, both codecs on both landed
+  legs, and the four carry-forwards `CF-114-1`/`-3`/`-4`/`-5` each named at the
+  claim it bounds.
+- **§I** the authoritative fixture with its eight-probe table and the mutation
+  result.
+
+### Step 3 — additions only
+
+```
+$ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
+135	0	docs/envoy-rust/BEHAVIOR_CONTRACT.md
+```
+
+Deletions **0**, as `PLAN.md` Step 3 requires — no existing section was
+disturbed. Heading order after the insert: 73 → 74 → **114** → 75, with each
+`### ` heading still unique.

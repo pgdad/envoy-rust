@@ -3406,6 +3406,141 @@ be "cleaned up".
 
 ---
 
+### Phase 114 (ADR-0196/0197): `grpc_status_filter` — the SEVENTH emission-gate arm (the UNGATED gRPC-STATUS gate)
+
+> `filter: { grpc_status_filter: { statuses: [<token>, …], exclude: <bool> } }`
+
+Upstream `envoy.config.accesslog.v3.GrpcStatusFilter`. Gates a sink's per-record
+emission on the request's **effective gRPC status**. Every rule below was
+MEASURED against `envoyproxy/envoy:v1.33.0`
+(`sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`), on
+the config surface via `--mode validate` with a negative control, and at runtime
+via six sinks on one listener.
+
+**§A The `statuses` token grammar.** Each entry is EITHER a canonical
+`SCREAMING_SNAKE` status name matched **case-INSENSITIVELY**, OR an integer in
+**0–16**. Duplicates are permitted; there is no `min_items` and no uniqueness
+bound. An entry that is neither is rejected AT LOAD (envoy-rust:
+`ConfigError::UnknownGrpcStatus { token }`).
+
+| token | verdict | note |
+|---|---|---|
+| the 17 canonical names, `OK` … `UNAUTHENTICATED` | **ACCEPT** | index IS the code |
+| `not_found`, `ok`, `Ok`, `oK` | **ACCEPT** | case-insensitive |
+| `NotFound` | **REJECT** | ⚠ case-insensitivity does NOT imply camel case — the **underscores are required** |
+| `CANCELLED` (two Ls) | **REJECT** | ⚠ see §B |
+| `0`, `5`, `16`, and the quoted `"5"` | **ACCEPT** | int or string-spelled |
+| `"05"`, `"+5"`, `" 5"`, `"5 "` | **ACCEPT** | the string form is parsed PERMISSIVELY — exactly `trim().parse::<i64>()` |
+| `"0x5"`, `""` | **REJECT** | not integral |
+| `17`, `-1`, `1.0` | **REJECT** | the range is exactly 0–16 |
+| `TRUE` | **REJECT** | YAML booleanizes it before the enum parser sees it |
+
+⚠ **`y` / `n` / `on` / `off` / `yes` / `no` REJECT on both sides but by different
+routes.** Envoy parses YAML **1.1**, where they are booleans; `serde_yaml` parses
+YAML **1.2**, where they are plain strings that then resolve to no token. Same
+verdict, different error class — the `ADR-0049` fail-loud parity posture. `TRUE`
+booleanizes on BOTH sides (`serde_yaml`'s `parse_bool` accepts exactly
+`true|True|TRUE|false|False|FALSE`), so that rejection reproduces identically.
+
+**§B The code-1 asymmetry — two enums that share sixteen of seventeen names.**
+`GrpcStatusFilter.Status` spells code 1 **`CANCELED`, with ONE L**, and REJECTS
+`CANCELLED`. Phase 113's `%GRPC_STATUS(SNAKE_STRING)%` rendering table renders
+code 1 as **`CANCELLED`, with TWO**. Both are MEASURED against the same pinned
+image. **They are different upstream enums and MUST NOT be unified.** Reusing
+`GRPC_STATUS_NAMES` (`crates/envoy-accesslog/src/command_operator.rs`) as this
+arm's accept-list gets exactly that one cell backwards, and the coincidence of
+the other sixteen is what hides it.
+
+**§C The runtime rule — the status SOURCE.** The effective status is:
+
+1. the response **`grpc-status` header** if present, else
+2. **`http_to_grpc_status(response_code)`** — the phase-110 map.
+
+Upstream's map has **no `200 => 0` arm**: a plain 200 derives `UNKNOWN` (2), the
+`_ => 2` default.
+
+**§D The gate is NOT gated on the request being a gRPC request.** This is the
+**OPPOSITE** of `%GRPC_STATUS%` and it is the load-bearing rule of the arm. A
+plain HTTP request with no gRPC `content-type` — for which `%GRPC_STATUS%`
+renders the `-` sentinel — still has an effective status and is still
+discriminated on. MEASURED: a plain `404` was **KEPT** by a sink filtered on
+`statuses: [UNIMPLEMENTED]`.
+
+Consequence for implementers: `AccessLogRecord.grpc_status`
+(`crates/envoy-accesslog/src/record.rs`) is **UNUSABLE** for this arm despite its
+name — it is gated on `is_grpc_request` and holds a raw string. envoy-rust
+carries a second, separately-shaped field `grpc_status_code: u8` for this arm,
+populated by `envoy_http1::hcm::effective_grpc_status` at BOTH codecs' record
+builds.
+
+**§E `exclude` inverts membership**, over the SAME derived status. MEASURED: a
+sink with `statuses: [UNIMPLEMENTED], exclude: true` kept every probe whose
+derived status was not 12 and dropped both whose status was 12 — including the
+plain-HTTP 404. envoy-rust: `codes.contains(&code) != *exclude`.
+
+**§F An empty `statuses` list keeps NOTHING.** It is not "match everything".
+MEASURED: `grpc_status_filter: {}` kept none of eight probes. It nonetheless
+LOADS cleanly on both sides — emptiness is a RUNTIME rule, not a load rule. With
+`exclude: true` an empty list keeps EVERYTHING, which falls out of the same
+expression.
+
+**§G Mutual exclusion.** `grpc_status_filter` joins the `AccessLogFilter` oneof
+as the **SEVENTH** arm (`status_code_filter`, `response_flag_filter`,
+`header_filter`, `and_filter`, `or_filter`, `metadata_filter`,
+`grpc_status_filter`) — exactly one may be set at each level, enforced by
+`validate_access_logs` (`ConfigError::AmbiguousAccessLogFilter`), NOT by serde.
+
+**§H envoy-rust scope — what is and is not implemented.**
+
+- **TWO sources of three.** Upstream also reads the response **TRAILER** block;
+  envoy-rust does not. `crates/envoy-http1/src/client.rs` discards response
+  trailers behind chunked response encoding — pre-existing, banked as
+  **`CF-111-2`**, and this arm's share banked as **`CF-114-1`**. The
+  implementation is written so adding the trailer source is an added branch, not
+  a reshape.
+- **Both codecs implement both landed legs.** The response-header map IS live at
+  the H2 record build (`response_headers_for_log_owned` is cloned before the
+  `resp` move), so H1 and H2 share ONE helper. The H2 arm has no cross-proxy
+  fixture and is pinned in-process only — **`CF-114-3`**.
+- **`exclude` and the empty-list rule are pinned in-process only**, not
+  differentially: the byte-exact driver takes exactly one log file per side, so
+  an `exclude` witness would need its own fixture — **`CF-114-4`**.
+- **A PRESENT but unparseable or out-of-range `grpc-status` header** is
+  **unmeasured upstream** and unwitnessable by any fixture on either proxy
+  (neither side can set an arbitrary `grpc-status` response header without
+  route-level `response_headers_to_add`, which is boot-fatal in envoy-rust).
+  envoy-rust falls back to the response-code map. That is a defensible reading of
+  upstream's own optional parse, but it is a **CHOICE, not a measurement** —
+  **`CF-114-5`**.
+
+**§I Authoritative fixture.** `0094-accesslog-grpc-status-filter`: one sink,
+`filter: { grpc_status_filter: { statuses: [UNIMPLEMENTED, INTERNAL] } }` (codes
+12 and 13), format `PATH=%REQ(:PATH)% CODE=%RESPONSE_CODE% GS=%GRPC_STATUS%`,
+`clusters: []`, no backend. **EIGHT probes on eight distinct paths, FIVE kept.**
+
+| probe | path | request `content-type` | route status | observed | derived | kept |
+|---|---|---|---|---|---|---|
+| 1 | `/g-unimpl` | `application/grpc` | 404 | **200** | 12 (header) | **yes** |
+| 2 | `/g-internal` | `application/grpc` | 400 | **200** | 13 (header) | **yes** |
+| 3 | `/g-unknown` | `application/grpc` | 200 | 200 | 2 | no |
+| 4 | `/g-unavail` | `application/grpc` | 503 | **200** | 14 | no |
+| 5 | `/p-unimpl` | *(none)* | 404 | 404 | 12 (map) | **yes** ⚠ |
+| 6 | `/p-internal` | *(none)* | 400 | 400 | 13 (map) | **yes** ⚠ |
+| 7 | `/p-unknown` | *(none)* | 200 | 200 | 2 | no |
+| 8 | `/g-param` | `application/grpc; charset=utf-8` | 404 | 404 | 12 (map) | **yes** ⚠ |
+
+Probes 1–4 observe **HTTP 200** because the phase-110 local-reply transform
+rewrites the status and emits the `grpc-status` header — which is precisely what
+makes probes 1 and 2 witness the HEADER leg: deriving from the LOGGED 200 would
+compute 2 and drop both.
+
+**Probes 5, 6 and 8 (⚠) are the non-vacuity witnesses.** `%GRPC_STATUS%` renders
+`-` for all three, yet the filter keeps them. Proved by MUTATION, not asserted:
+gating the derivation on `is_grpc_request` makes envoy-rust emit **2** lines
+where **5** are expected, the three lost being exactly those three, with the
+unmutated control GREEN from the same tree. Assertion is pure cross-proxy
+equality plus an exact per-side count.
+
 ### Phase 75 (ADR-0156/0157/0158/0159/0161/0162): `HeaderMatcher` ABSENCE semantics — the `present_match` POLARITY rule and its two-consumer witnesses
 
 > Fixtures `0083-headermatcher-absence-parity` (ROUTE path, sub-phase 75.1) +
