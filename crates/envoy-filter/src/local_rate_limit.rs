@@ -149,6 +149,7 @@ impl LocalRateLimitFilter {
                 headers,
                 body: Bytes::from_static(b"local_rate_limited"),
                 details: None,
+                headers_only: false,
             })
         }
     }
@@ -542,6 +543,7 @@ mod tests {
             headers: Vec::new(),
             body: bytes::Bytes::new(),
             details: None,
+            headers_only: false,
         };
         let decision = filter.encode_headers(&mut resp);
         assert!(matches!(decision, Decision::Continue));

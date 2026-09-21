@@ -52,23 +52,26 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
         .map_err(|_| Http2Error::MalformedH2HeaderBlock)
 }
 
-/// Decorate a filter-synth H2 response with the standard response headers —
+/// Decorate a filter's local H2 reply with the standard response headers —
 /// a delegating wrapper over the shared H1/H2 implementation at
-/// `envoy_http1::hcm::decorate_filter_synth_response`, called with
-/// `connection: None` because `connection` is an H2-forbidden hop-by-hop
-/// header stripped by `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP`
-/// (RFC 7540 §8.1.2.2).
+/// `envoy_http1::hcm::decorate_filter_reply`, called with `connection: None`
+/// because `connection` is an H2-forbidden hop-by-hop header stripped by
+/// `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP` (RFC 7540 §8.1.2.2),
+/// and with no HEAD-specific framing (H2 has none).
 ///
-/// Semantics (see the shared fn's doc for the full ADR-0033 contract):
-/// `content-length` always overwritten from `resp.body.len()`; `server` /
-/// `date` only-if-missing; `content-type` only-if-missing AND only when the
-/// body is non-empty (Envoy v1.33 empirical behaviour, fixture 0031 §6.2).
+/// Semantics (see the shared fns' docs for the full ADR-0033 / ADR-0202
+/// contract): `content-length` always overwritten from `resp.body.len()` —
+/// unless `headers_only` (`FilterResponse::headers_only`, ADR-0202), when the
+/// reply carries NO `content-length` (MEASURED upstream, phase-115
+/// `REVIEW.md` I-1); `server` / `date` only-if-missing; `content-type`
+/// only-if-missing AND only when the body is non-empty (Envoy v1.33 empirical
+/// behaviour, fixture 0031 §6.2).
 ///
 /// Closes the 09 REVIEW M2 implementation arm (phase 11 D6): the H1 writer
 /// path has decorated filter-synth responses since 09 ADR-0033 Commit C; this
 /// brings the H2 writer path to parity.
-pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
-    envoy_http1::hcm::decorate_filter_synth_response(resp, None);
+pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response, headers_only: bool) {
+    envoy_http1::hcm::decorate_filter_reply(resp, headers_only, None, false);
 }
 
 /// Translate a trailer block into an `http::HeaderMap` for
@@ -259,7 +262,7 @@ mod tests {
             headers: Vec::new(),
             body: Bytes::from_static(b"fault filter abort"),
         };
-        super::decorate_filter_synth_response_h2(&mut resp);
+        super::decorate_filter_synth_response_h2(&mut resp, false);
         let name = |n: &str| -> Option<&str> {
             resp.headers
                 .iter()
@@ -280,6 +283,28 @@ mod tests {
         assert_eq!(resp.headers.len(), 4, "headers: {:?}", resp.headers);
     }
 
+    /// ADR-0202: a headers-only filter reply carries NO `content-length` on
+    /// H2 (MEASURED upstream); without the flag the ADR-0033 decoration holds.
+    #[test]
+    fn decorate_h2_honours_headers_only() {
+        let reply = |headers_only: bool| {
+            let mut resp = Response {
+                status: 200,
+                reason: None,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            };
+            super::decorate_filter_synth_response_h2(&mut resp, headers_only);
+            resp.headers
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| k != "date")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reply(true), ["server"]);
+        assert_eq!(reply(false), ["content-length", "server"]);
+    }
+
     #[test]
     fn decorate_h2_omits_content_type_when_body_is_empty() {
         // Empty-body local reply (e.g. CORS preflight 200): content-type must
@@ -291,7 +316,7 @@ mod tests {
             headers: Vec::new(),
             body: Bytes::new(),
         };
-        super::decorate_filter_synth_response_h2(&mut resp);
+        super::decorate_filter_synth_response_h2(&mut resp, false);
         let name = |n: &str| -> Option<&str> {
             resp.headers
                 .iter()
@@ -329,7 +354,7 @@ mod tests {
             ],
             body: Bytes::from_static(b"fault filter abort"),
         };
-        super::decorate_filter_synth_response_h2(&mut resp);
+        super::decorate_filter_synth_response_h2(&mut resp, false);
         let name = |n: &str| -> Option<String> {
             resp.headers
                 .iter()

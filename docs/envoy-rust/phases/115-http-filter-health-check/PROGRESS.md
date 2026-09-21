@@ -1287,3 +1287,227 @@ still `bootstrap.rs`'s blank separator (283 vs 282) and was not re-litigated.
   and `PLAN.md` disagree, `PLAN.md` wins on all seven counts `ADR-0201` records.
 - `CF-115-1` … `CF-115-10` stand; `CF-114-6` is CONSUMED; `CF-75-5` open.
 - The next free ADR number is **`ADR-0202`**.
+
+# §5.2 STATE-3 RE-ENTRY — the `REVIEW.md` §2 fixes
+
+**The work order is `REVIEW.md` §2 "Required disposition" items 1–4** (item 5, the
+full gate re-run and the fresh re-review, belongs to states 4 and 5). The state-5
+CI record (`25c5397`) closed the previous chain, so this session entered owing no CI
+record, detected STRUCTURALLY. `STATE.md`'s `## Last commit` block already carried the
+CI-confirmed answer for `66585e3` (run `35629740765`). HEAD at entry was `25c5397`,
+tree clean. **`ADR-0202` fired** (the headers-only design; `REVIEW.md` asked for one if
+a later reader needs the decision, and one does). `ROADMAP.md` was NOT touched: row
+`115` stays `planned`. `REVIEW.md`, `SPEC.md`, `ADR-0200` and `ADR-0201` are not
+edited.
+
+## Stop condition — re-measured from disk, all three legs FALSE
+
+```
+LEG (i)   rows=123  done=122  planned=1   not-done: row 115 at ROADMAP.md line 78
+          status = field 4 on ' | '; field-count histogram {6: 121, 7: 1, 10: 1}
+LEG (ii)  crates=14; envoy-{http3,grpc,wasm,protos,runtime,xds} all absent
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0 of 28 manifests; tokio=19
+          histogram=0 over crates/; gauge=365 (crates/) / 352 (crates/*/src/)
+LEG (iii) 11 headings 11/5/3/14/3/4/6/31/6/0/13 + 27 pre-heading = 123;
+          zero-row family: ### WASM host family
+```
+
+No `stop` file exists and none was created.
+
+## Step 0 — the upstream cells, RE-MEASURED before any code changed
+
+Two `envoyproxy/envoy:v1.33.0` containers (digest `sha256:56da5afd…770c2` by
+`docker inspect`, both), fixture `0095`'s `envoy.yaml` with `{{PORT}}`→10000 and only
+`codec_type` varied, bound to free loopback ports, readiness polled over HTTP. The H1
+side was read as RAW BYTES from a socket (a 1 s read timeout marks "no EOF"), and the
+H2 side via `curl --http2-prior-knowledge` (`-I` for HEAD). `date` is redacted below.
+
+```
+H1 GET  /healthz close  x-envoy-upstream-healthchecked-cluster, date, server,
+                        connection: close, content-length: 0            <EOF>
+H1 HEAD /healthz close  x-envoy-upstream-healthchecked-cluster, date, server,
+                        connection: close, transfer-encoding: chunked   <TIMEOUT>
+                        (NO body bytes, NO chunk terminator, socket left OPEN)
+H1 HEAD /other   close  content-length: 4, content-type, date, server,
+                        connection: close                               <EOF>  (no body)
+H2 GET  /healthz        x-envoy-upstream-healthchecked-cluster, server
+H2 HEAD /healthz        x-envoy-upstream-healthchecked-cluster, server
+H2 GET/HEAD /other      content-length: 4, content-type, server
+```
+
+The same probe against the landed DEBUG `envoy-bin` reproduced I-1 (H2 `content-length:
+0`, GET and HEAD) and I-2 (H1 HEAD `content-length: 0`, no `transfer-encoding`). **Two
+things the review had not recorded:**
+
+1. **Upstream leaves the socket OPEN after an H1 HEAD intercept**, even when the request
+   and the reply both say `connection: close`. So a driver that reads to EOF would wait
+   out its timeout (see the driver change below).
+2. **envoy-rust writes the body of a non-intercepted reply on an H1 HEAD** —
+   `HEAD /other` got `…\r\n\r\nMAIN`. Upstream sends none. It is pre-existing (the H1
+   writer has no HEAD handling at all) and not this filter's. It is banked as
+   **`CF-115-14`** and NOT fixed (§6.3).
+
+## Fix 1 — `FilterResponse::headers_only` and a per-codec, per-method framing (I-1, I-2)
+
+- `crates/envoy-filter/src/types.rs`: `pub headers_only: bool` (doc: headers-only
+  reply; codec frames it; set only by `health_check`). `static_reply` and `test_200`
+  set `false`.
+- `crates/envoy-filter/src/health_check.rs`: the intercept sets `headers_only: true`.
+- `crates/envoy-http1/src/hcm.rs`: new `pub fn decorate_filter_reply(resp,
+  headers_only, connection, head_request)`. Without the flag it calls
+  `decorate_filter_synth_response` unchanged (ADR-0033). With it, it removes any
+  filter-supplied `content-length`/`transfer-encoding`, then pushes `content-length: 0`
+  (H1 non-HEAD), or `transfer-encoding: chunked` (H1 HEAD), or nothing (H2, where
+  `connection` is `None`), and adds the standard headers via the extracted
+  `add_standard_filter_reply_headers`. `RequestPath::SynthFromDecode` carries the flag
+  as a third field. Both the decode-side and the encode-side decoration sites dispatch
+  through it, with `req.method == "HEAD"`.
+- `crates/envoy-http2/src/hcm.rs` / `response.rs`: `H2RequestPath::SynthFromDecode`
+  carries the flag. `decorate_filter_synth_response_h2(resp, headers_only)` keeps its
+  name, so its five doc references stay true, and delegates to
+  `decorate_filter_reply(resp, headers_only, None, false)`. Both H2 decoration sites
+  pass the flag.
+- **`E0063` blast: 18 literal sites**, closed by a fixpoint loop in rounds of 4 / 9 / 1 /
+  4. Every inserted `headers_only: false,` was audited to sit directly after its
+  literal's `details` line. The `types.rs` `Self { … }` literals (2) were edited by
+  hand.
+
+**Scope: the health-check reply ONLY.** Every other filter's local reply keeps the
+ADR-0033 decoration; upstream's framing of those replies on H2/HEAD is unmeasured.
+
+## Fix 2 — the in-process pins, each RED by MUTATION (item 2)
+
+Tests (5 new test functions here, 2 landed ones extended; with the driver test of Fix 3
+and the F-3 rider the session adds 7):
+
+| test | crate | pins |
+|---|---|---|
+| `intercept_is_a_headers_only_reply` | envoy-filter | GET and HEAD intercepts set the flag; `static_reply` does not |
+| `decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method` | envoy-http1 | the three framings + H2's none, exact header lists |
+| `decorate_filter_reply_without_headers_only_is_the_adr_0033_decoration` | envoy-http1 | the flag off = `content-length` from `body.len()`, HEAD or not |
+| `h1_health_check_head_intercept_is_chunked_and_bodyless` | envoy-http1 | HEAD `/healthz` → `transfer-encoding: chunked`, no `content-length`, and a GET pipelined behind it is the very next reply |
+| `h1_health_check_filter_end_to_end` (extended) | envoy-http1 | H1 GET intercept carries `content-length: 0`, no `transfer-encoding` |
+| `decorate_h2_honours_headers_only` | envoy-http2 | H2 headers-only → `server` only; flag off → `content-length` |
+| `h2_health_check_filter_intercepts_and_logs` (extended) | envoy-http2 | NO `content-length` on the H2 intercept, GET and a new HEAD request |
+
+The H1 end-to-end config moved into a helper, `health_check_h1_config`, shared by the
+two H1 tests. The H2 helper gained `h2_response_code_details_line_with_method`; the
+old name delegates with `GET`, so its four other callers are unchanged.
+
+**Mutations.** Each ran under a FORCED rebuild (`Compiling <crate>` asserted), with the
+target asserted to occur EXACTLY ONCE before the swap. Each file was restored and
+md5-verified after its run, and the unmutated tree was the green control.
+
+```
+M1 H1 decode arm → flag ignored (landed decoration)  compiled [envoy-http1]
+   FAILED 247/1  RED = h1_health_check_head_intercept_is_chunked_and_bodyless
+M2 H2 decode arm → flag false (landed decoration)    compiled [envoy-http2]
+   FAILED 128/1  RED = h2_health_check_filter_intercepts_and_logs
+M3 filter sets headers_only: false  (--no-fail-fast) compiled [filter, http1, http2]
+   FAILED 225/1, 247/1, 128/1  RED = intercept_is_a_headers_only_reply,
+        h1_health_check_head_intercept_is_chunked_and_bodyless,
+        h2_health_check_filter_intercepts_and_logs
+M4 H1 HEAD framed as content-length                  compiled [envoy-http1]
+   FAILED 246/2  RED = decorate_filter_reply_frames_…, h1_health_check_head_intercept_…
+M5 H1 non-HEAD headers-only left unframed            compiled [envoy-http1]
+   FAILED 246/2  RED = decorate_filter_reply_frames_…, h1_health_check_filter_end_to_end
+```
+
+⚠ The first M1 attempt was refused by its own guard: its target text occurred TWICE,
+because the encode-side arm makes the identical call. It was re-anchored on the
+decode arm's unique comment line. The first M3 run showed only the filter crate's red,
+because cargo stops at the first failing crate. The `--no-fail-fast` re-run above
+reached all three layers.
+
+## Fix 3 — the differential HEAD witness (item 3)
+
+- `tests/differential/src/lib.rs`: `Http1Method::Head` (`"HEAD"`). `drive_http1` now
+  returns an EMPTY body at the end of a HEAD reply's head and reads nothing further. A
+  HEAD response has no content whatever its framing says (RFC 9110 §9.3.2), and upstream
+  never closes the socket (Step 0), so the old chunked/EOF read would time out. New unit
+  test `drive_http1_head_reads_the_head_only` replays upstream's exact shape: a chunked
+  head, then a socket held open for 30 s. It asserts the driver returns inside 2 s.
+  **Mutation:** the HEAD short-circuit removed → `FAILED 1/1` with `returns at the end of
+  the head: Elapsed(())`. Restored, md5-verified.
+- Fixture `0095`: probe **`p11-head-intercepted-headers-only`** (`method: head`, path
+  `/healthz`, empty body, `set_equal_modulo_allow_list`). README, `expectations.yaml`
+  header and the runner's doc updated from ten to eleven probes. `envoy.yaml` ≡
+  `envoy-rust.yaml` by `cmp`, re-derived.
+- **No `HEAD /other` control was added**, deliberately. The driver cannot see bytes after
+  a HEAD reply, so such a probe would read green while `CF-115-14` sits on the wire. The
+  README says why.
+- **Runs (DEBUG `envoy-bin` rebuilt first):** `0095` GREEN (1.16 s), `0096` GREEN
+  (1.23 s). **V6** — M1 applied, `envoy-http1` and `envoy-bin` recompiled → `0095`
+  FAILED at `probe p11-head-intercepted-headers-only: diff_headers`. Restored
+  (md5-verified), rebuilt, GREEN again (1.13 s). The fast greens are normal for a
+  backend-free fixture, and V6 is their negative control.
+- I-1's differential witness stays banked as `CF-115-4`. The H2 cells are pinned
+  in-process only.
+
+## Fix 4 — `BEHAVIOR_CONTRACT.md` (item 4; folds `REVIEW.md` N-10 and N-11)
+
+The "health_check intercept wire shape (MEASURED)" bullet now carries a three-row table
+per codec and method: H1 non-HEAD `content-length: 0`; H1 HEAD `transfer-encoding:
+chunked`, no `content-length`, no body bytes; H2 none. It states that the framing is
+the health-check reply's alone, and records the open-socket measurement. Every bullet
+in the section now names its witness: `[0095]`/`[0096]` differential, `[in-process]`,
+or `[measured, no in-tree witness]` (the chain-order bullet). The LDS stamping path is
+recorded as exercised by no test (F-2). The lead says "witnessed differentially on H1
+only", and the stats bullet records that envoy-rust emits neither
+`downstream_rq_completed` nor `downstream_rq_http1_total` (N-11).
+
+## Riders (optional; each in a file this fix already touches)
+
+- **N-1** — `FilterResponse::details`'s doc now names its second use, the
+  `downstream_rq_Nxx` gate.
+- **F-5** — `health_check`'s `request_total`/`ok` handles are bound by NAME through
+  `STAT_NAMES.iter().position`, not by index 7/6.
+- **F-3 (filter half)** — `path_pseudo_header_name_is_case_insensitive`: a `:PATH`
+  matcher intercepts `/healthz` and not `/other`. **Mutation:** `eq_ignore_ascii_case` →
+  `==` → `FAILED 12/1`, RED = that test. The validator half lives in `bootstrap.rs`,
+  which this fix does not touch, so it stays banked.
+- Not taken: F-2, F-4, N-2 … N-9, N-12. `CF-115-1` … `-3`, `-5` … `-13` stand, and
+  `CF-115-14` is new. `CF-75-5` and the phase-112 ALPN rider stand, not re-costed.
+
+## Verification at this re-entry
+
+State-4 re-runs the full §7.5 gate. What this session ran, and why:
+
+```
+cargo fmt --all -- --check                               exit 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+    (after touch -m of the 4 touched crate roots)       exit 0, 9 Checking, 0 warning/error lines
+cargo test --workspace --no-fail-fast                    exit 101
+    ANSI-stripped, regex `test result: (ok|FAILED)`:     172 rows = 166 ok + 6 FAILED
+    passed=2346 failed=6   passed + failed = 2352
+```
+
+**The identity moved exactly as PREDICTED before the run: 2345 + 7 = 2352, binaries
+unchanged at 172.** The 7 new test functions are Fix 2's 5, Fix 3's driver test and the F-3
+rider. That is 2 in envoy-filter, 3 in envoy-http1, 1 in envoy-http2 and 1 in
+the differential lib. Six local failures, and NONE is in code this fix touches:
+
+- `access_log_{h2_rcd,h2_uc,rcd,rf}_upstream_reset` and `admin_config_dump_server_info`
+  are five of the nine PRE-EXISTING local reds that the state-4 gate
+  (`# §5 STATE 4`, leg (b)) classified against an interleaved pre-phase control. None
+  of them configures `health_check`. They are not re-adjudicated here; state 4 does
+  that again.
+- `envoy-http2` `client::tests::send_request_maps_h2_handshake_failure_to_typed_error`
+  is a known host flake (a race between the fake server's shutdown and the h2
+  handshake). It passed 3/3 in isolation this session and 2/2 in two lib-suite
+  re-runs.
+
+**CI prediction: `binaries=172 passed=2352 failed=0`.**
+
+Size: net **395** lines excluding `docs/` (444 insertions, 49 deletions over 14 files), read
+off `git diff --numstat` at staging time.
+
+## What this session did NOT do
+
+- **Did not run the §7.5 gate.** That is state 4's job, in full (legs (a)–(e)), and a
+  fresh state-5 re-review writes `REVIEW-2.md`. No state was chained.
+- **Did not touch `ROADMAP.md`** (row `115` stays `planned`), `REVIEW.md`, `SPEC.md`,
+  `ADR-0200`/`ADR-0201`, or `known-failures.txt`.
+- **Did not widen the framing to other filters' local replies**, and did not fix
+  `CF-115-14` (HEAD body bytes on non-intercepted replies), `CF-115-11` or `CF-115-9`.
+- **Did not repair the state-3 citation damage.** Re-anchor on TEXT.

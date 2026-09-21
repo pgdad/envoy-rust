@@ -82,11 +82,20 @@ impl HealthCheckFilter {
                 &format!("http.{hcm_stat_prefix}.health_check.{name}"),
             )?);
         }
+        // Bound by NAME, not index: the two always tick together, so no test
+        // could tell a swapped pair apart (phase-115 `REVIEW.md` F-5).
+        let counter = |name: &str| {
+            let i = STAT_NAMES
+                .iter()
+                .position(|n| *n == name)
+                .expect("a STAT_NAMES entry");
+            Arc::clone(&counters[i])
+        };
         Ok(Self {
             headers,
             local_cluster: cfg.local_cluster.clone(),
-            request_total: Arc::clone(&counters[7]),
-            ok: Arc::clone(&counters[6]),
+            request_total: counter("request_total"),
+            ok: counter("ok"),
         })
     }
 
@@ -105,6 +114,7 @@ impl HealthCheckFilter {
             )],
             body: Bytes::new(),
             details: Some(HEALTH_CHECK_OK),
+            headers_only: true,
         })
     }
 
@@ -179,6 +189,18 @@ mod tests {
         assert_eq!(resp.details, Some("health_check_ok"));
     }
 
+    /// ADR-0202: the intercept is a HEADERS-ONLY reply — the codec frames it
+    /// (H1 non-HEAD `content-length: 0`, H1 HEAD `transfer-encoding: chunked`,
+    /// H2 no framing header), never from `body.len()`.
+    #[test]
+    fn intercept_is_a_headers_only_reply() {
+        for method in ["GET", "HEAD"] {
+            let resp = run(&mut filter(healthz()), method, "/healthz", &[]).expect("intercepted");
+            assert!(resp.headers_only, "{method}");
+        }
+        assert!(!FilterResponse::static_reply(403, None, b"denied").headers_only);
+    }
+
     #[test]
     fn path_matcher_sees_the_query_string() {
         assert!(run(&mut filter(healthz()), "GET", "/healthz?x=1", &[]).is_none());
@@ -189,6 +211,15 @@ mod tests {
         let mut f = filter(healthz());
         assert!(run(&mut f, "GET", "/healthz/", &[]).is_none());
         assert!(run(&mut f, "GET", "/healthZ", &[]).is_none());
+        assert!(run(&mut f, "GET", "/other", &[]).is_none());
+    }
+
+    /// The `:path` view is keyed case-insensitively, like every header name
+    /// (phase-115 `REVIEW.md` F-3, the filter half).
+    #[test]
+    fn path_pseudo_header_name_is_case_insensitive() {
+        let mut f = filter(vec![header_matcher_exact(":PATH", "/healthz")]);
+        assert!(run(&mut f, "GET", "/healthz", &[]).is_some());
         assert!(run(&mut f, "GET", "/other", &[]).is_none());
     }
 

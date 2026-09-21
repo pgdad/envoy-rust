@@ -54,10 +54,21 @@ pub struct FilterResponse {
     pub body: Bytes,
     /// Phase 115: the `%RESPONSE_CODE_DETAILS%` value of a filter's local
     /// reply. Read ONLY on the decode-side `StopAndSend` path, where both
-    /// HCMs copy it into the access-log record; `None` renders `-`. Every
+    /// HCMs copy it into the access-log record; `None` renders `-`. The same
+    /// value ALSO gates both HCMs' `downstream_rq_Nxx` tick: a reply whose
+    /// detail is `health_check_ok` is not counted there, so a filter that
+    /// reused that string would silently suppress those counters. Every
     /// filter that predates phase 115 sets `None` (unchanged behaviour); the
     /// encode side and the Continue write-back ignore it.
     pub details: Option<&'static str>,
+    /// ADR-0202: a HEADERS-ONLY reply (upstream: a filter encoding headers
+    /// with end-of-stream). The codec frames it — H1 non-HEAD
+    /// `content-length: 0`, H1 HEAD `transfer-encoding: chunked`, H2 no
+    /// framing header — instead of writing `content-length` from `body.len()`.
+    /// The body must be empty. Set ONLY by `health_check`; every other filter
+    /// sets `false`, because upstream frames its other local replies with a
+    /// `content-length`.
+    pub headers_only: bool,
 }
 
 impl FilterResponse {
@@ -76,6 +87,7 @@ impl FilterResponse {
             headers: Vec::new(),
             body: Bytes::from_static(body),
             details: None,
+            headers_only: false,
         }
     }
 }
@@ -120,6 +132,7 @@ impl FilterResponse {
             headers: vec![],
             body: Bytes::new(),
             details: None,
+            headers_only: false,
         }
     }
 }

@@ -1,4 +1,4 @@
-# Phase 115: ten sequential HTTP/1.1 probes against a backend-free,
+# Phase 115: eleven sequential HTTP/1.1 probes against a backend-free,
 # CLUSTER-FREE HCM listener whose chain is
 #   [health_check A (:path exact /healthz),
 #    health_check B (:path exact /both AND x-probe exact yes),
@@ -20,6 +20,9 @@
 #   p6       the filter is method-agnostic (POST with a body)
 #   p7       the header value is proxy state, not a request echo
 #   p8-p10   a two-entry matcher list folds as AND
+#   p11      a HEAD intercept is HEADERS-ONLY: upstream frames it
+#            `transfer-encoding: chunked` with NO `content-length` (ADR-0202;
+#            phase-115 REVIEW.md I-2). The driver reads a HEAD reply's head only.
 driver:
   kind: http1_probe_list
   probes:
@@ -99,4 +102,11 @@ driver:
         - ["x-probe", "yes"]
       expected_status: 200
       expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p11-head-intercepted-headers-only
+      method: head
+      path: "/healthz"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
       expected_headers: set_equal_modulo_allow_list

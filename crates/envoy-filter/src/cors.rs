@@ -223,6 +223,7 @@ fn build_preflight_response(policy: &CompiledCorsPolicy, origin: &str) -> Filter
         headers,
         body: Bytes::new(),
         details: None,
+        headers_only: false,
     }
 }
 

@@ -1,6 +1,6 @@
 # 0095 — `envoy.filters.http.health_check` (non-pass-through mode)
 
-Phase **115** (`ADR-0200` pick, `ADR-0201` PLAN-write). Ten HTTP/1.1 probes against a
+Phase **115** (`ADR-0200` pick, `ADR-0201` PLAN-write). Eleven HTTP/1.1 probes against a
 **backend-free, CLUSTER-FREE** HCM listener whose chain is
 
 ```
@@ -32,6 +32,16 @@ probe asserts the body byte-exact, and `set_equal_modulo_allow_list` compares
 | `p8` | `GET /both` + `x-probe: yes` | empty | both matchers match |
 | `p9` | `GET /both` | `MAIN` | the list is AND, not OR |
 | `p10` | `GET /other` + `x-probe: yes` | `MAIN` | …in the other direction |
+| `p11` | `HEAD /healthz` | empty; `transfer-encoding: chunked`, NO `content-length` | a HEAD intercept is headers-only (`ADR-0202`) |
+
+**`p11` is the only HEAD probe, and its reading is the HEAD itself.** Upstream answers it with
+`transfer-encoding: chunked`, no `content-length` and no body bytes, and — even under the driver's
+`Connection: close` — leaves the socket open (MEASURED, phase-115 §5.2 state-3 re-entry). The
+driver therefore reads a HEAD reply's head ONLY; the header-name set is what discriminates. It
+follows that the driver cannot see stray bytes AFTER a HEAD reply, which is why no `HEAD /other`
+control is listed here: envoy-rust sends a `direct_response` body on a HEAD reply and upstream does
+not (`CF-115-14`, pre-existing, not this filter's), and a probe that cannot see that would read as a
+witness of parity it does not give.
 
 **The header value is the bootstrap `node.cluster`.** `SPEC.md` §2.2 recorded it as EMPTY; that
 was measured on a config with no `node:` block. With `node.cluster` set it carries that string
@@ -65,3 +75,4 @@ Each mutation was applied, `envoy-bin` rebuilt, the fixture run, and the file re
 | V1 | stamp an empty `local_cluster` in `validate_hcm` | `p1` REDs on `diff_headers` |
 | V2 | strip the query string before matching `:path` | `p2` REDs (`MAIN` expected, empty returned) |
 | V3 | fold the matchers with `any` instead of `all` | `p9` REDs (`MAIN` expected, empty returned) |
+| V6 | restore the landed decoration on the H1 decode arm (`headers_only` ignored) | `p11` REDs on `diff_headers` (`content-length` vs `transfer-encoding`) |

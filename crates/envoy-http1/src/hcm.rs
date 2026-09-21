@@ -940,6 +940,7 @@ async fn serve_connection(
                         body: filter_resp.body,
                     },
                     filter_resp.details,
+                    filter_resp.headers_only,
                 )
             }
         };
@@ -1400,7 +1401,7 @@ async fn serve_connection(
                     } // close the `else` (request-budget Acquired/Unlimited path)
                 }
             },
-            RequestPath::SynthFromDecode(resp, details) => {
+            RequestPath::SynthFromDecode(resp, details, headers_only) => {
                 // 07.1 Task 6: decode-side filter short-circuit. Unreachable
                 // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation
                 // (which never short-circuits via StopAndSend on production
@@ -1413,8 +1414,15 @@ async fn serve_connection(
                 // Phase 09 ADR-0033: decorate the filter-synth response with
                 // the 5 standard HTTP/1.1 response headers if the filter did
                 // not provide them, and ALWAYS overwrite content-length from
-                // body.len() (the filter's body is the source of truth).
-                decorate_filter_synth_response(&mut outgoing, Some(connection_value(close)));
+                // body.len() (the filter's body is the source of truth) —
+                // unless the reply is headers-only (ADR-0202), whose framing
+                // header depends on whether the request was a HEAD.
+                decorate_filter_reply(
+                    &mut outgoing,
+                    headers_only,
+                    Some(connection_value(close)),
+                    req.method == "HEAD",
+                );
             }
         }
 
@@ -1430,6 +1438,7 @@ async fn serve_connection(
             headers: std::mem::take(&mut outgoing.headers),
             body: std::mem::take(&mut outgoing.body),
             details: None,
+            headers_only: false,
         };
         match pipeline.encode_headers(&mut filter_resp) {
             envoy_filter::Decision::Continue => {
@@ -1441,6 +1450,7 @@ async fn serve_connection(
             }
             envoy_filter::Decision::StopAndSend(replacement) => {
                 // Replace outgoing entirely with the filter's substitute response.
+                let headers_only = replacement.headers_only;
                 outgoing_direct = false;
                 // 110.1: a filter's substitute response IS a local reply, even
                 // when it replaced a proxied one. MEASURED upstream: an RBAC
@@ -1459,7 +1469,12 @@ async fn serve_connection(
                 // future filters that emit encode-side StopAndSend (e.g., a
                 // hypothetical RBAC-on-encode rejection) inherit the standard
                 // HTTP/1.1 response header set on the wire.
-                decorate_filter_synth_response(&mut outgoing, Some(connection_value(close)));
+                decorate_filter_reply(
+                    &mut outgoing,
+                    headers_only,
+                    Some(connection_value(close)),
+                    req.method == "HEAD",
+                );
             }
         }
 
@@ -2088,8 +2103,9 @@ pub enum BuildOutcome {
 enum RequestPath {
     Match(BuildOutcome),
     /// A decode-side filter's local reply, plus its `%RESPONSE_CODE_DETAILS%`
-    /// (phase 115: `FilterResponse::details`).
-    SynthFromDecode(Response, Option<&'static str>),
+    /// (phase 115: `FilterResponse::details`) and whether it is headers-only
+    /// (ADR-0202: `FilterResponse::headers_only`).
+    SynthFromDecode(Response, Option<&'static str>, bool),
 }
 
 /// 26 Task 2: a matched route that OWNS its route-table snapshot. With the
@@ -2554,12 +2570,14 @@ fn synth_overflow(close: bool) -> Response {
 
 /// Decorate a filter-synth response with the standard response headers
 /// (`server`, `date`, `content-length`, `content-type`, and — on HTTP/1.1 —
-/// `connection`) per phase-09 ADR-0033. Called from both H1 writer-arm sites
-/// where a filter emits `Decision::StopAndSend` (decode-side
-/// `RequestPath::SynthFromDecode` at the writer-arm match; encode-side
-/// `Decision::StopAndSend(replacement)` after the encode iteration), and —
-/// via envoy-http2's `decorate_filter_synth_response_h2` wrapper — from the
-/// H2 writer path. The 07.1-landed framework converts `FilterResponse` ↔
+/// `connection`) per phase-09 ADR-0033. Reached through
+/// [`decorate_filter_reply`] (ADR-0202) for every reply that is NOT
+/// headers-only, from both H1 writer-arm sites where a filter emits
+/// `Decision::StopAndSend` (decode-side `RequestPath::SynthFromDecode` at the
+/// writer-arm match; encode-side `Decision::StopAndSend(replacement)` after
+/// the encode iteration), and — via envoy-http2's
+/// `decorate_filter_synth_response_h2` wrapper — from the H2 writer path. The
+/// 07.1-landed framework converts `FilterResponse` ↔
 /// `Response` verbatim; filter implementations are not expected to populate
 /// the standard response headers (their responsibility ends at the
 /// application-semantic content). This helper brings filter-synth responses
@@ -2604,6 +2622,59 @@ pub fn decorate_filter_synth_response(resp: &mut Response, connection: Option<&s
         resp.headers
             .push((headers::CONTENT_LENGTH.to_string(), cl_value));
     }
+    add_standard_filter_reply_headers(resp, connection);
+}
+
+/// ADR-0202: decorate a filter's local reply, choosing its FRAMING.
+///
+/// Without `headers_only` this IS [`decorate_filter_synth_response`]
+/// (ADR-0033: `content-length` from `body.len()`), whatever the method.
+///
+/// With `headers_only` the reply is upstream's HEADERS-ONLY shape — a filter
+/// encoding headers with end-of-stream, as `envoy.filters.http.health_check`
+/// does — and carries exactly the framing header upstream's codec puts on the
+/// wire (MEASURED against v1.33.0, phase-115 `REVIEW.md` I-1/I-2):
+///
+/// - H1 (`connection` is `Some`), non-HEAD: `content-length: 0`;
+/// - H1 HEAD (`head_request`): `transfer-encoding: chunked`, NO
+///   `content-length`, and — the body being empty — no body bytes, not even a
+///   chunk terminator;
+/// - H2 (`connection` is `None`): NO framing header.
+///
+/// Any `content-length` / `transfer-encoding` the filter supplied is
+/// replaced. The standard `server` / `date` / `connection` headers follow
+/// the ADR-0033 only-if-missing rule either way.
+pub fn decorate_filter_reply(
+    resp: &mut Response,
+    headers_only: bool,
+    connection: Option<&str>,
+    head_request: bool,
+) {
+    if !headers_only {
+        decorate_filter_synth_response(resp, connection);
+        return;
+    }
+    debug_assert!(resp.body.is_empty(), "a headers-only reply has no body");
+    resp.headers.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case(headers::CONTENT_LENGTH)
+            && !k.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
+    });
+    if connection.is_some() {
+        let framing = if head_request {
+            (headers::TRANSFER_ENCODING, "chunked")
+        } else {
+            (headers::CONTENT_LENGTH, "0")
+        };
+        resp.headers
+            .push((framing.0.to_string(), framing.1.to_string()));
+    }
+    add_standard_filter_reply_headers(resp, connection);
+}
+
+/// The framing-independent half of the ADR-0033 decoration: `content-type`
+/// (only-if-missing, non-empty body only), then `server`, `date` and — on
+/// HTTP/1.1 — `connection`, each only-if-missing.
+fn add_standard_filter_reply_headers(resp: &mut Response, connection: Option<&str>) {
     // server / date / connection (when requested): add only-if-missing (always).
     // content-type: add only-if-missing AND only when the body is non-empty —
     // upstream Envoy v1.33 does not emit content-type on empty-body local
@@ -3583,6 +3654,79 @@ static_resources:
             "content-type must NOT be added for empty body; headers: {:?}",
             resp.headers
         );
+    }
+
+    /// ADR-0202: a headers-only filter reply carries exactly the framing
+    /// header its codec and method put on upstream's wire (MEASURED against
+    /// v1.33.0): H1 non-HEAD `content-length: 0`; H1 HEAD
+    /// `transfer-encoding: chunked` and NO `content-length`; H2 neither.
+    #[test]
+    fn decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method() {
+        let decorated = |connection: Option<&str>, head: bool| {
+            let mut resp = Response {
+                status: 200,
+                reason: None,
+                headers: vec![("x-a".to_string(), "1".to_string())],
+                body: bytes::Bytes::new(),
+            };
+            super::decorate_filter_reply(&mut resp, true, connection, head);
+            let names: Vec<String> = resp
+                .headers
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            names
+                .into_iter()
+                .filter(|kv| !kv.starts_with("date="))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            decorated(Some("close"), false),
+            [
+                "x-a=1",
+                "content-length=0",
+                "server=envoy-rust",
+                "connection=close"
+            ]
+        );
+        assert_eq!(
+            decorated(Some("keep-alive"), true),
+            [
+                "x-a=1",
+                "transfer-encoding=chunked",
+                "server=envoy-rust",
+                "connection=keep-alive"
+            ]
+        );
+        assert_eq!(decorated(None, false), ["x-a=1", "server=envoy-rust"]);
+        assert_eq!(decorated(None, true), ["x-a=1", "server=envoy-rust"]);
+    }
+
+    /// ADR-0202: `headers_only: false` keeps the ADR-0033 decoration exactly —
+    /// `content-length` from `body.len()`, HEAD or not.
+    #[test]
+    fn decorate_filter_reply_without_headers_only_is_the_adr_0033_decoration() {
+        for head in [false, true] {
+            let mut resp = Response {
+                status: 403,
+                reason: None,
+                headers: vec![],
+                body: bytes::Bytes::from_static(b"denied"),
+            };
+            super::decorate_filter_reply(&mut resp, false, Some("close"), head);
+            let cl = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k == headers::CONTENT_LENGTH)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(cl, Some("6"), "head={head}");
+            assert!(
+                !resp
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k == headers::TRANSFER_ENCODING)
+            );
+        }
     }
 
     // ── 04.2 header-matcher HCM integration tests ────────────────────────────
@@ -7243,6 +7387,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "8".to_string())],
             body: Bytes::from_static(b"stopped\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -7279,6 +7424,7 @@ static_resources:
                 headers: vec![],
                 body: Bytes::new(),
                 details,
+                headers_only: false,
             };
             let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
                 envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -7296,14 +7442,13 @@ static_resources:
         assert_eq!(line(None).await.trim(), "d=-");
     }
 
-    /// Phase 115: `envoy.filters.http.health_check` end to end on H1, from
-    /// bootstrap YAML through `parse_bootstrap` (which stamps `node.cluster`)
-    /// and `HCMConfig::from_config`. The wire and the access log are two
-    /// independent readings of the same two requests.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn h1_health_check_filter_end_to_end() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let log = dir.path().join("access.log");
+    /// Phase 115: an H1 HCM built from bootstrap YAML through
+    /// `parse_bootstrap` (which stamps `node.cluster`) and
+    /// `HCMConfig::from_config`: one `:path exact /healthz` health_check
+    /// filter, a `direct_response` "MAIN" route, and a file access log.
+    async fn health_check_h1_config(
+        log: &std::path::Path,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
         let yaml = format!(
             r#"
 node: {{ id: n, cluster: hc-node-cluster }}
@@ -7366,6 +7511,18 @@ static_resources:
             .await
             .expect("HCM config builds"),
         );
+        (config, registry)
+    }
+
+    /// Phase 115: `envoy.filters.http.health_check` end to end on H1, from
+    /// bootstrap YAML through `parse_bootstrap` (which stamps `node.cluster`)
+    /// and `HCMConfig::from_config`. The wire and the access log are two
+    /// independent readings of the same two requests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_filter_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("access.log");
+        let (config, registry) = health_check_h1_config(&log).await;
 
         let probe =
             |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
@@ -7377,6 +7534,12 @@ static_resources:
             "{hit}"
         );
         assert!(!hit.to_ascii_lowercase().contains("content-type"), "{hit}");
+        // ADR-0202: H1 non-HEAD headers-only framing (MEASURED upstream).
+        assert!(hit.contains("\r\ncontent-length: 0\r\n"), "{hit}");
+        assert!(
+            !hit.to_ascii_lowercase().contains("transfer-encoding"),
+            "{hit}"
+        );
         assert!(hit.ends_with("\r\n\r\n"), "empty body: {hit}");
 
         let miss =
@@ -7404,6 +7567,37 @@ static_resources:
         );
     }
 
+    /// ADR-0202 (phase-115 `REVIEW.md` I-2): an H1 `HEAD` intercept is
+    /// headers-only with `transfer-encoding: chunked` and NO `content-length`
+    /// (MEASURED upstream), and NO body bytes follow — not even a chunk
+    /// terminator — so the GET pipelined behind it on the same keep-alive
+    /// connection is read as the next request and answered normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_head_intercept_is_chunked_and_bodyless() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, _) = health_check_h1_config(&dir.path().join("access.log")).await;
+        let req = b"HEAD /healthz HTTP/1.1\r\nHost: x\r\n\r\n\
+GET /other HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let wire = String::from_utf8(drive(config, req).await).unwrap();
+        let (head_reply, rest) = wire.split_once("\r\n\r\n").expect("a reply head");
+        let head_reply = head_reply.to_ascii_lowercase();
+        assert!(head_reply.starts_with("http/1.1 200 "), "{wire}");
+        assert!(
+            head_reply.contains("\r\nx-envoy-upstream-healthchecked-cluster: hc-node-cluster"),
+            "{wire}"
+        );
+        assert!(
+            head_reply.contains("\r\ntransfer-encoding: chunked"),
+            "{wire}"
+        );
+        assert!(!head_reply.contains("content-length"), "{wire}");
+        assert!(
+            rest.starts_with("HTTP/1.1 200 "),
+            "nothing precedes the next reply: {rest:?}"
+        );
+        assert!(rest.ends_with("MAIN"), "{rest:?}");
+    }
+
     #[tokio::test]
     async fn h1_stop_and_send_at_encode_substitutes_wire_response() {
         // test-util stub: a filter that StopAndSend(418 "teapot\n") on encode.
@@ -7415,6 +7609,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: Bytes::from_static(b"teapot\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
@@ -11720,6 +11915,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "10".to_string())],
             body: Bytes::from_static(b"over limit"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -11744,6 +11940,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: Bytes::from_static(b"teapot\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),

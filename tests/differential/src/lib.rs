@@ -1097,6 +1097,12 @@ pub enum Http1Method {
     /// never driven over H2 this phase — fixture 0032 is H1-only, so
     /// `drive_http2`'s `matches!(GET | OPTIONS)` debug_assert stays unwidened.
     Post,
+    /// Phase 115 NEW: HEAD is required by fixture 0095's HEAD health probe
+    /// (`REVIEW.md` I-2). `drive_http1` reads a HEAD reply's head ONLY — the
+    /// reply has no body whatever its framing headers say — so upstream's
+    /// chunked-framed, never-closed HEAD reply is read without waiting. HEAD
+    /// is never driven over H2 (the `drive_http2` debug_assert stays).
+    Head,
 }
 
 impl Http1Method {
@@ -1105,6 +1111,7 @@ impl Http1Method {
             Http1Method::Get => "GET",
             Http1Method::Options => "OPTIONS",
             Http1Method::Post => "POST",
+            Http1Method::Head => "HEAD",
         }
     }
 }
@@ -2321,6 +2328,9 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
 /// in order, parse `Content-Length`, and read the declared body bytes (zero if
 /// no `Content-Length`). Returns status + headers + body.
 ///
+/// A `HEAD` reply's head is read and its body is empty by definition —
+/// nothing past the head is read (phase 115).
+///
 /// Framing scope: this helper only handles `Content-Length`-framed responses
 /// (the only shape produced by 04.1's `direct_response` filter). `chunked` /
 /// `connection: close` framing is the existing `drive_http_get` helper's
@@ -2407,13 +2417,21 @@ pub async fn drive_http1(
     // `content-length`. `content-length`-framed: read exactly N. Otherwise
     // (no length, no chunked): read-until-EOF (`Connection: close`-framed,
     // which is what the harness always asks for via the close header).
+    // A HEAD reply has NO body whatever its framing headers say (RFC 9110
+    // §9.3.2): read nothing past the head. Upstream answers a health-check
+    // HEAD with `transfer-encoding: chunked` and leaves the socket open even
+    // under `Connection: close` (MEASURED, phase 115), so any further read
+    // would wait out the timeout. It follows that this driver cannot see
+    // stray bytes after a HEAD reply (CF-115-14).
     //
     // 06.1 Task 13 fix: this arm previously hard-defaulted content_length
     // to 0 and only handled the `Some(content_length)` shape, so an admin
     // scrape against upstream Envoy v1.33.0's `/stats/prometheus` (which
     // ships chunked) was decoded as a 0-byte body. Mirrors `drive_http_get`'s
     // chunked handling (added in phase 01 for `/ready`).
-    let body = if chunked {
+    let body = if *method == Http1Method::Head {
+        Vec::new()
+    } else if chunked {
         // Drain the rest of the wire to EOF, then chunk-decode.
         let mut wire = buf[headers_end..].to_vec();
         loop {
@@ -11545,5 +11563,55 @@ mod drive_http1_body_tests {
             "driver set content-length: {got}"
         );
         assert!(got.ends_with("hello"), "driver appended the body: {got}");
+    }
+
+    /// Phase 115 (`REVIEW.md` I-2): a HEAD reply has no body whatever its
+    /// framing headers say (RFC 9110 §9.3.2), and upstream v1.33.0 answers a
+    /// health-check `HEAD` with `transfer-encoding: chunked` and then leaves
+    /// the socket OPEN even under `Connection: close` (MEASURED). The driver
+    /// must return at the end of the head — never wait for a chunk, a length
+    /// or an EOF that never comes.
+    #[tokio::test]
+    async fn drive_http1_head_reads_the_head_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let rec = recorded.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            rec.lock().unwrap().extend_from_slice(&buf[..n]);
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nserver: envoy\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            // Hold the socket open, as upstream does.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drive_http1(addr, &Http1Method::Head, "/healthz", "x.test", &[], None),
+        )
+        .await
+        .expect("returns at the end of the head")
+        .expect("drive_http1 must succeed");
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .starts_with(b"HEAD /healthz HTTP/1.1\r\n"),
+            "request line"
+        );
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n == "transfer-encoding" && v == "chunked")
+        );
     }
 }

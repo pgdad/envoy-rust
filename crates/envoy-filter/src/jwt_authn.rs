@@ -201,6 +201,7 @@ fn missing_reply(realm: &str) -> Decision {
         headers: vec![www_authenticate(realm, false)],
         body: Bytes::from_static(b"Jwt is missing"),
         details: None,
+        headers_only: false,
     })
 }
 
@@ -236,6 +237,7 @@ fn error_reply(e: &JwtError, realm: &str) -> Decision {
         headers: vec![www_authenticate(realm, true)],
         body: Bytes::from_static(body),
         details: None,
+        headers_only: false,
     })
 }
 

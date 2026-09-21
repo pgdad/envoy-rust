@@ -127,8 +127,9 @@ async fn serve_h2_connection(
 enum H2RequestPath {
     Match(BuildOutcome),
     /// A decode-side filter's local reply, plus its `%RESPONSE_CODE_DETAILS%`
-    /// (phase 115: `FilterResponse::details`).
-    SynthFromDecode(Response, Option<&'static str>),
+    /// (phase 115: `FilterResponse::details`) and whether it is headers-only
+    /// (ADR-0202: `FilterResponse::headers_only`).
+    SynthFromDecode(Response, Option<&'static str>, bool),
 }
 
 /// 16 Task 5: outcome of one upstream attempt inside the H2 retry loop.
@@ -553,6 +554,7 @@ async fn handle_one_stream(
                 body: filter_resp.body,
             },
             filter_resp.details,
+            filter_resp.headers_only,
         ),
     };
 
@@ -959,12 +961,13 @@ async fn handle_one_stream(
                 } // close the `else` (request-budget Acquired/Unlimited path)
             }
         },
-        H2RequestPath::SynthFromDecode(mut r, details) => {
+        H2RequestPath::SynthFromDecode(mut r, details, headers_only) => {
             // 07.1 Task 7: decode-side filter short-circuit. Phase 11 D6:
             // decorate the filter-synth response with the standard H2 response
-            // headers (closes 09 REVIEW M2 implementation arm).
+            // headers (closes 09 REVIEW M2 implementation arm); a headers-only
+            // reply gets no `content-length` (ADR-0202).
             // `upstream_host_for_log_h2` stays None (no proxy attempt).
-            crate::response::decorate_filter_synth_response_h2(&mut r);
+            crate::response::decorate_filter_synth_response_h2(&mut r, headers_only);
             // Phase 115: the filter's own details (e.g. `health_check_ok`).
             response_code_details_for_log_h2 = details.map(str::to_owned);
             (r, None)
@@ -1072,6 +1075,7 @@ async fn finalize_h2_stream(
         headers: std::mem::take(&mut resp.headers),
         body: std::mem::take(&mut resp.body),
         details: None,
+        headers_only: false,
     };
     match pipeline.encode_headers(&mut filter_resp) {
         envoy_filter::Decision::Continue => {
@@ -1081,6 +1085,7 @@ async fn finalize_h2_stream(
             resp.body = filter_resp.body;
         }
         envoy_filter::Decision::StopAndSend(replacement) => {
+            let headers_only = replacement.headers_only;
             resp = Response {
                 status: replacement.status,
                 reason: replacement.reason,
@@ -1091,7 +1096,7 @@ async fn finalize_h2_stream(
             // the standard H2 response headers (symmetric to the H1 helper's
             // encode-side wiring). No phase-11 filter takes this path, but future
             // encode-side-short-circuiting H2 filters inherit it.
-            crate::response::decorate_filter_synth_response_h2(&mut resp);
+            crate::response::decorate_filter_synth_response_h2(&mut resp, headers_only);
             // Phase 111 D-PLAN-5: the filter REPLACED the response, so the
             // upstream's trailer block no longer describes what is being sent.
             // This clear is NOT redundant with the rebuild above: under
@@ -4597,6 +4602,15 @@ static_resources:
         pipeline: Option<Arc<envoy_filter::FilterPipeline>>,
         uri: &str,
     ) -> (http::HeaderMap, String, u64) {
+        h2_response_code_details_line_with_method(pipeline, "GET", uri).await
+    }
+
+    /// `h2_response_code_details_line` with the request method chosen.
+    async fn h2_response_code_details_line_with_method(
+        pipeline: Option<Arc<envoy_filter::FilterPipeline>>,
+        method: &str,
+        uri: &str,
+    ) -> (http::HeaderMap, String, u64) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
         let sink = Arc::new(
@@ -4671,7 +4685,7 @@ static_resources:
             let _ = conn.await;
         });
         let req = http::Request::builder()
-            .method("GET")
+            .method(method)
             .uri(uri)
             .body(())
             .unwrap();
@@ -4737,6 +4751,20 @@ static_resources:
             "hc-node-cluster"
         );
         assert!(!headers.contains_key("content-type"));
+        // ADR-0202 (phase-115 `REVIEW.md` I-1): headers-only — upstream sends
+        // NO `content-length` on an H2 intercept, GET or HEAD (MEASURED).
+        assert!(!headers.contains_key("content-length"), "{headers:?}");
+        let (headers, _, _) = h2_response_code_details_line_with_method(
+            Some(Arc::clone(&pipeline)),
+            "HEAD",
+            "http://x/healthz",
+        )
+        .await;
+        assert_eq!(
+            headers["x-envoy-upstream-healthchecked-cluster"],
+            "hc-node-cluster"
+        );
+        assert!(!headers.contains_key("content-length"), "{headers:?}");
         let (_, line, rq_2xx) =
             h2_response_code_details_line(Some(pipeline), "http://x/healthz?x=1").await;
         assert_eq!(rq_2xx, 1, "a fall-through is counted");
@@ -4757,6 +4785,7 @@ static_resources:
             headers: vec![],
             body: bytes::Bytes::new(),
             details: Some("seam_probe"),
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -5602,6 +5631,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: bytes::Bytes::from_static(b"teapot\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
@@ -5706,6 +5736,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "8".to_string())],
             body: bytes::Bytes::from_static(b"stopped\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -5746,6 +5777,7 @@ static_resources:
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: bytes::Bytes::from_static(b"teapot\n"),
             details: None,
+            headers_only: false,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
