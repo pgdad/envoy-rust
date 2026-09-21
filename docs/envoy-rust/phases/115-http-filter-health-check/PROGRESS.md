@@ -269,3 +269,128 @@ And the unit-test total across `envoy-config` + `envoy-filter` + `envoy-http1` +
 `envoy-http2` is **1307 passed / 0 failed over 9 binaries**, against the plan's
 predicted post-Task-2 **1307**. Two independent invariants of the same slice,
 both landing on the predicted value.
+
+---
+
+## Task 3 — `HealthCheckFilterConfig` and `HealthCheckFilter`
+
+**Commit:** `phase 115 task 3: HealthCheckFilterConfig + HealthCheckFilter (matching, local reply, counters)`
+
+**What it is.** The config schema
+(`envoy.extensions.filters.http.health_check.v3.HealthCheck`, non-pass-through
+mode only) and the runtime filter: AND-folded `HeaderMatcher` matching, the empty
+200 local reply carrying `x-envoy-upstream-healthchecked-cluster`, and the eight
+`http.<stat_prefix>.health_check.*` counters. **Not yet reachable from a
+bootstrap** — Task 4 adds the typed-config variant.
+
+**Steps 1–2 — the config tests, RED first.** Six schema tests were added to
+`crates/envoy-config/src/bootstrap.rs` above the phase-31 `cdn_loop` banner.
+⚠ Located BY TEXT, not by a line number or "append at EOF": `bootstrap.rs`
+carries TEN column-0 `#[cfg(test)] mod` blocks and an EOF append lands inside the
+wrong one.
+
+```
+$ cargo test -p envoy-config health_check_config_tests
+      1 error[E0432]: unresolved import `crate::HealthCheckFilterConfig`
+      1 error: could not compile `envoy-config` (lib test) due to 1 previous error
+```
+
+Exactly one error — the predicted one.
+
+**Steps 3–4 — the config type, GREEN.** `HealthCheckFilterConfig` with a REQUIRED
+`pass_through_mode`, a `#[serde(default)]` `headers`, the two RECOGNIZED-then-
+rejected fields (`cache_time`, `cluster_min_healthy_percentages`) and the
+`#[serde(skip)] local_cluster` that Task 4 stamps. Re-exported from
+`crates/envoy-config/src/lib.rs`; `cargo fmt --all` re-flowed the whole `pub use`
+list, which is why that file's numstat is `17 16` rather than `1 0` — expected
+and called out by the plan.
+
+```
+$ cargo test -p envoy-config health_check_config_tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 722 filtered out
+```
+
+**Step 5 — the filter's tests, RED first.** `crates/envoy-filter/src/health_check.rs`
+was created holding ONLY the 147-line test module, extracted VERBATIM from
+`PLAN.md`'s fence by script (not retyped), plus `pub mod health_check;`:
+
+```
+$ cargo test -p envoy-filter health_check::     → 18 errors
+      2 error[E0425]: cannot find type `HealthCheckFilter` in this scope
+      1 error[E0425]: cannot find value `STAT_NAMES` in this scope
+      3 error[E0433]: cannot find type `HealthCheckFilter` in this scope
+      3 error[E0433]: cannot find type `Arc` / `Decision` / `StatsRegistry` …
+```
+
+**18** is exactly the plan's MEASURED count, and the two load-bearing names
+(`HealthCheckFilter`, `STAT_NAMES`) are among them; the rest are names the
+implementation's own `use` lines bring into scope.
+
+**Step 6 — the implementation, GREEN.** 127 lines, again extracted verbatim from
+the plan's fence. The design point `ADR-0201` correction 1 turns on: a `:path`
+matcher is evaluated against a ONE-ENTRY view `[(":path", req.path.clone())]`,
+because neither codec puts pseudo-headers into `FilterRequest::headers`; every
+other matcher name goes to `req.headers` as usual.
+
+```
+$ cargo test -p envoy-filter health_check::
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 214 filtered out
+```
+
+**Steps 7–8 — TWO mutations, both landing exactly where predicted.** Each anchor
+was asserted to occur exactly **1×** first, each run showed a forced
+`Compiling envoy-filter`, and each restore was md5-verified
+(`d87fc1d7c7f7cab3a2318e61855ccb19` on both sides, both times).
+
+| mutation | what it restores | predicted RED | MEASURED |
+|---|---|---|---|
+| `m.matches(&path_view)` → `m.matches(&req.headers)` | the naive matcher reuse `SPEC.md` §4 item 3 implies | 5 named tests | **5 passed / 5 failed** — `matched_probe_is_answered_locally`, `filter_is_method_agnostic`, `header_value_is_not_an_echo_of_the_request`, `matchers_fold_as_and`, `registers_eight_counters_and_ticks_two_per_intercept` ✓ exactly those five |
+| `req.path.clone()` → `req.path.split('?').next()…` | stripping the query string | 1 named test | **9 passed / 1 failed** — `path_matcher_sees_the_query_string` ✓ |
+
+The first mutation is the one that matters: it is the filter `SPEC.md` describes,
+and it would never have matched `:path` at all. The test suite sees it.
+**Unmutated control re-run from the same tree after the second restore, with its
+own forced rebuild: `test result: ok. 10 passed; 0 failed`.**
+
+**Step 9 — gate. ⚠ The clippy leg is DEFERRED to Task 4 BY DESIGN and that
+deferral was MEASURED, not assumed.**
+
+```
+$ cargo build --workspace --all-targets                  → BUILD=0
+$ cargo fmt --all -- --check                             → FMT=0
+$ cargo test -p envoy-config health_check_config_tests   → ok. 6 passed; 0 failed
+$ cargo test -p envoy-filter health_check::              → ok. 10 passed; 0 failed
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+CLIPPY=101
+  error: constant `PATH_PSEUDO_HEADER` is never used
+  error: fields `headers`, `local_cluster`, `request_total`, and `ok` are never read
+  error: methods `decode_headers`, `encode_headers`, and `matches` are never used
+  error: could not compile `envoy-filter` (lib) due to 3 previous errors
+files named: crates/envoy-filter/src/health_check.rs
+```
+
+**EXACTLY the three `dead_code` errors `PLAN.md` and `ADR-0201` DECISION 5
+predicted, all in that one file, and nothing else in the workspace.** The filter
+has no production consumer until Task 4 adds the typed-config variant. **No
+`#[allow]` and no `_` prefix was added** — `ADR-0194` DECISION 1, chosen so a
+forgotten suppression cannot outlive the gap. Task 4 must show clippy exit 0 with
+a non-zero `Checking` count. Every alternative ordering lands an intermediate
+commit that parses a health-check config and silently ignores part of it, the
+window `ADR-0176` DECISION 2 forbids.
+
+**Size and identity, both reproducing the plan EXACTLY.**
+
+```
+$ git diff --cached --numstat -- crates/
+83	0	crates/envoy-config/src/bootstrap.rs
+17	16	crates/envoy-config/src/lib.rs
+274	0	crates/envoy-filter/src/health_check.rs
+2	0	crates/envoy-filter/src/lib.rs
+TOTAL ins=376 del=16 net=360
+```
+
+against `PLAN.md`'s per-task row `3 — config type + filter | 376 | 16 | 360`, and
+`health_check.rs` at **274** lines against the whole-slice table's 274. The
+four-crate unit total is **1323 passed / 0 failed over 9 binaries** against the
+plan's predicted post-Task-3 **1323**.

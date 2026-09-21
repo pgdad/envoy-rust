@@ -1642,6 +1642,33 @@ pub struct CdnLoopConfig {
     pub max_allowed_occurrences: u32,
 }
 
+/// `envoy.extensions.filters.http.health_check.v3.HealthCheck` (phase 115).
+/// Only NON-pass-through mode is implemented: a request matching every
+/// `headers` entry is answered at the proxy with an empty 200.
+///
+/// `pass_through_mode` is REQUIRED (absent is a serde missing-field error,
+/// matching upstream's `HealthCheckValidationError.PassThroughMode`).
+/// `cache_time` and `cluster_min_healthy_percentages` are RECOGNIZED so that
+/// `validate_health_check_config` can reject them by name instead of serde
+/// failing with an opaque unknown-field error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckFilterConfig {
+    pub pass_through_mode: bool,
+    /// AND-combined; an EMPTY list matches every request (MEASURED).
+    #[serde(default)]
+    pub headers: Vec<HeaderMatcher>,
+    #[serde(default)]
+    pub cache_time: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub cluster_min_healthy_percentages: Option<serde_yaml::Value>,
+    /// NOT a wire field. The bootstrap `node.cluster` (empty without a
+    /// `node`), stamped by `validate_hcm`; the filter renders it as the
+    /// `x-envoy-upstream-healthchecked-cluster` response header value.
+    #[serde(skip)]
+    pub local_cluster: String,
+}
+
 /// `envoy.extensions.filters.http.set_metadata.v3.Config` (phase 33,
 /// §A1-LOCKED). The modern repeated `metadata` form. Each entry merges a flat
 /// string→string `value` map into the request's dynamic metadata under
@@ -21859,6 +21886,62 @@ admin:
             ),
             "expected UnsupportedRuntimeKeyedCsrfFilterEnabled (route override), got {err:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// phase 115: health_check filter config schema tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod health_check_config_tests {
+    use crate::HealthCheckFilterConfig;
+
+    fn parse(yaml: &str) -> Result<HealthCheckFilterConfig, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    #[test]
+    fn parses_pass_through_mode_and_headers() {
+        let cfg = parse(
+            "pass_through_mode: false\nheaders:\n  - name: \":path\"\n    string_match: { exact: /healthz }\n",
+        )
+        .expect("parses");
+        assert!(!cfg.pass_through_mode);
+        assert_eq!(cfg.headers.len(), 1);
+        assert_eq!(cfg.headers[0].name, ":path");
+        assert_eq!(cfg.local_cluster, "", "not a wire field; stamped later");
+    }
+
+    #[test]
+    fn absent_headers_default_to_empty() {
+        let cfg = parse("pass_through_mode: false\n").expect("parses");
+        assert!(cfg.headers.is_empty());
+    }
+
+    #[test]
+    fn pass_through_mode_is_required() {
+        let err = parse("headers: []\n").expect_err("absent pass_through_mode");
+        assert!(err.to_string().contains("pass_through_mode"), "{err}");
+    }
+
+    #[test]
+    fn recognizes_the_two_rejected_fields() {
+        let cfg = parse(
+            "pass_through_mode: true\ncache_time: 5s\ncluster_min_healthy_percentages: { c: { value: 50 } }\n",
+        )
+        .expect("recognized, rejected later by the validator");
+        assert!(cfg.cache_time.is_some());
+        assert!(cfg.cluster_min_healthy_percentages.is_some());
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        assert!(parse("pass_through_mode: false\nbogus: 1\n").is_err());
+    }
+
+    #[test]
+    fn local_cluster_is_not_a_wire_field() {
+        assert!(parse("pass_through_mode: false\nlocal_cluster: x\n").is_err());
     }
 }
 
