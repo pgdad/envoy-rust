@@ -1955,6 +1955,78 @@ generic HCM `downstream_rq_{2xx,4xx,5xx}`). **Deferred non-goals (ADR-0076):** p
 `typed_per_filter_config` for cdn_loop; RFC 8586 `cdn-info` parameter semantics beyond counting;
 encode-side behavior (cdn_loop is request-only).
 
+**health_check filter, non-pass-through mode (ADR-0200 SPEC / ADR-0201).**
+
+> The HTTP-filter family's eleventh row. `envoy.filters.http.health_check` answers a downstream
+> liveness probe AT THE PROXY: a request matching every configured header matcher is
+> short-circuited with a local reply and never reaches the route; anything else continues down
+> the chain. Decode-side only, no per-route config. Differentially proven by fixtures
+> `0095-http-filter-health-check` (ten probes, the wire) and `0096-http-filter-health-check-stats`
+> (the counters) against `envoyproxy/envoy:v1.33.0`.
+
+**health_check intercept wire shape (MEASURED).**
+
+- Status **200**; body EMPTY (`content-length: 0`); **NO `content-type`** — the filter-synth
+  decorators add it only for a non-empty body.
+- One filter header, `x-envoy-upstream-healthchecked-cluster`, whose value is the bootstrap
+  **`node.cluster`** — empty only when the bootstrap has no `node` (or an empty `cluster`). It is
+  NOT an upstream cluster (an unrelated static cluster does not change it) and NOT an echo (a
+  request carrying the header with any value still gets `node.cluster` back). envoy-rust stamps it
+  into the filter config in `validate_hcm`, so LDS-delivered listeners carry it too.
+- `server`, `date` and (under a `Connection: close` request) `connection: close`, as for every
+  filter-synth reply. Compared set-equal modulo the header allow-list; the filter header is
+  value-compared.
+- Access log: `%RESPONSE_CODE_DETAILS%` = **`health_check_ok`**, `%RESPONSE_FLAGS%` = `-`,
+  `%BYTES_SENT%` = `0`. It is the first landed filter to set a response-code detail; the value
+  travels on `FilterResponse::details` and is read only on the decode-side `StopAndSend` path.
+
+**health_check matching rule (MEASURED).**
+
+- The `headers` list is AND-combined over the landed seven-mode `HeaderMatcher`; an absent or
+  empty list matches EVERY request.
+- **`:path` is matched WITH its query string**: `exact: /healthz` does not match `/healthz?x=1`.
+  Exact is exact (`/healthz/` falls through) and the value match is case-sensitive (`/healthZ`
+  falls through).
+- The filter is method-agnostic (`POST /healthz` with a body is intercepted).
+- Chain order is declaration order: `[health_check, fault(abort 100%)]` answers `/healthz` with
+  200; `[fault, health_check]` answers it with the fault's 503.
+- envoy-rust feeds a `:path` matcher `FilterRequest::path` verbatim (both codecs keep the query
+  there); no codec puts pseudo-headers into the filter-visible header list.
+
+**health_check stats (MEASURED).**
+
+- Eight counters are REGISTERED at config load under `http.<stat_prefix>.health_check.`:
+  `cached_response`, `degraded`, `failed`, `failed_cluster_empty`, `failed_cluster_not_found`,
+  `failed_cluster_unhealthy`, `ok`, `request_total`. An intercept ticks `request_total` and `ok`;
+  a fall-through ticks none. The other six stay `0` in non-pass-through mode.
+- **An intercepted request is NOT counted in `downstream_rq_2xx`** (nor, upstream, in
+  `downstream_rq_completed`); it IS counted in `downstream_rq_total`. envoy-rust skips its
+  `downstream_rq_{2,3,4,5}xx` tick for a response whose detail is `health_check_ok`, on both
+  codecs.
+
+**health_check config validity (ALL BOOT-FATAL — ADR-0049).**
+
+- `pass_through_mode` is REQUIRED on both sides. `@type` =
+  `type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck`.
+- **Recorded REJECT-direction divergences** — upstream ACCEPTS, envoy-rust rejects with
+  `ConfigError::UnsupportedHealthCheckField`: `pass_through_mode: true` (CF-115-5), any
+  `cache_time` (CF-115-5; upstream rejects it only when `pass_through_mode` is `false`, with a
+  message that misspells the field `path_through_mode` — envoy-rust does NOT reproduce the typo,
+  §7.4), and any `cluster_min_healthy_percentages` (CF-115-1).
+- A matcher naming `:method`, `:authority`, `:scheme` or any other `:`-prefixed name except
+  `:path` is rejected with `ConfigError::UnsupportedHealthCheckPseudoHeader`; upstream MATCHES all
+  three (CF-115-6). `host` is an ordinary header on both sides.
+- Each matcher runs the shared `HeaderMatcher` validation (empty name, bad regex, bad range).
+
+**health_check — measured behaviour envoy-rust does NOT match.**
+
+- After `POST /healthcheck/fail` on the admin listener upstream answers a probe with **503**
+  and decorates NON-health-check responses too with `x-envoy-immediate-health-check-fail: true`
+  and `connection: close` — an HCM-level behaviour no landed driver can witness (CF-115-2).
+- Upstream ticks `http.<stat_prefix>.tracing.health_check` per intercept; envoy-rust has no
+  `tracing.*` HCM stat family (CF-115-7).
+- The H2 behaviour is pinned in-process only; there is no H2 differential witness (CF-115-4).
+
 **H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
 
 > When an upstream H1 response carries `Connection: close`, the H1 connection

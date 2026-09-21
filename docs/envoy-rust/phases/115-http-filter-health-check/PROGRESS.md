@@ -769,3 +769,78 @@ TOTAL ins=197 del=0 net=197
 ```
 
 against `PLAN.md`'s row `7 — fixture 0096 | 197 | 0 | 197`.
+
+---
+
+## Task 8 — `BEHAVIOR_CONTRACT.md`: the health_check section
+
+**Commit:** `phase 115 task 8: BEHAVIOR_CONTRACT — the health_check filter section`
+
+The only `docs/` change in the phase, and the only task EXCLUDED from the §6.1
+LoC gate. The anchor was asserted unique first
+(`grep -cF '**H1 upstream connection-pool …'` = **1**, at file line 1958, with the
+`cdn_loop` blocks immediately above — where the HTTP-filter wire contracts live),
+and the 71-line block was extracted from `PLAN.md`'s fence by script.
+
+```
+$ git diff --numstat docs/envoy-rust/BEHAVIOR_CONTRACT.md
+72	0	docs/envoy-rust/BEHAVIOR_CONTRACT.md
+```
+
+**Additions only, deletions 0**, as the plan requires. The section records the
+intercept wire shape, the matching rule (including that `:path` carries the query
+string and that chain order is declaration order), the eight counters and the
+`downstream_rq_2xx` exclusion, the four boot-fatal config rejections with their
+REJECT-direction divergences named, and the three measured upstream behaviours
+envoy-rust does NOT match (CF-115-2, CF-115-7, CF-115-4).
+
+### ⚠ Citation damage this phase causes — MEASURED, and deliberately NOT repaired
+
+A phase invalidates `file:line` citations it does not own. The blast radius was
+DERIVED rather than sampled: for each file this phase MODIFIED (creations cannot
+invalidate anything), the earliest OLD line its diff touches, then every
+`…<file>.rs:<n>` / `…<file>.md:<n>` citation in the seven top-level documents
+classified against it.
+
+| modified file | first changed OLD line |
+|---|---:|
+| `crates/envoy-config/src/bootstrap.rs` | 1527 |
+| `crates/envoy-config/src/lib.rs` | 27 |
+| `crates/envoy-filter/src/cors.rs` | 224 |
+| `crates/envoy-filter/src/instance.rs` | 27 |
+| `crates/envoy-filter/src/jwt_authn.rs` | 202 |
+| `crates/envoy-filter/src/lib.rs` | 16 |
+| `crates/envoy-filter/src/local_rate_limit.rs` | 150 |
+| `crates/envoy-filter/src/pipeline.rs` | 222 |
+| `crates/envoy-filter/src/router.rs` | 62 |
+| `crates/envoy-filter/src/types.rs` | 54 |
+| `crates/envoy-http1/src/hcm.rs` | 935 |
+| `crates/envoy-http2/src/hcm.rs` | 129 |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | 1957 |
+
+| document | invalidated | of which unambiguous | still valid |
+|---|---:|---:|---:|
+| `MISSION.md` | 0 | 0 | 0 |
+| `STATE.md` | 45 | 17 | 5 |
+| `ROADMAP.md` | 99 | 34 | 18 |
+| `BEHAVIOR_CONTRACT.md` | 15 | 1 | 4 |
+| `SKILL_ROUTING.md` | 0 | 0 | 0 |
+| `ENVOY_TARGET.md` | 0 | 0 | 0 |
+| `DECISIONS.md` | 465 | 220 | 153 |
+| **TOTAL** | **624** | **272** | **180** |
+
+⚠ **The figure is an UPPER BOUND and the method is why.** A bare `hcm.rs:<n>`
+citation cannot be attributed to `envoy-http1` or `envoy-http2` from its text, so
+an ambiguous basename is classified against the EARLIER of the two thresholds.
+The "unambiguous" column is the subset whose path prefix resolves to exactly one
+modified file; the truth lies between 272 and 624.
+
+**Nothing is repaired, and that is the standing discipline, not laziness.**
+`DECISIONS.md` is append-only (D-3.5), so its 465 are structurally
+un-repairable and always have been; `ROADMAP.md` is untouchable this phase (its
+row `115` stays `planned` until the state-6 close-out, and it already carries an
+off-by-one from the phase-115 row insert); `STATE.md`'s citations sit in
+narrative that each session supersedes or relocates anyway. **RE-ANCHOR ON TEXT
+when following any of these; do not mass-repair.** The one live document this
+phase both edits and cites into is `BEHAVIOR_CONTRACT.md`, and its 15 are all
+`hcm.rs`/`bootstrap.rs` citations — 1 of them unambiguous.
