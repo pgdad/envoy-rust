@@ -1121,12 +1121,19 @@ async fn finalize_h2_stream(
     // from `resp` (see the comment block above); it reflects whichever branch
     // (Continue or StopAndSend) determined the final response. 13.2 D6: the
     // `HCMConfig` wrapper now hosts the H1 stats via `config.inner.stats`.
-    match response_status_for_log / 100 {
-        2 => config.inner.stats.downstream_rq_2xx.inc(),
-        3 => config.inner.stats.downstream_rq_3xx.inc(),
-        4 => config.inner.stats.downstream_rq_4xx.inc(),
-        5 => config.inner.stats.downstream_rq_5xx.inc(),
-        _ => {}
+    //
+    // Phase 115 (MEASURED): a request the health_check filter answered is NOT
+    // counted here.
+    if response_code_details_for_log_h2.as_deref()
+        != Some(envoy_filter::health_check::HEALTH_CHECK_OK)
+    {
+        match response_status_for_log / 100 {
+            2 => config.inner.stats.downstream_rq_2xx.inc(),
+            3 => config.inner.stats.downstream_rq_3xx.inc(),
+            4 => config.inner.stats.downstream_rq_4xx.inc(),
+            5 => config.inner.stats.downstream_rq_5xx.inc(),
+            _ => {}
+        }
     }
 
     // 06.2: per-stream access-log dispatch on the H2 path. Mirrors the
@@ -4686,6 +4693,57 @@ static_resources:
             line.contains("d=direct_response"),
             "direct_response route → %RESPONSE_CODE_DETAILS% renders `direct_response`; got: {}",
             line.trim()
+        );
+    }
+
+    /// Phase 115: `envoy.filters.http.health_check` on H2 (CF-115-4 pins the
+    /// H2 cell in-process only): the `:path` matcher sees the query string, a
+    /// match carries the stamped `local_cluster` and logs `health_check_ok`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_health_check_filter_intercepts_and_logs() {
+        let cfg = envoy_config::HealthCheckFilterConfig {
+            pass_through_mode: false,
+            headers: vec![HeaderMatcher {
+                name: ":path".to_string(),
+                mode: HeaderMatcherMode::ExactMatch("/healthz".to_string()),
+                invert_match: false,
+            }],
+            cache_time: None,
+            cluster_min_healthy_percentages: None,
+            local_cluster: "hc-node-cluster".to_string(),
+        };
+        let pipeline = envoy_filter::FilterPipeline::build_from_config(
+            &[
+                HttpFilter {
+                    name: "envoy.filters.http.health_check".to_string(),
+                    typed_config: HttpFilterTypedConfig::HealthCheck(cfg),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+            &Arc::new(envoy_stats::StatsRegistry::new()),
+            "ingress_http_h2",
+        )
+        .expect("pipeline builds");
+        let pipeline = Arc::new(pipeline);
+        let (headers, line, rq_2xx) =
+            h2_response_code_details_line(Some(Arc::clone(&pipeline)), "http://x/healthz").await;
+        assert_eq!(line.trim(), "d=health_check_ok");
+        assert_eq!(rq_2xx, 0, "the intercept is not counted");
+        assert_eq!(
+            headers["x-envoy-upstream-healthchecked-cluster"],
+            "hc-node-cluster"
+        );
+        assert!(!headers.contains_key("content-type"));
+        let (_, line, rq_2xx) =
+            h2_response_code_details_line(Some(pipeline), "http://x/healthz?x=1").await;
+        assert_eq!(rq_2xx, 1, "a fall-through is counted");
+        assert_eq!(
+            line.trim(),
+            "d=direct_response",
+            "the query string falls through"
         );
     }
 

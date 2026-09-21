@@ -1531,12 +1531,19 @@ async fn serve_connection(
         // Status codes outside [200, 600) silently no-op — 1xx informational
         // and non-standard 6xx codes are not in the per-class counter family
         // per Envoy v1.33.0 stats docs.
-        match response_status_for_log / 100 {
-            2 => config.stats.downstream_rq_2xx.inc(),
-            3 => config.stats.downstream_rq_3xx.inc(),
-            4 => config.stats.downstream_rq_4xx.inc(),
-            5 => config.stats.downstream_rq_5xx.inc(),
-            _ => {}
+        //
+        // Phase 115 (MEASURED): a request the health_check filter answered is
+        // NOT counted here.
+        if response_code_details_for_log.as_deref()
+            != Some(envoy_filter::health_check::HEALTH_CHECK_OK)
+        {
+            match response_status_for_log / 100 {
+                2 => config.stats.downstream_rq_2xx.inc(),
+                3 => config.stats.downstream_rq_3xx.inc(),
+                4 => config.stats.downstream_rq_4xx.inc(),
+                5 => config.stats.downstream_rq_5xx.inc(),
+                _ => {}
+            }
         }
 
         // 06.2 Task 6: factored access-log dispatch site. Per PLAN-write
@@ -7287,6 +7294,114 @@ static_resources:
         }
         assert_eq!(line(Some("seam_probe")).await.trim(), "d=seam_probe");
         assert_eq!(line(None).await.trim(), "d=-");
+    }
+
+    /// Phase 115: `envoy.filters.http.health_check` end to end on H1, from
+    /// bootstrap YAML through `parse_bootstrap` (which stamps `node.cluster`)
+    /// and `HCMConfig::from_config`. The wire and the access log are two
+    /// independent readings of the same two requests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_filter_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("access.log");
+        let yaml = format!(
+            r#"
+node: {{ id: n, cluster: hc-node-cluster }}
+static_resources:
+  listeners:
+    - name: l
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {log}
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ(:PATH)%|%RESPONSE_CODE_DETAILS%|%RESPONSE_FLAGS%|%BYTES_SENT%\n"
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: MAIN }} }}
+                http_filters:
+                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                      pass_through_mode: false
+                      headers:
+                        - {{ name: ":path", string_match: {{ exact: /healthz }} }}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#,
+            log = log.display()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap loads");
+        let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) =
+            &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0].typed_config
+        else {
+            panic!("HCM expected");
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let config = Arc::new(
+            HCMConfig::from_config(
+                hcm,
+                cluster_mgr_empty().await,
+                Arc::clone(&registry),
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCM config builds"),
+        );
+
+        let probe =
+            |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let hit = String::from_utf8(drive(Arc::clone(&config), probe("/healthz").as_bytes()).await)
+            .unwrap();
+        assert!(hit.starts_with("HTTP/1.1 200 "), "{hit}");
+        assert!(
+            hit.contains("\r\nx-envoy-upstream-healthchecked-cluster: hc-node-cluster\r\n"),
+            "{hit}"
+        );
+        assert!(!hit.to_ascii_lowercase().contains("content-type"), "{hit}");
+        assert!(hit.ends_with("\r\n\r\n"), "empty body: {hit}");
+
+        let miss =
+            String::from_utf8(drive(config, probe("/healthz?x=1").as_bytes()).await).unwrap();
+        assert!(miss.ends_with("MAIN"), "query string falls through: {miss}");
+        let count = |name: &str| {
+            registry
+                .register_counter(&format!("http.ingress_http.{name}"))
+                .unwrap()
+                .value()
+        };
+        assert_eq!(count("downstream_rq_total"), 2);
+        assert_eq!(
+            count("downstream_rq_2xx"),
+            1,
+            "the intercept is not counted"
+        );
+        assert_eq!(count("health_check.request_total"), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let lines = tokio::fs::read_to_string(&log).await.expect("log");
+        assert_eq!(
+            lines,
+            "/healthz|health_check_ok|-|0\n/healthz?x=1|direct_response|-|4\n"
+        );
     }
 
     #[tokio::test]

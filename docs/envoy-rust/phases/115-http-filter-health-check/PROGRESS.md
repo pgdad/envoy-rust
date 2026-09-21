@@ -501,3 +501,95 @@ trimmed to chase the number. `ADR-0198` reconciliation precedent; `PLAN.md`'s
 **The test-count identity, by contrast, is EXACT:** the four-crate unit total is
 **1331 passed / 0 failed over 9 binaries**, against the plan's predicted
 post-Task-4 **1331**.
+
+---
+
+## Task 5 — An intercepted probe is not counted in `downstream_rq_Nxx`; the H1/H2 end-to-end pins
+
+**Commit:** `phase 115 task 5: an intercepted health-check probe is not counted in downstream_rq_Nxx; H1/H2 end-to-end pins`
+
+**What it is.** `ADR-0201` correction 4's most consequential half. Upstream
+MEASURED: an intercepted probe IS counted in `downstream_rq_total` and
+`downstream_rq_http1_total` but is **NOT** counted in `downstream_rq_2xx` (nor
+`downstream_rq_completed`). envoy-rust already emits `downstream_rq_2xx`, so
+shipping the filter without the exclusion would have CREATED a divergence on a
+landed, contracted stat. The discriminator is the `health_check_ok` detail
+string: exactly one producer sets it, and it is already live at both tick sites,
+so no new flag is threaded.
+
+**Steps 1–2 — RED, and ONLY on the counter.** Two end-to-end tests. The H1 one
+goes through real bootstrap YAML → `parse_bootstrap` (which does the `node.cluster`
+stamping) → `HCMConfig::from_config` → the wire, and reads the access log as an
+INDEPENDENT second witness of the same two requests. The H2 one reuses Task 2's
+generalised `h2_response_code_details_line` (CF-115-4 pins the H2 cell in-process
+only — there is no H2 fixture).
+
+```
+H1: panicked at crates/envoy-http1/src/hcm.rs:7385:9:
+    assertion `left == right` failed: the intercept is not counted
+      left: 2
+     right: 1
+H2: panicked at crates/envoy-http2/src/hcm.rs:4727:9:
+    assertion `left == right` failed: the intercept is not counted
+      left: 1
+     right: 0
+```
+
+**Exactly the two predicted failures, and nothing else in either test.** That is
+the load-bearing observation: every OTHER assertion — the 200, the
+`x-envoy-upstream-healthchecked-cluster: hc-node-cluster` header, the absent
+`content-type`, the empty body, `/healthz?x=1` falling through to `MAIN`,
+`downstream_rq_total == 2`, `health_check.request_total == 1`, and the exact
+access-log text `/healthz|health_check_ok|-|0\n/healthz?x=1|direct_response|-|4\n` —
+**already passed before this task's change**, which is an end-to-end confirmation
+that Tasks 2, 3 and 4 compose correctly through real YAML.
+
+**Steps 3–4 — the exclusion**, guarding the existing per-class `match` on both
+codecs with `response_code_details_for_log(_h2).as_deref() != Some(HEALTH_CHECK_OK)`.
+
+**Step 5 — GREEN.** `cargo test -p envoy-http1 -p envoy-http2` → 5 binaries,
+5 `ok` rows, 0 `FAILED` rows, **373 passed / 0 failed**.
+
+**Step 6 — MUTATION.** Anchor asserted to occur exactly **1×**;
+`!= Some(envoy_filter::health_check::HEALTH_CHECK_OK)` → `!= Some("__never__")`
+(i.e. the guard is present but can never fire):
+
+```
+   Compiling envoy-http1 v0.0.0 (…)
+assertion `left == right` failed: the intercept is not counted
+  left: 2
+ right: 1
+test result: FAILED. 0 passed; 1 failed; …
+```
+
+Restored md5-identical (`6fb5a7d70e3daef38a2906887efe07b2`); the unmutated
+control re-run GREEN from the same tree with its own forced rebuild.
+
+**Step 7 — gate, all green.**
+
+```
+$ cargo build --workspace --all-targets                                  → BUILD=0
+$ cargo fmt --all -- --check                                             → FMT=0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings   → CLIPPY=0
+                                    7 `Checking` lines, 0 warning/error rows
+```
+
+**Size and identity, both reproducing the plan EXACTLY.**
+
+```
+$ git diff --cached --numstat -- crates/
+121	6	crates/envoy-http1/src/hcm.rs
+64	6	crates/envoy-http2/src/hcm.rs
+TOTAL ins=185 del=12 net=173
+```
+
+against `PLAN.md`'s row `5 — counter exclusion + end-to-end pins | 185 | 12 | 173`.
+The four-crate unit total is **1333 passed / 0 failed over 9 binaries**, the
+plan's exact predicted post-Task-5 figure — the FOURTH consecutive task whose
+test identity lands on the prediction.
+
+**Cumulative code size after Task 5:** `git diff --numstat 74f2e12 -- crates/` =
+`ins=953 del=55 net=898`, against the plan's whole-slice `crates/` total of
+**897**. The single line of divergence is Task 4's recorded `bootstrap.rs` blank
+separator and nothing else; `crates/` is otherwise line-for-line the measured
+prototype.
