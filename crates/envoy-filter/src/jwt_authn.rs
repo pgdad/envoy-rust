@@ -200,6 +200,7 @@ fn missing_reply(realm: &str) -> Decision {
         reason: Some("Unauthorized"),
         headers: vec![www_authenticate(realm, false)],
         body: Bytes::from_static(b"Jwt is missing"),
+        details: None,
     })
 }
 
@@ -234,6 +235,7 @@ fn error_reply(e: &JwtError, realm: &str) -> Decision {
         reason: Some(reason),
         headers: vec![www_authenticate(realm, true)],
         body: Bytes::from_static(body),
+        details: None,
     })
 }
 

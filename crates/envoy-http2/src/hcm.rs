@@ -126,7 +126,9 @@ async fn serve_h2_connection(
 #[allow(dead_code)] // SynthFromDecode unused under 07.1 Router-only chain; 07.2 lights it up.
 enum H2RequestPath {
     Match(BuildOutcome),
-    SynthFromDecode(Response),
+    /// A decode-side filter's local reply, plus its `%RESPONSE_CODE_DETAILS%`
+    /// (phase 115: `FilterResponse::details`).
+    SynthFromDecode(Response, Option<&'static str>),
 }
 
 /// 16 Task 5: outcome of one upstream attempt inside the H2 retry loop.
@@ -543,14 +545,15 @@ async fn handle_one_stream(
                 /* close = */ false,
             ))
         }
-        envoy_filter::Decision::StopAndSend(filter_resp) => {
-            H2RequestPath::SynthFromDecode(Response {
+        envoy_filter::Decision::StopAndSend(filter_resp) => H2RequestPath::SynthFromDecode(
+            Response {
                 status: filter_resp.status,
                 reason: filter_resp.reason,
                 headers: filter_resp.headers,
                 body: filter_resp.body,
-            })
-        }
+            },
+            filter_resp.details,
+        ),
     };
 
     // 06.2 Task 7: per-stream access-log state. Populated below as the
@@ -561,8 +564,9 @@ async fn handle_one_stream(
     let mut upstream_host_for_log_h2: Option<String> = None;
     // phase 42 (ADR-0099): per-stream %RESPONSE_CODE_DETAILS%. Set by the synth
     // match arm (carries the BuildOutcome detail) and the proxy-success arm
-    // (`via_upstream`); error/filter synths leave it None.
-    let mut response_code_details_for_log_h2: Option<String> = None;
+    // (`via_upstream`); a decode-side filter synth copies
+    // `FilterResponse::details` (phase 115).
+    let mut response_code_details_for_log_h2: Option<String>;
     // phase 43 (ADR-0100): per-stream %UPSTREAM_CLUSTER%. Set at the proxy
     // ARM ENTRY (route resolved to a cluster) — NOT gated on upstream success,
     // mirroring Envoy; threaded into `finalize_h2_stream` like
@@ -955,12 +959,14 @@ async fn handle_one_stream(
                 } // close the `else` (request-budget Acquired/Unlimited path)
             }
         },
-        H2RequestPath::SynthFromDecode(mut r) => {
+        H2RequestPath::SynthFromDecode(mut r, details) => {
             // 07.1 Task 7: decode-side filter short-circuit. Phase 11 D6:
             // decorate the filter-synth response with the standard H2 response
             // headers (closes 09 REVIEW M2 implementation arm).
             // `upstream_host_for_log_h2` stays None (no proxy attempt).
             crate::response::decorate_filter_synth_response_h2(&mut r);
+            // Phase 115: the filter's own details (e.g. `health_check_ok`).
+            response_code_details_for_log_h2 = details.map(str::to_owned);
             (r, None)
         }
     };
@@ -1065,6 +1071,7 @@ async fn finalize_h2_stream(
         reason: resp.reason,
         headers: std::mem::take(&mut resp.headers),
         body: std::mem::take(&mut resp.body),
+        details: None,
     };
     match pipeline.encode_headers(&mut filter_resp) {
         envoy_filter::Decision::Continue => {
@@ -4579,7 +4586,10 @@ static_resources:
     /// access-log record per response-path, threaded from `handle_one_stream`
     /// into `finalize_h2_stream`. A `direct_response` route over H2 →
     /// `%RESPONSE_CODE_DETAILS%` renders `direct_response`.
-    async fn h2_response_code_details_line() -> String {
+    async fn h2_response_code_details_line(
+        pipeline: Option<Arc<envoy_filter::FilterPipeline>>,
+        uri: &str,
+    ) -> (http::HeaderMap, String, u64) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
         let sink = Arc::new(
@@ -4641,7 +4651,11 @@ static_resources:
         .await
         .expect("build HCM config");
         built.access_log = vec![sink];
+        if let Some(p) = pipeline {
+            built.filter_pipeline = p;
+        }
         let config = Arc::new(built);
+        let stats = Arc::clone(&config.stats);
 
         let (addr, _server) = spawn_h2_hcm(config).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -4651,28 +4665,48 @@ static_resources:
         });
         let req = http::Request::builder()
             .method("GET")
-            .uri("http://test.example/")
+            .uri(uri)
             .body(())
             .unwrap();
         let (response_fut, _) = send_request.send_request(req, true).unwrap();
-        let resp = response_fut.await.expect("response");
-        let mut body = resp.into_body();
+        let (parts, mut body) = response_fut.await.expect("response").into_parts();
         while let Some(chunk) = body.data().await {
             let chunk = chunk.unwrap();
             let _ = body.flow_control().release_capacity(chunk.len());
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        tokio::fs::read_to_string(&path).await.unwrap_or_default()
+        let line = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        (parts.headers, line, stats.downstream_rq_2xx.value())
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn hcm_h2_sets_response_code_details_from_response_path() {
-        let line = h2_response_code_details_line().await;
+        let (_, line, _) = h2_response_code_details_line(None, "http://test.example/").await;
         assert!(
             line.contains("d=direct_response"),
             "direct_response route → %RESPONSE_CODE_DETAILS% renders `direct_response`; got: {}",
             line.trim()
         );
+    }
+
+    /// Phase 115: a decode-side filter's `FilterResponse::details` is the H2
+    /// access-log record's `%RESPONSE_CODE_DETAILS%`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_decode_stop_and_send_details_reach_the_access_log() {
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+            details: Some("seam_probe"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let (_, line, _) =
+            h2_response_code_details_line(Some(pipeline), "http://test.example/").await;
+        assert_eq!(line.trim(), "d=seam_probe");
     }
 
     /// phase 43 Task 4 (H2): a request routed to a cluster → the access-log
@@ -5509,6 +5543,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: bytes::Bytes::from_static(b"teapot\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
@@ -5612,6 +5647,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "8".to_string())],
             body: bytes::Bytes::from_static(b"stopped\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -5651,6 +5687,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: bytes::Bytes::from_static(b"teapot\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),

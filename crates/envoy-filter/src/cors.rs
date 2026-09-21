@@ -222,6 +222,7 @@ fn build_preflight_response(policy: &CompiledCorsPolicy, origin: &str) -> Filter
         reason: Some("OK"),
         headers,
         body: Bytes::new(),
+        details: None,
     }
 }
 

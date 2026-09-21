@@ -60,6 +60,7 @@ mod tests {
             reason: None,
             headers: vec![("content-length".to_string(), "5".to_string())],
             body: Bytes::from_static(b"hello"),
+            details: None,
         };
         let before = resp.clone();
         let decision = router.encode_headers(&mut resp);

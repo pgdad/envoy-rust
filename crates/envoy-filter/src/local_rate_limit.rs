@@ -148,6 +148,7 @@ impl LocalRateLimitFilter {
                 reason: Some("Too Many Requests"),
                 headers,
                 body: Bytes::from_static(b"local_rate_limited"),
+                details: None,
             })
         }
     }
@@ -540,6 +541,7 @@ mod tests {
             reason: Some("OK"),
             headers: Vec::new(),
             body: bytes::Bytes::new(),
+            details: None,
         };
         let decision = filter.encode_headers(&mut resp);
         assert!(matches!(decision, Decision::Continue));

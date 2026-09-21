@@ -52,6 +52,12 @@ pub struct FilterResponse {
     pub reason: Option<&'static str>,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
+    /// Phase 115: the `%RESPONSE_CODE_DETAILS%` value of a filter's local
+    /// reply. Read ONLY on the decode-side `StopAndSend` path, where both
+    /// HCMs copy it into the access-log record; `None` renders `-`. Every
+    /// filter that predates phase 115 sets `None` (unchanged behaviour); the
+    /// encode side and the Continue write-back ignore it.
+    pub details: Option<&'static str>,
 }
 
 impl FilterResponse {
@@ -69,6 +75,7 @@ impl FilterResponse {
             reason,
             headers: Vec::new(),
             body: Bytes::from_static(body),
+            details: None,
         }
     }
 }
@@ -112,6 +119,7 @@ impl FilterResponse {
             reason: None,
             headers: vec![],
             body: Bytes::new(),
+            details: None,
         }
     }
 }

@@ -932,12 +932,15 @@ async fn serve_connection(
             }
             envoy_filter::Decision::StopAndSend(filter_resp) => {
                 // Convert FilterResponse → codec-native Response.
-                RequestPath::SynthFromDecode(Response {
-                    status: filter_resp.status,
-                    reason: filter_resp.reason,
-                    headers: filter_resp.headers,
-                    body: filter_resp.body,
-                })
+                RequestPath::SynthFromDecode(
+                    Response {
+                        status: filter_resp.status,
+                        reason: filter_resp.reason,
+                        headers: filter_resp.headers,
+                        body: filter_resp.body,
+                    },
+                    filter_resp.details,
+                )
             }
         };
 
@@ -958,8 +961,9 @@ async fn serve_connection(
         let mut upstream_cluster_for_log: Option<String> = None;
         // phase 42 (ADR-0099): per-request %RESPONSE_CODE_DETAILS%. Set by the
         // synth writer-arm (carries the BuildOutcome detail) and the
-        // proxy-success arm (`via_upstream`); error/filter synths leave it None.
-        let mut response_code_details_for_log: Option<String> = None;
+        // proxy-success arm (`via_upstream`); a decode-side filter synth copies
+        // `FilterResponse::details` (phase 115).
+        let mut response_code_details_for_log: Option<String>;
         // phase 51 (ADR-0108): per-request %RESPONSE_FLAGS% = "URX" discriminator.
         // URX (UpstreamRetryLimitExceeded) is the FIRST flag NOT 1:1 with a unique
         // %RESPONSE_CODE_DETAILS% — the retry-limit-exceeded path's rcd is the
@@ -1396,7 +1400,7 @@ async fn serve_connection(
                     } // close the `else` (request-budget Acquired/Unlimited path)
                 }
             },
-            RequestPath::SynthFromDecode(resp) => {
+            RequestPath::SynthFromDecode(resp, details) => {
                 // 07.1 Task 6: decode-side filter short-circuit. Unreachable
                 // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation
                 // (which never short-circuits via StopAndSend on production
@@ -1404,6 +1408,8 @@ async fn serve_connection(
                 // production filter to emit StopAndSend with a sparse header
                 // list). `upstream_host_for_log` stays None (no proxy attempt).
                 outgoing = resp;
+                // Phase 115: the filter's own details (e.g. `health_check_ok`).
+                response_code_details_for_log = details.map(str::to_owned);
                 // Phase 09 ADR-0033: decorate the filter-synth response with
                 // the 5 standard HTTP/1.1 response headers if the filter did
                 // not provide them, and ALWAYS overwrite content-length from
@@ -1423,6 +1429,7 @@ async fn serve_connection(
             reason: outgoing.reason,
             headers: std::mem::take(&mut outgoing.headers),
             body: std::mem::take(&mut outgoing.body),
+            details: None,
         };
         match pipeline.encode_headers(&mut filter_resp) {
             envoy_filter::Decision::Continue => {
@@ -2073,7 +2080,9 @@ pub enum BuildOutcome {
 /// factored site without consulting the writer arms or `build_response`.
 enum RequestPath {
     Match(BuildOutcome),
-    SynthFromDecode(Response),
+    /// A decode-side filter's local reply, plus its `%RESPONSE_CODE_DETAILS%`
+    /// (phase 115: `FilterResponse::details`).
+    SynthFromDecode(Response, Option<&'static str>),
 }
 
 /// 26 Task 2: a matched route that OWNS its route-table snapshot. With the
@@ -7226,6 +7235,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "8".to_string())],
             body: Bytes::from_static(b"stopped\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -7244,6 +7254,41 @@ static_resources:
         );
     }
 
+    /// Phase 115: a decode-side filter's `FilterResponse::details` is the
+    /// access-log record's `%RESPONSE_CODE_DETAILS%`; `None` renders `-`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_decode_stop_and_send_details_reach_the_access_log() {
+        async fn line(details: Option<&'static str>) -> String {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("access.log");
+            let format = envoy_accesslog::CompiledFormat::from_inline("d=%RESPONSE_CODE_DETAILS%")
+                .expect("format parses");
+            let sink = envoy_accesslog::FileSink::new(path.clone(), format, None)
+                .await
+                .expect("open sink");
+            let stop_resp = envoy_filter::FilterResponse {
+                status: 200,
+                reason: None,
+                headers: vec![],
+                body: Bytes::new(),
+                details,
+            };
+            let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+                envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
+                envoy_filter::HttpFilterInstance::test_router(),
+            ]));
+            let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+            let mut config = Arc::into_inner(config).expect("sole owner");
+            config.access_log = vec![Arc::new(sink)];
+            let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            let _ = drive(Arc::new(config), req).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
+        }
+        assert_eq!(line(Some("seam_probe")).await.trim(), "d=seam_probe");
+        assert_eq!(line(None).await.trim(), "d=-");
+    }
+
     #[tokio::test]
     async fn h1_stop_and_send_at_encode_substitutes_wire_response() {
         // test-util stub: a filter that StopAndSend(418 "teapot\n") on encode.
@@ -7254,6 +7299,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: Bytes::from_static(b"teapot\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
@@ -11558,6 +11604,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "10".to_string())],
             body: Bytes::from_static(b"over limit"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
@@ -11581,6 +11628,7 @@ static_resources:
             reason: None,
             headers: vec![("content-length".to_string(), "7".to_string())],
             body: Bytes::from_static(b"teapot\n"),
+            details: None,
         };
         let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
             envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),

@@ -220,6 +220,7 @@ mod tests {
             reason: None,
             headers: vec![("content-length".to_string(), "0".to_string())],
             body: bytes::Bytes::new(),
+            details: None,
         }
     }
 

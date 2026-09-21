@@ -140,3 +140,132 @@ staged with it, because §5 state 3 requires appending to `PROGRESS.md` on each
 task completion and the phase-114 rider commit `2cf0830` set exactly that
 precedent (`10 10` on the code file + the new `PROGRESS.md`). `PROGRESS.md` is
 `docs/` and is excluded from the §6.1 LoC accounting.
+
+---
+
+## Task 2 — The `FilterResponse::details` seam
+
+**Commit:** `phase 115 task 2: FilterResponse::details — a filter's local reply carries %RESPONSE_CODE_DETAILS%`
+
+**What it is.** A new `pub details: Option<&'static str>` on
+`envoy_filter::FilterResponse`, copied by BOTH HCMs into the access-log record's
+`%RESPONSE_CODE_DETAILS%` on the decode-side `StopAndSend` path ONLY. Every
+filter that predates phase 115 sets `None`, which renders `-` exactly as before,
+so the task is behaviour-neutral for the landed tree. Task 3's health-check
+filter is its first real producer.
+
+**Steps 1–2 — the failing tests, written FIRST (TDD).** An H1 test
+(`h1_decode_stop_and_send_details_reach_the_access_log`) drives a decode-side
+`StopAndSend` through a `%RESPONSE_CODE_DETAILS%`-only file sink twice, once with
+`Some("seam_probe")` and once with `None`, asserting `d=seam_probe` and `d=-`.
+The H2 side required generalising the landed `h2_response_code_details_line`
+helper to take an optional pipeline and a URI and to return
+`(http::HeaderMap, String, u64)` — headers, log line and `downstream_rq_2xx` —
+which Task 5 reuses; its one existing caller
+(`hcm_h2_sets_response_code_details_from_response_path`) was rewritten to the new
+signature and a second caller
+(`h2_decode_stop_and_send_details_reach_the_access_log`) added.
+
+⚠ The H1 insertion point was checked for the phase-113/114 doc-comment-theft
+class before splicing: the line above the anchor `#[tokio::test]` is blank and
+the one above that is a closing `}`, so nothing's docblock was stolen.
+
+**Step 3 — RED, and for the right reason.**
+
+```
+$ cargo test -p envoy-http1 -p envoy-http2 details_reach_the_access_log
+      1 error: could not compile `envoy-http1` (lib test) due to 1 previous error
+      1 error: could not compile `envoy-http2` (lib test) due to 1 previous error
+      2 error[E0560]: struct `FilterResponse` has no field named `details`
+```
+
+Exactly one `E0560` per crate — the predicted failure, not an incidental one.
+
+**Step 5 — the `E0063` sweep, driven to a FIXPOINT from the COMPILER's list.**
+`FilterResponse` has no `Default`, so the new field is a hard error at every
+exhaustive literal. `cargo` stops at the first failing crate, so round 0 is NOT
+the blast radius:
+
+| round | crate | distinct `file:line:col` sites |
+|---|---|---:|
+| 0 | `envoy-filter` (`types.rs` ×2, `jwt_authn.rs` ×2, `local_rate_limit.rs` ×2, `cors.rs`, `pipeline.rs`, `router.rs`) | **9** |
+| 1 | `envoy-http1/src/hcm.rs` (the encode-side literal at `:1421` + four test literals) | **5** |
+| 2 | `envoy-http2/src/hcm.rs` (the encode-side literal at `:1063` + three test literals) | **4** |
+| 3 | — | **0** (fixpoint) |
+| | **TOTAL** | **18** |
+
+**18 is exactly the `PLAN.md` / `ADR-0201` MEASURED figure, and it refutes
+`SPEC.md` §8 PV-3's 28** (a text count of `FilterResponse {` lines that includes
+the struct declaration, 8 `fn` signatures, 2 `impl` headers and one
+functional-update literal, and cannot see the two `Self { … }` literals inside
+`impl FilterResponse`). No site was found by grep; every one came from the
+compiler. The `..FilterResponse::test_200()` functional update in
+`header_mutation.rs` absorbs the field and was NOT edited — the compiler never
+named it.
+
+⚠ **A census trap caught in passing:** `grep -c "details: None," crates/…` reads
+**20**, not 18, because it matches the two PRE-EXISTING
+`response_code_details: None,` lines as a substring. The diff-derived count
+(`git diff -U0 | grep -c '^+.*details: None,'`) is **18**. Anchor the name or
+count the diff.
+
+**Steps 6–7 — the threading.** `RequestPath::SynthFromDecode` and
+`H2RequestPath::SynthFromDecode` each grow a second field carrying
+`filter_resp.details`; each arm assigns `response_code_details_for_log(_h2)` from
+it. Both locals lose their `= None` initialiser — every arm now assigns, and
+keeping the initialiser makes `rustc` warn that the assigned value is never read.
+Build clean afterwards, zero warnings.
+
+**Step 8 — GREEN.**
+
+```
+test hcm::tests::h1_decode_stop_and_send_details_reach_the_access_log ... ok
+test hcm::tests::h2_decode_stop_and_send_details_reach_the_access_log ... ok
+test hcm::tests::hcm_h2_sets_response_code_details_from_response_path ... ok
+```
+
+**Step 9 — MUTATION: the H1 test is not vacuous.** ⚠ The bare text
+`response_code_details_for_log = details.map(str::to_owned);` occurs **2×** in
+`crates/envoy-http1/src/hcm.rs` (the `BuildOutcome::Synth` arm carries the same
+line), so a plain `sed` would have mutated both and faked a result. The mutation
+was anchored on the preceding phase-115 comment, whose combined form was asserted
+to occur exactly **1×**. `details.map(str::to_owned)` → `details.and(None)`:
+
+```
+   Compiling envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+test hcm::tests::h1_decode_stop_and_send_details_reach_the_access_log ... FAILED
+  left: "d=-"
+ right: "d=seam_probe"
+test result: FAILED. 0 passed; 1 failed; …
+```
+
+The `Compiling envoy-http1` line is the proof the binary was actually rebuilt (a
+stale test binary gives a FALSE PASS). Restored from the backup and verified
+**md5-identical** (`993cf52812c8e140fb6a09cbf867608e` both sides), then the
+UNMUTATED CONTROL re-run from the same tree, with its own forced rebuild:
+`… h1_decode_stop_and_send_details_reach_the_access_log ... ok`.
+
+**Step 10 — gate, all green.**
+
+```
+$ cargo build --workspace --all-targets                                  → BUILD=0
+$ cargo fmt --all -- --check                                             → FMT=0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings   → CLIPPY=0
+                                    8 `Checking` lines, 0 warning/error rows
+$ cargo test -p envoy-filter -p envoy-http1 -p envoy-http2               → TEST=0
+                                    7 binaries, 7 `ok` rows, 0 `FAILED` rows,
+                                    585 passed, 0 failed
+```
+
+**Size and identity, both reproducing the plan EXACTLY.**
+
+```
+$ git diff --cached --numstat | awk '{i+=$1; d+=$2} END {print i, d, i-d}'
+124 24 100
+```
+
+against `PLAN.md`'s per-task table row `2 — FilterResponse::details | 124 | 24 | 100`.
+And the unit-test total across `envoy-config` + `envoy-filter` + `envoy-http1` +
+`envoy-http2` is **1307 passed / 0 failed over 9 binaries**, against the plan's
+predicted post-Task-2 **1307**. Two independent invariants of the same slice,
+both landing on the predicted value.
