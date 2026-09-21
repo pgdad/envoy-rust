@@ -689,3 +689,83 @@ TOTAL ins=304 del=0 net=304
 ```
 
 against `PLAN.md`'s row `6 — fixture 0095 | 304 | 0 | 304`.
+
+---
+
+## Task 7 — Differential fixture `0096-http-filter-health-check-stats`
+
+**Commit:** `phase 115 task 7: fixture 0096-http-filter-health-check-stats — intercepts are counted by health_check, not by downstream_rq_2xx`
+
+**What it is.** The STAT witness, on the existing `Driver::AdminScrape`: three
+HTTP/1.1 pre-requests (`GET /healthz`, `GET /other`, `GET /healthz`) against a
+backend-free, cluster-free `[health_check, router]` listener, then a **bilateral
+ABSOLUTE** stat assertion scraped from BOTH admin listeners.
+
+| stat | value | rule |
+|---|---:|---|
+| `http.ingress_http.health_check.request_total` | 2 | ticks once per INTERCEPT, never on a fall-through |
+| `http.ingress_http.health_check.ok` | 2 | the same, in non-pass-through mode |
+| `http.ingress_http.downstream_rq_total` | 3 | every request is counted |
+| `http.ingress_http.downstream_rq_2xx` | 1 | **an intercepted probe is NOT counted** |
+| `http.ingress_http.health_check.failed` | 0 | ⚠ NOT a presence witness |
+
+⚠ `scrape_admin_stat` returns **0** for a name a proxy never registered, so the
+`value: 0` row passes even if the stat is ABSENT — **only the four non-zero rows
+are witnesses.** Presence of the six zero-valued counters is pinned in-process by
+`registers_eight_counters_and_ticks_two_per_intercept`, not here. And the
+`scrapes:` block is fixture `0015`'s `/server_info` sub-case carried verbatim,
+present ONLY because `Driver::AdminScrape` rejects an empty list.
+
+**Steps 1–5 — the files**, all four extracted from `PLAN.md` by script:
+`envoy.yaml` **40**, `envoy-rust.yaml` **40**, `expectations.yaml` **47**,
+`README.md` **45**, the runner **25** — every count matching the whole-slice
+table. Byte-identity re-derived: `cmp` silent, md5
+`e66e8ad0cc20d41cf5d7f12ce42ecd65` on both sides. Unlike `0095`, this fixture
+DOES use `{{ADMIN_PORT}}` — it is driver-gated and `AdminScrape` is one of the
+four drivers that receive it — and it still carries a `{{PORT}}` listener,
+because the harness's accept-ready wait is unconditional.
+
+**Step 6 — GREEN, audited the same way as `0095`:**
+
+```
+test http_filter_health_check_stats_fixture ... ok
+test result: ok. 1 passed; 0 failed; … finished in 1.32s
+```
+
+with `docker ps` polled at 4 Hz through the run observing exactly one
+`envoyproxy/envoy:v1.33.0` container (`f908eadf74de`).
+
+**MUTATIONS V4–V5**, each with the anchor asserted unique, a forced
+`envoy-bin` rebuild, a 10-second settle gap and an md5-verified restore:
+
+| # | mutation | predicted RED | MEASURED |
+|---|---|---|---|
+| V4 | the H1 per-class gate compares against a sentinel that never matches | `downstream_rq_2xx expected 1 got 3` | `subject stat http.ingress_http.downstream_rq_2xx expected 1 got 3` ✓ |
+| V5 | delete `self.request_total.inc();` | `health_check.request_total expected 2 got 0` | `subject stat http.ingress_http.health_check.request_total expected 2 got 0` ✓ |
+
+V4 is the one that matters: `got 3` is what upstream would have disagreed with,
+and it is the exact divergence `ADR-0201` correction 4 predicted envoy-rust would
+have shipped without Task 5.
+
+md5 after restore: V4 `6fb5a7d70e3daef38a2906887efe07b2`, V5
+`d87fc1d7c7f7cab3a2318e61855ccb19` — identical to their backups.
+
+**Unmutated control from the restored tree**, `git status --porcelain -- crates/`
+EMPTY, `envoy-bin` rebuilt: `test result: ok. 1 passed; 0 failed; … in 1.31s`.
+
+**Gate:** build 0, fmt 0, clippy `-D warnings` 0 with **9 `Checking`** lines and
+zero diagnostics.
+
+**Size, reproducing the plan EXACTLY.**
+
+```
+$ git diff --cached --numstat
+25	0	tests/differential/tests/http_filter_health_check_stats.rs
+45	0	tests/fixtures/0096-http-filter-health-check-stats/README.md
+40	0	tests/fixtures/0096-http-filter-health-check-stats/envoy-rust.yaml
+40	0	tests/fixtures/0096-http-filter-health-check-stats/envoy.yaml
+47	0	tests/fixtures/0096-http-filter-health-check-stats/expectations.yaml
+TOTAL ins=197 del=0 net=197
+```
+
+against `PLAN.md`'s row `7 — fixture 0096 | 197 | 0 | 197`.

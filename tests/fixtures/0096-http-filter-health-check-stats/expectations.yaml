@@ -1,0 +1,47 @@
+# Phase 115: three HTTP/1.1 pre-requests — two intercepted `/healthz` probes
+# and one `/other` fall-through — then a bilateral ABSOLUTE stat assertion.
+#
+# The non-zero entries are the witnesses (MEASURED against
+# envoyproxy/envoy:v1.33.0, ADR-0201):
+#   health_check.request_total / ok  tick once per INTERCEPT, never on a
+#                                    fall-through;
+#   downstream_rq_total              counts all three requests;
+#   downstream_rq_2xx                counts ONLY the fall-through — an
+#                                    intercepted probe is NOT counted.
+#
+# ⚠ `scrape_admin_stat` returns 0 for a name a proxy never registered, so the
+# `value: 0` entry is NOT a presence witness; it pins that `failed` does not
+# move. Presence of the six zero-valued counters is pinned in-process only.
+driver:
+  kind: admin_scrape
+  pre_requests:
+    - { method: GET, path: /healthz, host: envoy-rust.test, port_key: PORT }
+    - { method: GET, path: /other, host: envoy-rust.test, port_key: PORT }
+    - { method: GET, path: /healthz, host: envoy-rust.test, port_key: PORT }
+  # The driver requires a non-empty `scrapes:`; this is fixture 0015's
+  # /server_info sub-case verbatim. The witnesses are `expected_stats` below.
+  scrapes:
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["state"]
+        value_may_differ_keys:
+          - state
+          - version
+          - hot_restart_version
+          - command_line_options
+          - node
+        allowlist_envoy_only_keys:
+          - uptime_current_epoch
+          - uptime_all_epochs
+        allowlist_envoy_rust_only_keys:
+          - uptime_current_epoch_seconds
+          - uptime_all_epochs_seconds
+  expected_stats:
+    - { name: "http.ingress_http.health_check.request_total", value: 2 }
+    - { name: "http.ingress_http.health_check.ok", value: 2 }
+    - { name: "http.ingress_http.downstream_rq_total", value: 3 }
+    - { name: "http.ingress_http.downstream_rq_2xx", value: 1 }
+    - { name: "http.ingress_http.health_check.failed", value: 0 }
