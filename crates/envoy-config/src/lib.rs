@@ -1043,6 +1043,28 @@ pub enum ConfigError {
     )]
     CdnLoopInvalidCdnId { listener: String, cdn_id: String },
 
+    /// Phase 115: a `health_check` filter sets something envoy-rust does not
+    /// implement — `pass_through_mode: true`, `cache_time` or
+    /// `cluster_min_healthy_percentages`. Startup-fatal (ADR-0049); upstream
+    /// accepts the first (and `cache_time` alongside it), so this is a
+    /// recorded REJECT-direction divergence (CF-115-1, CF-115-5).
+    #[error(
+        "health_check filter on listener `{listener}` sets `{field}`, which envoy-rust does not implement; only pass_through_mode: false is supported"
+    )]
+    UnsupportedHealthCheckField {
+        listener: String,
+        field: &'static str,
+    },
+
+    /// Phase 115: a `health_check` header matcher names a pseudo-header other
+    /// than `:path`. The filter cannot see it; upstream matches `:method`,
+    /// `:authority` and `:scheme` (MEASURED), so this is a recorded
+    /// REJECT-direction divergence (CF-115-6).
+    #[error(
+        "health_check filter on listener `{listener}` matches pseudo-header `{name}`; only `:path` is supported"
+    )]
+    UnsupportedHealthCheckPseudoHeader { listener: String, name: String },
+
     /// Phase 33 (§A5-LOCKED): a `set_metadata` filter entry has an empty
     /// `metadata_namespace`. Envoy rejects this boot-fatally (PGV: length ≥ 1);
     /// envoy-rust matches (ADR-0049 all-fatal). `listener` names the offending HCM.

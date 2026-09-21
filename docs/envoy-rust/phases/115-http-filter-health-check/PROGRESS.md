@@ -394,3 +394,110 @@ against `PLAN.md`'s per-task row `3 — config type + filter | 376 | 16 | 360`, 
 `health_check.rs` at **274** lines against the whole-slice table's 274. The
 four-crate unit total is **1323 passed / 0 failed over 9 binaries** against the
 plan's predicted post-Task-3 **1323**.
+
+---
+
+## Task 4 — Make the filter reachable: typed config, validator, `node.cluster` stamping, 13th instance
+
+**Commit:** `phase 115 task 4: health_check reachable — typed config, validator, node.cluster stamping, 13th HttpFilterInstance`
+
+**What it is.** The four edges that make Task 3's filter reachable from a
+bootstrap: the `HttpFilterTypedConfig::HealthCheck` variant (`@type`
+`…filters.http.health_check.v3.HealthCheck`, name
+`envoy.filters.http.health_check`), two new `ConfigError` variants and the
+`validate_health_check_config` gauntlet, the `node.cluster` stamping in
+`validate_hcm`, and `HttpFilterInstance::HealthCheck` — the **THIRTEENTH**
+production variant.
+
+**Steps 1–2 — RED first, with exactly the predicted errors.** Thirteen new
+`envoy-config` tests (seven appended to `mod health_check_config_tests`) and one
+`envoy-filter` instance test, both fences extracted from `PLAN.md` by script:
+
+```
+$ cargo test -p envoy-config health_check_config_tests
+      1 error[E0599]: no variant named `UnsupportedHealthCheckField` found for enum `ConfigError`
+      1 error[E0599]: no variant named `UnsupportedHealthCheckPseudoHeader` found for enum `ConfigError`
+      1 error[E0599]: no variant or associated item named `HealthCheck` found for enum `bootstrap::HttpFilterTypedConfig` in the current scope
+```
+
+Exactly **3** — the plan's MEASURED count, and each one names a thing this task
+adds.
+
+**Steps 3–7 — the implementation.** `UnsupportedHealthCheckField` (boot-fatal on
+`pass_through_mode: true`, `cache_time`, `cluster_min_healthy_percentages` —
+`ADR-0049` fail-loud; upstream ACCEPTS the first two, so these are RECORDED
+REJECT-direction divergences, CF-115-1 / CF-115-5) and
+`UnsupportedHealthCheckPseudoHeader` (any `:`-prefixed matcher name other than
+`:path`; upstream MATCHES `:method` / `:authority` / `:scheme`, envoy-rust cannot
+see them, CF-115-6 — rejected at load rather than silently never matching). The
+validator then runs each matcher through the shared `validate_header_matcher`
+gauntlet on a clone.
+
+`validate` captures `node.cluster` (empty without a `node`) BEFORE the `&mut`
+listener loop and passes it to `validate_hcm` as a new last parameter; the
+stamping loop writes it into every `health_check` filter's `#[serde(skip)]`
+`local_cluster`. `validate` runs at `parse_bootstrap` AND at the post-merge
+re-validation in `load_dynamic_resources`, so LDS-delivered listeners are stamped
+too. `validate_hcm` now takes seven parameters — under clippy's
+`too_many_arguments` threshold, and clippy confirms it below.
+
+**Step 8 — GREEN, both at the predicted counts.**
+
+```
+$ cargo test -p envoy-config health_check_config_tests
+running 13 tests → test result: ok. 13 passed; 0 failed
+$ cargo test -p envoy-filter health_check
+running 11 tests → test result: ok. 11 passed; 0 failed     (10 filter + 1 instance)
+```
+
+**Step 9 — THE GATE THAT CLOSES TASK 3's DEFERRAL.**
+
+```
+$ cargo build --workspace --all-targets                                  → BUILD=0
+$ cargo fmt --all -- --check                                             → FMT=0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings   → CLIPPY=0
+                                    13 `Checking` lines, 0 warning/error rows
+$ cargo test -p envoy-config -p envoy-filter                             → TEST=0
+                                    4 binaries, 4 `ok` rows, 0 `FAILED` rows,
+                                    960 passed, 0 failed
+```
+
+**Clippy exits 0 with a NON-ZERO `Checking` count** (the count is the gate; an
+exit 0 with zero `Checking` lines is a cached no-op). The three `dead_code`
+errors Task 3 measured are gone because the filter now has a production consumer
+— **not because anything was suppressed.** Verified on disk:
+`grep -c 'allow(' crates/envoy-filter/src/health_check.rs` = **0** and
+`grep -cE '^\s+_[a-z_]+:'` = **0**. `ADR-0194` DECISION 1 discharged.
+
+### ⚠ Size drift: +1 line against `PLAN.md`'s per-task table — RECORDED, not absorbed
+
+```
+$ git diff --cached --numstat -- crates/
+200	0	crates/envoy-config/src/bootstrap.rs
+22	0	crates/envoy-config/src/lib.rs
+43	0	crates/envoy-filter/src/instance.rs
+TOTAL ins=265 del=0 net=265
+```
+
+against `PLAN.md`'s row `4 — reachable: variant, validator, stamping, instance |
+264 | 0 | 264`. **Two of the three files reproduce EXACTLY** —
+`crates/envoy-config/src/lib.rs` at 22 (making its cumulative `39 / 16` the
+whole-slice table's figure to the line) and `crates/envoy-filter/src/instance.rs`
+at 43 (the whole-slice table's 43). The drift is entirely in
+`crates/envoy-config/src/bootstrap.rs`: **200 landed against the prototype's
+199**, i.e. cumulative **283 against the whole-slice table's 282**.
+
+It is located and it is one BLANK SEPARATOR, not a line of code. The nine
+`bootstrap.rs` hunks sum as `5 + 1 + 8 + 1 + 1 + 6 + 3 + 39 + 136 = 200`, and
+every hunk is its `PLAN.md` fence plus exactly one separating blank line
+(fences: 4, 1, 7, 1, 1, 5, 3, 38, 135 = 195 content lines this task, 276 across
+Tasks 3+4). The prototype therefore carried **six** separating blanks where this
+tree carries **seven**; which of the seven the prototype omitted is not
+recoverable from the fences, and no double blank exists in the landed tree
+(checked: zero `+` blank lines adjacent to a context blank) — so nothing was
+trimmed to chase the number. `ADR-0198` reconciliation precedent; `PLAN.md`'s
+102-line §6.1 margin absorbs it with 101 to spare.
+
+**The test-count identity, by contrast, is EXACT:** the four-crate unit total is
+**1331 passed / 0 failed over 9 binaries**, against the plan's predicted
+post-Task-4 **1331**.

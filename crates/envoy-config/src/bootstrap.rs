@@ -1525,6 +1525,11 @@ pub enum HttpFilterTypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config"
     )]
     HeaderToMetadata(HeaderToMetadataConfig),
+
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck"
+    )]
+    HealthCheck(HealthCheckFilterConfig),
 }
 
 impl HttpFilterTypedConfig {
@@ -1546,6 +1551,7 @@ impl HttpFilterTypedConfig {
             Self::CdnLoop(_) => "envoy.filters.http.cdn_loop",
             Self::SetMetadata(_) => "envoy.filters.http.set_metadata",
             Self::HeaderToMetadata(_) => "envoy.filters.http.header_to_metadata",
+            Self::HealthCheck(_) => "envoy.filters.http.health_check",
         }
     }
 }
@@ -3827,6 +3833,14 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     // without conflicting with the listener borrow.
     let defer_cluster_refs = bootstrap.cds_configured_but_unloaded();
 
+    // 115: the bootstrap `node.cluster` (empty without a `node`, MEASURED to
+    // match upstream), stamped into every `health_check` filter by
+    // `validate_hcm`. Captured before the `&mut` listener loop below.
+    let local_cluster = bootstrap
+        .node
+        .as_ref()
+        .map_or_else(String::new, |n| n.cluster.clone());
+
     // 18 D3: snapshot the EFFECTIVE cluster list (static + dynamic) BEFORE the
     // `&mut bootstrap.static_resources.listeners` loop below — the reference
     // checks (UnknownCluster + the H2-from-H1 gate) must resolve against the
@@ -4047,6 +4061,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             &listener.name,
                             defer_cluster_refs,
                             &runtime_snapshot,
+                            &local_cluster,
                         )?;
                     }
                     crate::DIRECT_RESPONSE_FILTER => {
@@ -4360,6 +4375,7 @@ fn validate_hcm(
     listener_name: &str,
     defer_cluster_refs: bool,
     runtime: &crate::runtime::RuntimeSnapshot,
+    local_cluster: &str,
 ) -> Result<(), crate::ConfigError> {
     // codec_type: AUTO, HTTP1, and HTTP2 are runtime-supported. HTTP3 is
     // rejected pending future work. HTTP2 over TLS is rejected separately
@@ -4393,6 +4409,12 @@ fn validate_hcm(
 
     // http_filters: cardinality + name + Router-terminal — 07.1 D4.1.
     validate_http_filters(&hcm.http_filters, listener_name)?;
+
+    for hf in &mut hcm.http_filters {
+        if let crate::HttpFilterTypedConfig::HealthCheck(cfg) = &mut hf.typed_config {
+            cfg.local_cluster = local_cluster.to_string();
+        }
+    }
 
     // 20 D1 (C16): inline route_config validation runs only when present.
     // An rds HCM has route_config: None at parse time (the route table is
@@ -4662,6 +4684,9 @@ pub(crate) fn validate_http_filters(
             }
             crate::HttpFilterTypedConfig::HeaderToMetadata(cfg) => {
                 validate_header_to_metadata_config(cfg, listener_name)?;
+            }
+            crate::HttpFilterTypedConfig::HealthCheck(cfg) => {
+                validate_health_check_config(cfg, listener_name)?;
             }
         }
     }
@@ -5111,6 +5136,45 @@ fn validate_cdn_loop_config(
             listener: listener_name.to_string(),
             cdn_id: cfg.cdn_id.clone(),
         });
+    }
+    Ok(())
+}
+
+/// Phase 115: validate a `health_check` filter config. All boot-fatal
+/// (ADR-0049). Upstream ACCEPTS `pass_through_mode: true`, and accepts
+/// `cache_time` alongside it; envoy-rust implements only non-pass-through mode
+/// and rejects both, plus `cluster_min_healthy_percentages` (CF-115-1,
+/// CF-115-5). A matcher naming a pseudo-header other than `:path` is rejected
+/// because the filter cannot see it (CF-115-6); upstream matches `:method`,
+/// `:authority` and `:scheme` (MEASURED). Each matcher then runs the shared
+/// `validate_header_matcher` gauntlet on a clone.
+fn validate_health_check_config(
+    cfg: &crate::HealthCheckFilterConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    let unsupported = |field| {
+        Err(crate::ConfigError::UnsupportedHealthCheckField {
+            listener: listener_name.to_string(),
+            field,
+        })
+    };
+    if cfg.pass_through_mode {
+        return unsupported("pass_through_mode: true");
+    }
+    if cfg.cache_time.is_some() {
+        return unsupported("cache_time");
+    }
+    if cfg.cluster_min_healthy_percentages.is_some() {
+        return unsupported("cluster_min_healthy_percentages");
+    }
+    for hm in &cfg.headers {
+        if hm.name.starts_with(':') && !hm.name.eq_ignore_ascii_case(":path") {
+            return Err(crate::ConfigError::UnsupportedHealthCheckPseudoHeader {
+                listener: listener_name.to_string(),
+                name: hm.name.clone(),
+            });
+        }
+        validate_header_matcher(&mut hm.clone())?;
     }
     Ok(())
 }
@@ -21942,6 +22006,142 @@ mod health_check_config_tests {
     #[test]
     fn local_cluster_is_not_a_wire_field() {
         assert!(parse("pass_through_mode: false\nlocal_cluster: x\n").is_err());
+    }
+
+    /// A full bootstrap whose HCM chain is `[health_check, router]`; `body` is
+    /// the health_check typed_config's fields, one per line, unindented.
+    fn bootstrap_with(body: &str) -> String {
+        let body: String = body
+            .lines()
+            .map(|l| format!("                      {l}\n"))
+            .collect();
+        format!(
+            r#"
+node: {{ id: n, cluster: hc-node-cluster }}
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: {{ socket_address: {{ address: 0.0.0.0, port_value: 8080 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: MAIN }} }}
+                http_filters:
+                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+{body}                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#
+        )
+    }
+
+    fn load(body: &str) -> Result<crate::Bootstrap, crate::ConfigError> {
+        crate::parse_bootstrap(&bootstrap_with(body))
+    }
+
+    const PATH_MATCHER: &str =
+        "headers:\n  - { name: \":path\", string_match: { exact: /healthz } }";
+
+    #[test]
+    fn accepts_non_pass_through_mode_with_a_path_matcher() {
+        load(&format!("pass_through_mode: false\n{PATH_MATCHER}")).expect("loads");
+    }
+
+    #[test]
+    fn accepts_absent_and_empty_headers() {
+        load("pass_through_mode: false").expect("absent headers");
+        load("pass_through_mode: false\nheaders: []").expect("empty headers");
+    }
+
+    #[test]
+    fn rejects_the_three_unimplemented_fields() {
+        for (body, field) in [
+            ("pass_through_mode: true", "pass_through_mode: true"),
+            ("pass_through_mode: false\ncache_time: 5s", "cache_time"),
+            (
+                "pass_through_mode: false\ncluster_min_healthy_percentages: { c: { value: 50 } }",
+                "cluster_min_healthy_percentages",
+            ),
+        ] {
+            match load(body) {
+                Err(crate::ConfigError::UnsupportedHealthCheckField { field: f, .. }) => {
+                    assert_eq!(f, field)
+                }
+                other => panic!("{body}: expected UnsupportedHealthCheckField, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_pseudo_headers_other_than_path() {
+        for name in [":method", ":authority", ":scheme"] {
+            let body = format!(
+                "pass_through_mode: false\nheaders:\n  - {{ name: \"{name}\", string_match: {{ exact: x }} }}"
+            );
+            assert!(
+                matches!(
+                    load(&body),
+                    Err(crate::ConfigError::UnsupportedHealthCheckPseudoHeader { .. })
+                ),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    /// The stamped `local_cluster` of the (single) listener's health_check.
+    fn stamped(b: &crate::Bootstrap) -> String {
+        let chain = &b.static_resources.listeners[0].filter_chains[0];
+        let Some(crate::bootstrap::TypedConfig::HttpConnectionManager(hcm)) =
+            &chain.filters[0].typed_config
+        else {
+            panic!("HCM expected");
+        };
+        match &hcm.http_filters[0].typed_config {
+            crate::HttpFilterTypedConfig::HealthCheck(c) => c.local_cluster.clone(),
+            other => panic!("health_check expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_stamps_node_cluster_into_the_filter() {
+        let b = load("pass_through_mode: false").expect("loads");
+        assert_eq!(stamped(&b), "hc-node-cluster");
+    }
+
+    #[test]
+    fn absent_node_stamps_the_empty_string() {
+        let yaml = bootstrap_with("pass_through_mode: false")
+            .replace("node: { id: n, cluster: hc-node-cluster }\n", "");
+        let b = crate::parse_bootstrap(&yaml).expect("loads without node");
+        assert_eq!(stamped(&b), "");
+    }
+
+    #[test]
+    fn runs_the_shared_header_matcher_validation() {
+        let empty_name = "pass_through_mode: false\nheaders:\n  - { name: \"\", exact_match: x }";
+        assert!(matches!(
+            load(empty_name),
+            Err(crate::ConfigError::EmptyHeaderName)
+        ));
+        let bad_regex = "pass_through_mode: false\nheaders:\n  - { name: x-a, safe_regex_match: { regex: \"(\" } }";
+        assert!(matches!(
+            load(bad_regex),
+            Err(crate::ConfigError::InvalidRegex { .. })
+        ));
     }
 }
 

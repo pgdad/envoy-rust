@@ -25,6 +25,7 @@ use crate::error::FilterError;
 use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
 use crate::header_to_metadata::HeaderToMetadataFilter;
+use crate::health_check::HealthCheckFilter;
 use crate::jwt_authn::JwtAuthnFilter;
 use crate::local_rate_limit::LocalRateLimitFilter;
 use crate::pipeline::Decision;
@@ -96,6 +97,12 @@ pub enum HttpFilterInstance {
     /// `on_header_missing`'s static `value`; a present-but-empty header writes
     /// nothing (§A4). No per-route config, no stats — ADR-0083/ADR-0084.
     HeaderToMetadata(HeaderToMetadataFilter),
+    /// Phase 115: the `envoy.filters.http.health_check` filter, non-pass-through
+    /// mode (decode-side; answers a request matching every configured header
+    /// matcher with an empty 200 carrying `x-envoy-upstream-healthchecked-cluster`
+    /// and `%RESPONSE_CODE_DETAILS%` `health_check_ok`). No per-route config; 8
+    /// stat counters registered under `http.{hcm_stat_prefix}.health_check.*`.
+    HealthCheck(HealthCheckFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -175,6 +182,11 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::HeaderToMetadata(cfg) => Ok(
                 HttpFilterInstance::HeaderToMetadata(HeaderToMetadataFilter::new(cfg)),
             ),
+            envoy_config::HttpFilterTypedConfig::HealthCheck(cfg) => {
+                Ok(HttpFilterInstance::HealthCheck(
+                    HealthCheckFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+                ))
+            }
         }
     }
 
@@ -192,6 +204,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::CdnLoop(f) => f.decode_headers(req),
             HttpFilterInstance::SetMetadata(f) => f.decode_headers(req),
             HttpFilterInstance::HeaderToMetadata(f) => f.decode_headers(req),
+            HttpFilterInstance::HealthCheck(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -215,6 +228,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::CdnLoop(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::SetMetadata(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::HeaderToMetadata(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::HealthCheck(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -505,6 +519,35 @@ mod tests {
         // encode_headers is inert for SetMetadata — must return Continue.
         let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    #[test]
+    fn builds_health_check_instance_and_intercepts() {
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.health_check".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::HealthCheck(
+                envoy_config::HealthCheckFilterConfig {
+                    pass_through_mode: false,
+                    headers: vec![crate::types::header_matcher_exact(":path", "/healthz")],
+                    cache_time: None,
+                    cluster_min_healthy_percentages: None,
+                    local_cluster: "c".to_string(),
+                },
+            ),
+        };
+        let mut inst = HttpFilterInstance::build(&hf, &test_registry(), "ingress_http")
+            .expect("HealthCheck build succeeds");
+        assert!(matches!(inst, HttpFilterInstance::HealthCheck(_)));
+        let mut probe = FilterRequest::test("GET", "/healthz", &[]);
+        assert!(matches!(
+            inst.decode_headers(&mut probe),
+            Decision::StopAndSend(_)
+        ));
+        let mut other = FilterRequest::test("GET", "/other", &[]);
+        assert!(matches!(
+            inst.decode_headers(&mut other),
+            Decision::Continue
+        ));
     }
 
     #[test]
