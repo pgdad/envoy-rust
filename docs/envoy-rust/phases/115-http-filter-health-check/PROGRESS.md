@@ -593,3 +593,99 @@ test identity lands on the prediction.
 **897**. The single line of divergence is Task 4's recorded `bootstrap.rs` blank
 separator and nothing else; `crates/` is otherwise line-for-line the measured
 prototype.
+
+---
+
+## Task 6 — Differential fixture `0095-http-filter-health-check`
+
+**Commit:** `phase 115 task 6: fixture 0095-http-filter-health-check — ten probes, byte-identical configs`
+
+**What it is.** The WIRE witness: ten sequential HTTP/1.1 probes at a
+backend-free, CLUSTER-FREE HCM listener whose chain is
+`[health_check A (:path exact /healthz), health_check B (:path exact /both AND
+x-probe exact yes), router]` with a `prefix: "/"` `direct_response` catch-all
+answering `MAIN`. Driver `Http1ProbeList`; no harness change, no new driver.
+
+**Why it is not vacuous, and the reason is non-obvious.** **Every probe answers
+200**, so status alone cannot pass this fixture. The BODY decides — an
+intercepted probe is empty with no `content-type`, a fall-through is the 4-byte
+`MAIN` — and `set_equal_modulo_allow_list` additionally compares
+`x-envoy-upstream-healthchecked-cluster` VALUE-exact across the two proxies.
+
+**Steps 1–5 — the files, all four extracted from `PLAN.md` by script.** Line
+counts, each matching the plan's whole-slice table exactly: `envoy.yaml` **53**,
+`envoy-rust.yaml` **53**, `expectations.yaml` **102**, `README.md` **67**, the
+runner **29**.
+
+**Byte-identity RE-DERIVED at this commit, not inherited:**
+
+```
+$ cmp tests/fixtures/0095-http-filter-health-check/envoy.yaml \
+      tests/fixtures/0095-http-filter-health-check/envoy-rust.yaml
+(silent)
+$ md5sum …/envoy.yaml …/envoy-rust.yaml
+85b837a66319583bf8c5a81f6b15f4e1  …/envoy-rust.yaml
+85b837a66319583bf8c5a81f6b15f4e1  …/envoy.yaml
+```
+
+`node: { id: fixture-0095, cluster: hc-fixture-cluster }` is on BOTH sides, and
+`hc-fixture-cluster` is a value no YAML-1.1 parser booleanizes (`envoy-rust`
+parses YAML 1.2, upstream 1.1 — the `0088` README records the trap an unquoted
+`y` sets). `admin` carries a LITERAL `port_value: 0`, not `{{ADMIN_PORT}}`, which
+is driver-gated and `Http1ProbeList` never receives.
+
+**Step 6 — GREEN, and the fast green was AUDITED rather than believed.**
+
+```
+$ cargo build -p envoy-bin          # the harness runs the DEBUG binary
+$ cargo test -p differential --test http_filter_health_check
+running 1 test
+test http_filter_health_check_fixture ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+```
+
+1.22 s is fast enough to be suspicious. `docker ps --format '{{.ID}} {{.Image}}'`
+was polled at 4 Hz for the duration of the run and observed exactly **one**
+`envoyproxy/envoy:v1.33.0` container (`5b2aa6ce5e77`), so the reference side
+really ran — the image ID `56da5afd7df3` is the `ENVOY_TARGET.md` pin's digest
+prefix. Backend-free fixtures genuinely finish in ~1 s.
+
+**Step 7 — MUTATIONS V1–V3, each landing on exactly the predicted probe.** The
+probe-list driver aborts at the FIRST failing probe, so one red run names ONE
+probe — which is what makes these three mutations a partition rather than a
+repeat. Each: assert the anchor occurs exactly `1`, apply, **rebuild
+`envoy-bin`** (a `Compiling envoy-filter`/`envoy-config` AND `Compiling
+envoy-bin` line every time — `cargo test -p differential` alone never rebuilds
+the proxy and would read a FALSE GREEN), run, restore, md5.
+
+| # | mutation | predicted RED | MEASURED |
+|---|---|---|---|
+| V1 | `cfg.local_cluster = local_cluster.to_string()` → `String::new()` (`bootstrap.rs`) | `p1 … diff_headers` | `probe p1-healthz-intercepted: diff_headers` ✓ |
+| V2 | `req.path.clone()` → query-stripped (`health_check.rs`) | `p2 … subject body != expected` | `probe p2-query-string-falls-through: subject body != expected` ✓ |
+| V3 | `self.headers.iter().all(` → `.any(` (`health_check.rs`) | `p9 … subject body != expected` | `probe p9-and-path-alone-falls-through: subject body != expected` ✓ |
+
+md5 after each restore: V1 `cfb018af8f2313b6b1ce009a1d697144`, V2 and V3 both
+`d87fc1d7c7f7cab3a2318e61855ccb19` — identical to their backups. A **10-second
+settle gap** separated the Docker runs (back-to-back container starts on this
+host can manufacture a false red).
+
+**Unmutated control, from the same tree after the last restore**, with
+`git status --porcelain -- crates/` EMPTY and `envoy-bin` rebuilt:
+`test result: ok. 1 passed; 0 failed; … finished in 1.30s`.
+
+**Gate:** build 0, fmt 0, clippy `-D warnings` 0 with **14 `Checking`** lines and
+zero diagnostics.
+
+**Size, reproducing the plan EXACTLY.**
+
+```
+$ git diff --cached --numstat
+29	0	tests/differential/tests/http_filter_health_check.rs
+67	0	tests/fixtures/0095-http-filter-health-check/README.md
+53	0	tests/fixtures/0095-http-filter-health-check/envoy-rust.yaml
+53	0	tests/fixtures/0095-http-filter-health-check/envoy.yaml
+102	0	tests/fixtures/0095-http-filter-health-check/expectations.yaml
+TOTAL ins=304 del=0 net=304
+```
+
+against `PLAN.md`'s row `6 — fixture 0095 | 304 | 0 | 304`.

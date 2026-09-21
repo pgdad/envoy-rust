@@ -1,0 +1,102 @@
+# Phase 115: ten sequential HTTP/1.1 probes against a backend-free,
+# CLUSTER-FREE HCM listener whose chain is
+#   [health_check A (:path exact /healthz),
+#    health_check B (:path exact /both AND x-probe exact yes),
+#    router]
+# with a `prefix: "/"` direct_response catch-all answering `MAIN`.
+#
+# EVERY probe answers 200, so status alone cannot pass this fixture. The body
+# decides: an intercepted probe has an EMPTY body (and no content-type), a
+# fall-through answers `MAIN`. `set_equal_modulo_allow_list` additionally
+# compares `x-envoy-upstream-healthchecked-cluster` VALUE-EXACT — it must be
+# the bootstrap `node.cluster` (`hc-fixture-cluster`) on both proxies.
+#
+# The cells (MEASURED against envoyproxy/envoy:v1.33.0, SPEC.md §2 and
+# ADR-0201):
+#   p1       the baseline intercept
+#   p2       `:path` INCLUDES the query string — the trap of the phase
+#   p3/p4    exact is exact; the value match is case-sensitive
+#   p5       a non-match continues to the route
+#   p6       the filter is method-agnostic (POST with a body)
+#   p7       the header value is proxy state, not a request echo
+#   p8-p10   a two-entry matcher list folds as AND
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: p1-healthz-intercepted
+      method: get
+      path: "/healthz"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p2-query-string-falls-through
+      method: get
+      path: "/healthz?x=1"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p3-trailing-slash-falls-through
+      method: get
+      path: "/healthz/"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p4-case-sensitive-falls-through
+      method: get
+      path: "/healthZ"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p5-other-falls-through
+      method: get
+      path: "/other"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p6-post-with-body-intercepted
+      method: post
+      path: "/healthz"
+      host: "envoy-rust.test"
+      body: "abc"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p7-request-header-is-not-echoed
+      method: get
+      path: "/healthz"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["x-envoy-upstream-healthchecked-cluster", "SENTINEL"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p8-and-both-matchers-intercepted
+      method: get
+      path: "/both"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["x-probe", "yes"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p9-and-path-alone-falls-through
+      method: get
+      path: "/both"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: p10-and-header-alone-falls-through
+      method: get
+      path: "/other"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["x-probe", "yes"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "MAIN" }
+      expected_headers: set_equal_modulo_allow_list
