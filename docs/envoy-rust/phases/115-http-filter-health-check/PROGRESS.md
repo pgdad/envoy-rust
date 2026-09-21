@@ -844,3 +844,127 @@ narrative that each session supersedes or relocates anyway. **RE-ANCHOR ON TEXT
 when following any of these; do not mass-repair.** The one live document this
 phase both edits and cites into is `BEHAVIOR_CONTRACT.md`, and its 15 are all
 `hcm.rs`/`bootstrap.rs` citations — 1 of them unambiguous.
+
+---
+
+## §5 state-3 summary — the implementation is COMPLETE
+
+All EIGHT `PLAN.md` tasks landed IN ORDER, one commit each, TDD on every one:
+
+| task | commit | numstat (crates/ + tests/) | plan row | |
+|---|---|---|---|---|
+| 1 — rider `CF-114-6` | `a05be5e` | `3 / 3` net **0** | `3 / 3` net 0 | ✓ |
+| 2 — `FilterResponse::details` | `4501f27` | `124 / 24` net **100** | `124 / 24` net 100 | ✓ |
+| 3 — config type + filter | `73d2972` | `376 / 16` net **360** | `376 / 16` net 360 | ✓ |
+| 4 — reachable | `46f0a4a` | `265 / 0` net **265** | `264 / 0` net 264 | **+1** |
+| 5 — counter exclusion + pins | `e28790f` | `185 / 12` net **173** | `185 / 12` net 173 | ✓ |
+| 6 — fixture `0095` | `4399734` | `304 / 0` net **304** | `304 / 0` net 304 | ✓ |
+| 7 — fixture `0096` | `7e33470` | `197 / 0` net **197** | `197 / 0` net 197 | ✓ |
+| 8 — `BEHAVIOR_CONTRACT.md` | `63d9445` | `72 / 0` (`docs/`, excluded) | not prototyped | — |
+| **TOTAL** | | **`1454 / 55` net 1399** | **`1453 / 55` net 1398** | **1.0007×** |
+
+**1399 against a MEASURED 1398 is the tightest landing in this project's recorded
+series** — `112.1` 1.00×, `113` 1.07×, `112.2` 1.10×, `114` 1.107× — and it is
+still **101 lines under** the ~1500 §6.1 gate. The mechanism `PLAN.md` installed
+is why: every code fence was extracted from the plan **by script**, never
+retyped, so no line of code drifted at all. The single line is Task 4's blank
+separator in `crates/envoy-config/src/bootstrap.rs`, located and recorded above.
+
+### The test identity
+
+```
+$ cargo test --workspace --no-fail-fast
+binaries: 172   ok-rows: 163   FAILED-rows: 9
+passed: 2336    failed: 9      passed + failed: 2345
+```
+
+**`binaries = 172` and `passed + failed = 2345` are EXACTLY `PLAN.md`'s predicted
+identity** (`binaries=172 passed=2345 failed=0`) — 2 new differential runners and
+30 new test functions, predicted as arithmetic on an unbuilt tree and landed
+without adjustment. The four-crate unit totals also landed on every predicted
+intermediate: **1307 / 1323 / 1331 / 1333** at the Task 2/3/4/5 boundaries.
+
+### The nine local failures — TWO families, NEITHER of them this slice's
+
+Classified by **ISOLATION against an UNMODIFIED CONTROL**, never by message text.
+The control is a detached `git worktree` at `04661b7` (the pre-phase commit) with
+its **own** `CARGO_TARGET_DIR`, built `--workspace --all-targets`, and its
+`envoy-bin` is md5-**different** from this tree's —
+`20c66e6181e83c010cd93b0c80f588c8` vs `0fe25404c4f5c6b9c809e958b3a43ccc` — which
+is what proves the control is a genuinely different tree. Every fixture was
+re-run there ALONE with a 20-second settle gap, and the four not already on
+record were re-run alone on THIS tree as well.
+
+| fixture | alone @ control `04661b7` | alone @ phase tree | family |
+|---|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | FAIL | — | A: deterministic host signature |
+| `access_log_h2_uc_upstream_reset` | FAIL | — | A |
+| `access_log_rcd_upstream_reset` | FAIL | — | A |
+| `access_log_rf_upstream_reset` | FAIL | — | A |
+| `admin_config_dump_server_info` | FAIL | — | A |
+| `access_log_upstream_host` | **ok** | **ok** | B: parallel-load flake |
+| `lb_maglev_fixture` | **ok** | **ok** | B |
+| `lb_ring_hash_fixture` | **ok** | **ok** | B |
+| `lb_subset_fixture` | **ok** | **ok** | B |
+
+Family A are the five already recorded at the PLAN-write; they fail
+deterministically in isolation on BOTH trees. Family B are four backend-routing
+fixtures that PASS in isolation on BOTH trees and redden only inside the full
+parallel `--workspace` run. **The two families have OPPOSITE tells and the panic
+text cannot tell them apart:** `access_log_upstream_host` panics with `deadline
+has elapsed` on upstream's own H1 drive, which reads exactly like Family A —
+**a first draft of this record sorted it there, and the control refuted it.**
+CI on native Linux is authoritative for all nine.
+
+### What this session did NOT do
+
+- **No ADR fired, and saying so is part of the record.** Nothing measured here
+  contradicted a landed figure that `ADR-0201` does not already settle; the one
+  line of size drift is reconciled in place. A state advance that writes an ADR
+  anyway manufactures a decision the record does not need. **`ADR-0202` is next
+  free and nothing is reserved.**
+- **`ROADMAP.md` was NOT touched.** Row `115` stays `planned` until the state-6
+  close-out.
+- **`known-failures.txt` was NOT trimmed** and no landed artifact (`SPEC.md`,
+  `ADR-0200`, `ADR-0201`, the phase-114 artifacts) was edited.
+- **Nothing was fixed** beyond the one scheduled rider (§6.3; `ADR-0165`).
+  `CF-114-6` is CONSUMED by Task 1. `CF-115-1 … CF-115-10` — including
+  **CF-115-9, the request-time PANIC in the `fault` filter's `safe_regex_match`
+  header gate** — remain banked; `fault.rs` is not in this phase's file list.
+  `CF-75-5` and the phase-112 ALPN rider stand, and the rider was not re-costed.
+- **No subagent was dispatched.**
+- **No §5 state was chained.** The unit ends here; the §5 STATE-4 VERIFICATION
+  GATE is a separate session (§5.1; `ADR-0127`).
+
+### Ledger discipline for this advance
+
+`STATE.md` `29 17`, `STATE_HISTORY.md` `28 0` in four hunks of 8 / 8 / 7 / 5 —
+the same shape as the phase-114 state-3 advance `ad19e9a`, whose `## Last commit`
+section was read for the state-3 shape rather than copying the file as found
+(block + ONE blank + the pending-CI line + THREE blanks + the pointer).
+
+**Relocation proved, not asserted** (ADR-0035): the `(old STATE.md − new
+STATE.md)` non-blank multiset is **16** — Active phase 5, Next expected skill
+4 + the rolling `### Doctrine reminders` §5.1 bullet, Last commit 4, Last updated
+2 — every one of the 16 present in `STATE_HISTORY.md`, **0 missing**, against
+**20** non-blank additions there: 16 + four copies of the one newly created
+`### Superseded at the phase-115 §5 state-3 implementation …` heading. The four
+archive headers were resolved by **EXACT whole-line equality, asserted unique,
+BEFORE any length-changing splice**, and spliced bottom-up.
+
+⚠ The doctrine bullet was archived because the bullet ITSELF was tested — its
+exact predecessor text was **not** already in `STATE_HISTORY.md` — not because
+the prior advance's hunk count said so; that heuristic has been wrong twice.
+
+**Token sweep over the PAIR**, method stated with the number: whitespace-split
+tokens over the concatenated `STATE.md` + `STATE_HISTORY.md`, pair universe
+**90 598 → 90 843** distinct (2 951 177 → 2 996 900 total), **candidate drops 0,
+unconserved 0**. Backticks paired **per line, never whole-file**: `STATE.md` has
+**0** odd-backtick lines and `STATE_HISTORY.md`'s **15** are all pre-existing
+archived wrapped prose — **0** introduced here.
+
+**Traps line**, both spans and both forms: length **280 344** characters (python
+`len`, not `wc -c`); anchored count **83** and naive count **88** over the traps
+line alone, and **83 / 88** over the whole of `STATE.md` — the two spans coincide,
+and this block contributed **exactly +1 to each** by not quoting the marker.
+`STATE.md` column-0 `### ` count is now **5** (was 4); the file is **254** lines.
