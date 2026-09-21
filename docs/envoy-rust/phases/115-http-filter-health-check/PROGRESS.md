@@ -968,3 +968,322 @@ archived wrapped prose — **0** introduced here.
 line alone, and **83 / 88** over the whole of `STATE.md` — the two spans coincide,
 and this block contributed **exactly +1 to each** by not quoting the marker.
 `STATE.md` column-0 `### ` count is now **5** (was 4); the file is **254** lines.
+
+---
+
+# §5 STATE 4 — the §7.5 verification gate
+
+**One commit: this state-advance commit.** The state-3 CI record (`b5c71f6`)
+closed the previous chain, so this session entered owing no CI record —
+detected STRUCTURALLY by reading `STATE.md`'s `## Last commit` block, which
+already carries a CI-confirmed answer (run `35550913313`, attempt 1, `success`,
+`binaries=172 passed=2345 failed=0` on `9aa367c`). `git status --porcelain` was
+empty at entry and HEAD was `b5c71f6d7bcc56843417fd9adfd077682596ea25`, a
+docs-only commit on top of the state-3 code tree.
+
+**No `ADR` fired**: nothing this gate measured contradicts a landed figure. One
+state-3 OBSERVATION did not reproduce (Family B passing alone, below), but that
+is a host-condition reading, not a decision, and the control settles it without
+one. `ROADMAP.md` was NOT touched — row `115` stays `planned` until the state-6
+close-out. **Nothing was fixed** (§6.3; `ADR-0165`) and no carry-forward was
+consumed.
+
+⚠ **§7.5 leg (f) — `REVIEW.md` is approved — is OUT OF SCOPE and is adjudicated
+as such, not as a pass.** It is state 5's product; `115/REVIEW.md` does not
+exist, which is the correct state at the end of a state-4 gate.
+
+## Stop condition — all three legs re-measured from disk, all three FALSE
+
+```
+LEG (i)   rows=123  done=122  planned=1     SUM 123==123
+          not-done: row 115 at ROADMAP.md line 78
+          field-count histogram on ' | ': {6: 121, 7: 1, 10: 1}
+          (the FORBIDDEN NF==6 filter would read 121)
+LEG (ii)  crates=14   tracked manifests=28 (git ls-files '*Cargo.toml')
+          envoy-http3/grpc/wasm/protos/runtime/xds: all six absent by test -d
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0  of 28
+          POSITIVE CONTROL, identical invocation: tokio=19 of 28
+          histogram over crates/ = 0 ; gauge = 365 by `grep -rIo 'gauge' crates/ | wc -l`
+                                               (352 over crates/*/src/)
+LEG (iii) headings=11  slices=11/5/3/14/3/4/6/31/6/0/13  pre-heading=27
+          SUM=123   zero-row family: ['### WASM host family']
+          (census from a /^### / rule that seeds every heading at 0)
+```
+
+`ls stop` → `No such file or directory`. **No `stop` file was created.**
+
+## Leg (e) — the five `cargo` commands
+
+⚠ **An exit-0 `build`/`clippy` on a warm cache is not evidence.** Before each
+of the two, all **22** tracked crate roots (`crates/*/src/{lib,main}.rs` and
+`tests/**/src/{lib,main}.rs`, list driven from `git ls-files`, never a glob —
+`touch` CREATES files) were given an **mtime-only `touch -m`**. `git status
+--porcelain` read EMPTY after both touches and at the end of the run.
+
+```
+cargo build  --workspace --all-targets                 exit 0   22 Compiling   Finished in 11.19s
+cargo clippy --workspace --all-targets --all-features
+             -- -D warnings                            exit 0   22 Checking    Finished in 2.93s
+             warning/error lines in build + clippy logs: 0 / 0
+cargo fmt    --all -- --check                          exit 0   (0 bytes of output)
+cargo deny   check                                     exit 0
+             advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 22 names in the `Compiling` and `Checking` lists are identical: the 14
+`envoy-*` crates + `differential` + `h2spec-conformance` + the six helpers.
+(`cargo deny` also prints its pre-existing `license-not-encountered` WARNING
+for an unmatched allowance in `deny.toml`; it is a warning, all four checks
+read `ok`, and it predates this phase.)
+
+⚠ **A 2.93 s clippy over 22 crates looked too fast to be a real lint pass, so
+it was given a NEGATIVE CONTROL** rather than believed: a four-line function
+`pub fn clippy_negative_control_probe() -> bool { let v = vec![1u8]; v.len() == 0 }`
+was appended to `crates/envoy-filter/src/health_check.rs` and the same clippy
+command re-run:
+
+```
+exit 101
+    Checking envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+error: length comparison to zero
+error: useless use of `vec!`
+error: could not compile `envoy-filter` (lib) due to 2 previous errors
+```
+
+The file was restored with `git checkout --` and **md5-verified** against its
+pre-mutation hash (`RESTORED-md5-ok`, `git status --porcelain` empty), and a
+re-run exited 0. So the fast pass is incremental reuse of the type-check, and the
+lints genuinely execute.
+
+## Legs (a) and (b) — the differential corpus
+
+The harness runs the DEBUG `envoy-bin`; `cargo build -p envoy-bin` exit 0 was
+run first (md5 `b17766df2a50529bafa71a931bbfe434`). Then, redirected to a file
+(never through `tail`), ANSI-stripped and censused by regex with `ok` and
+`FAILED` rows counted separately:
+
+```
+$ cargo test --workspace --no-fail-fast        (exit 101, real 6m53.758s)
+log bytes 262738   test-result rows 172   ok 163   FAILED 9
+passed 2336   failed 9   passed + failed = 2345   Running lines 156   Doc-tests 16
+```
+
+**`binaries = 172` and `passed + failed = 2345` reproduce EXACTLY** — the
+state-3 local run, `PLAN.md`'s prediction, and the CI identity on `9aa367c`
+(`binaries=172 passed=2345 failed=0`). The flake-vs-regression identity closes:
+if this phase had broken a test, the sum would not match CI's `passed`.
+
+### Leg (a) — fixtures `0095` and `0096`, this phase's own witnesses
+
+```
+     Running tests/http_filter_health_check.rs (target/debug/deps/http_filter_health_check-3794e3931298f76c)
+test http_filter_health_check_fixture ... ok
+     Running tests/http_filter_health_check_stats.rs (target/debug/deps/http_filter_health_check_stats-b527d25bf1a19757)
+test http_filter_health_check_stats_fixture ... ok
+```
+
+Both GREEN. Both keep their configs **byte-identical** across the two proxies
+(`cmp` exit 0), with the span stated alongside the hash:
+
+```
+0095 envoy.yaml == envoy-rust.yaml   2484 bytes   md5 85b837a66319583bf8c5a81f6b15f4e1
+0096 envoy.yaml == envoy-rust.yaml   1738 bytes   md5 e66e8ad0cc20d41cf5d7f12ce42ecd65
+```
+
+### Leg (b) — the other fixtures, and the nine local reds
+
+Censused from the `---- <name> stdout ----` markers — exactly the nine that
+state 3 recorded:
+
+```
+access_log_h2_rcd_upstream_reset
+access_log_h2_uc_upstream_reset
+access_log_rcd_upstream_reset
+access_log_rf_upstream_reset
+access_log_upstream_host
+admin_config_dump_server_info
+lb_maglev_fixture
+lb_ring_hash_fixture
+lb_subset_fixture
+```
+
+**Isolation on THIS tree**, each alone with a 20-second settle gap:
+
+```
+access_log_h2_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_rf_upstream_reset | exit=101 | test result: FAILED. 0 passed; 1 failed
+admin_config_dump_server_info | exit=101 | test result: FAILED. 0 passed; 1 failed
+access_log_upstream_host | exit=101 | test result: FAILED. 0 passed; 1 failed
+lb_maglev | exit=101 | test result: FAILED. 0 passed; 1 failed
+lb_ring_hash | exit=101 | test result: FAILED. 0 passed; 1 failed
+lb_subset | exit=101 | test result: FAILED. 0 passed; 1 failed
+ISOLATION DONE 2026-09-21T04:51:17-04:00
+```
+
+⚠⚠ **The finding of this gate: Family B did NOT pass alone this time.** At
+state 3 the four backend-routing fixtures passed in isolation on both trees; here
+all four fail in isolation on this tree. Isolation ALONE would therefore have
+classified them as deterministic — the Family-A signature — and a session
+reasoning from the state-3 tell ("passes alone ⇒ parallel-load flake") would have
+had nothing left to go on. `superpowers:systematic-debugging` was invoked before
+any classification:
+
+- **Where it breaks.** All four panic on the **REFERENCE side** — upstream
+  Envoy's own drive, before envoy-rust's response is compared:
+  `fixture green: upstream envoy http1 drive (Http1AccessLogByteExact probe 0)` /
+  `fixture passes: upstream http1 drive (key \`key-0\`)` (maglev, ring_hash) /
+  `fixture passes: upstream http1 drive (probe \`prod-route\` path \`/prod\`)`
+  (subset), each `Caused by: deadline has elapsed`. No envoy-rust code is on
+  that path.
+- **What changed on the host.** `docker ps -a -q | wc -l` read **93**: a
+  NEIGHBOUR workload (`cache-platform-*` builders, dataplanes and proxies, 24
+  `valkey` containers) was running on the same Docker Desktop VM, with builder
+  containers cycling second by second. The hypothesis: a loaded Docker VM makes
+  the reference container's backend route miss its deadline even with no
+  parallel test load, so the load-sensitive family now fails "alone".
+- **The control.** A detached worktree at `04661b7` (the pre-phase commit;
+  `0095` verified ABSENT there) with its OWN `CARGO_TARGET_DIR`, built
+  `--workspace --all-targets` (exit 0; `envoy-bin` md5
+  `4aad5f4f72b552a7769f3fcb1412fdf5` vs this tree's
+  `b17766df2a50529bafa71a931bbfe434`). Each Family-B fixture was run alone on
+  the control and on this tree **interleaved**, control first, 20 s apart, so
+  both sides saw the same host conditions:
+
+```
+control | access_log_upstream_host | test result: FAILED. 0 passed; 1 failed | fixture green: upstream envoy http1 drive (Http1AccessLogByteExact probe 0)
+phase   | access_log_upstream_host | test result: FAILED. 0 passed; 1 failed | fixture green: upstream envoy http1 drive (Http1AccessLogByteExact probe 0)
+control | lb_maglev                | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (key `key-0`)
+phase   | lb_maglev                | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (key `key-0`)
+control | lb_ring_hash             | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (key `key-0`)
+phase   | lb_ring_hash             | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (key `key-0`)
+control | lb_subset                | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (probe `prod-route` path `/prod`)
+phase   | lb_subset                | test result: FAILED. 0 passed; 1 failed | fixture passes: upstream http1 drive (probe `prod-route` path `/prod`)
+DONE 2026-09-21T04:56:07-04:00 containers=76
+```
+
+  and Family A alone on the same control:
+
+```
+control | access_log_h2_rcd_upstream_reset | test result: FAILED. 0 passed; 1 failed
+control | access_log_h2_uc_upstream_reset | test result: FAILED. 0 passed; 1 failed
+control | access_log_rcd_upstream_reset | test result: FAILED. 0 passed; 1 failed
+control | access_log_rf_upstream_reset | test result: FAILED. 0 passed; 1 failed
+control | admin_config_dump_server_info | test result: FAILED. 0 passed; 1 failed
+```
+
+**All nine fail identically at the pre-phase control, at the same panic site
+and on the same upstream drive.** A test that fails the same way before the
+phase existed was not broken by the phase; CI on native Linux — which reported
+`failed=0` on this exact code tree at `9aa367c` — is authoritative for all nine.
+**The lesson is the one the handoff stated, sharpened:** the Family-B tell
+("passes alone") is a property of the host's load at the time, not of the
+fixture. It held at state 3 and did not hold here. **Only the control
+discriminates; isolation is an input to it, never a verdict on its own.** The
+control worktree was removed afterwards (`git worktree list` shows no scratchpad
+entry).
+
+## Leg (c) — conformance
+
+**The local h2spec gate self-skips and is worth nothing here.** `which h2spec`
+is empty and `tools/` does not exist, so `h2spec_runner.rs` takes its
+`h2spec not found` early-return and reports a vacuous `h2spec_pass_rate_gate ...
+ok`. **Leg (c) is CI-AUTHORITATIVE**: CI installs the pinned h2spec 2.6.0, and
+the positive control that it genuinely executed is `h2spec not found` = 0 in the
+ANSI-stripped CI job log — recorded for `9aa367c` at state 3 and re-checked on
+this advance's own push by the follow-up CI record. **`known-failures.txt` was NOT
+trimmed** — its `3.5/2` entry passes on this host and fails in CI.
+
+## Leg (d) — fuzzing
+
+**Phase 115 added NO fuzz target** — verified, not assumed: `git diff
+--name-status 04661b7..HEAD -- '*fuzz*'` is EMPTY. The letter of (d) is
+therefore vacuous, so all five pre-existing targets were run at the CI contract
+(`cargo +nightly fuzz run <target> -- -max_total_time=30`, from the CRATE
+directory), with the seed-corpus line asserted so an empty-corpus exit 0 cannot
+pass for a run:
+
+```
+parse_bootstrap        | exit 0 | INFO: seed corpus: files: 13014 | Done 200086 runs in 31 second(s)   | crash lines 0
+jwt_parse              | exit 0 | INFO: seed corpus: files: 6250  | Done 6062006 runs in 112 second(s) | crash lines 0
+cdn_loop_parse         | exit 0 | INFO: seed corpus: files: 1638  | Done 10300821 runs in 31 second(s) | crash lines 0
+accesslog_format_parse | exit 0 | INFO: seed corpus: files: 3002  | Done 3534523 runs in 31 second(s)  | crash lines 0
+grpc_health_decode     | exit 0 | INFO: seed corpus: files: 216   | Done 32081561 runs in 31 second(s) | crash lines 0
+```
+
+`parse_bootstrap` covers this phase's new config surface (the `health_check`
+typed config and its validator). The corpus sizes above are LOCAL, mostly
+gitignored artifacts; the TRACKED seed counts are **67 / 3 / 0 / 11 / 1** —
+`cdn_loop_parse` still has **0** tracked seeds (`CF-75-5`, open).
+
+## The four files that had to stay untouched
+
+```
+git diff --numstat 04661b7..HEAD -- <file>
+Cargo.toml                       UNTOUCHED
+Cargo.lock                       UNTOUCHED
+.github/workflows/ci.yml         UNTOUCHED
+tests/differential/src/lib.rs    UNTOUCHED
+POSITIVE CONTROL (same probe, files the phase DID touch):
+crates/envoy-config/src/bootstrap.rs     283  0
+crates/envoy-filter/src/health_check.rs  274  0
+```
+
+## The SPEC's six deliverables, checked on disk
+
+1. `HealthCheckFilterConfig` (`crates/envoy-config/src/bootstrap.rs`) carries
+   `pass_through_mode: bool` with NO `serde(default)` (absent is boot-fatal),
+   `headers: Vec<HeaderMatcher>`, the RECOGNIZED `cache_time` and
+   `cluster_min_healthy_percentages`, and the `serde(skip)` `local_cluster`.
+2. `ConfigError::UnsupportedHealthCheckField` and
+   `ConfigError::UnsupportedHealthCheckPseudoHeader` exist
+   (`crates/envoy-config/src/lib.rs`).
+3. `crates/envoy-filter/src/health_check.rs` exists (274 lines; `HEALTH_CHECK_OK`
+   = `"health_check_ok"`, `X_ENVOY_UPSTREAM_HEALTHCHECKED_CLUSTER`), and
+   `HttpFilterInstance` has **13** production variants, `HealthCheck` the 13th
+   (plus the two `cfg(feature = "test-util")` test variants).
+4. `FilterResponse` carries `pub details: Option<&'static str>`
+   (`crates/envoy-filter/src/types.rs`).
+5. Fixture `0095` (and `0096`, added by `ADR-0201`) are GREEN above.
+6. `BEHAVIOR_CONTRACT.md` grew `72 0` over the phase arc — additions only.
+
+## Doctrine checks
+
+```
+#![forbid(unsafe_code)] in all 14 crates/*/src/{lib,main}.rs: 14 present, 0 missing
+over `git diff -U0 04661b7..HEAD -- crates tests`, added lines:
+  #[allow( 0   #[expect( 0   unsafe 0   #[ignore 0   todo! 0   unimplemented! 0   dbg! 0
+  POSITIVE CONTROL, same probe: #[test]/#[tokio::test] = 30   (= PLAN.md's 30 new test functions)
+```
+
+## Size, re-measured at this commit
+
+```
+git diff --numstat 04661b7..HEAD -- . ':(exclude)docs/'
+  files=23  insertions=1454  deletions=55  NET=1399   (1.0007x the MEASURED 1398)
+```
+
+Identical to state 3's figure; §6.1 does not fire on either axis at the LANDED
+number (8 tasks against ~25; 1399 against ~1500). The single line of drift is
+still `bootstrap.rs`'s blank separator (283 vs 282) and was not re-litigated.
+
+## What this session did NOT do
+
+- **No code, test or fixture changed.** The gate is docs-only; the one clippy
+  negative-control mutation was restored and md5-verified before anything else ran.
+- **`ROADMAP.md` untouched**; row `115` remains `planned`.
+- **No ADR fired**, no carry-forward consumed, nothing fixed — including
+  **CF-115-9** (the `fault` filter's `safe_regex_match` request-time panic).
+- **`known-failures.txt` untouched.**
+- **Leg (f) not attempted** — `REVIEW.md` is state 5's. No §5 state was chained.
+
+## For the state-5 code review
+
+- The nine local reds are adjudicated here **by a pre-phase control under
+  the same host conditions**. Do not re-litigate them. Do NOT rely on the
+  "Family B passes alone" tell: it did not hold at this gate.
+- `SPEC.md`, `ADR-0200` and `ADR-0201` are landed and uneditable; where `SPEC.md`
+  and `PLAN.md` disagree, `PLAN.md` wins on all seven counts `ADR-0201` records.
+- `CF-115-1` … `CF-115-10` stand; `CF-114-6` is CONSUMED; `CF-75-5` open.
+- The next free ADR number is **`ADR-0202`**.
