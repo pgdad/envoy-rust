@@ -1653,9 +1653,6 @@ struct AccessLogResponseInfo<'a> {
     connect_failure: bool,
 }
 
-/// Build the per-request access-log record (extracted verbatim from
-/// `serve_connection`'s factored access-log dispatch site, including the
-/// `%RESPONSE_FLAGS%` derive block).
 /// Phase 114: the UNGATED effective gRPC status. MEASURED on both proxies: the
 /// response `grpc-status` header if present and parseable, else the phase-110
 /// `http_to_grpc_status` map over the response code. Shared by both codecs.
@@ -1673,6 +1670,9 @@ pub fn effective_grpc_status(response_headers: &[(String, String)], status: u16)
     }
 }
 
+/// Build the per-request access-log record (extracted verbatim from
+/// `serve_connection`'s factored access-log dispatch site, including the
+/// `%RESPONSE_FLAGS%` derive block).
 fn build_access_log_record(
     request: AccessLogRequestInfo<'_>,
     response: AccessLogResponseInfo<'_>,
