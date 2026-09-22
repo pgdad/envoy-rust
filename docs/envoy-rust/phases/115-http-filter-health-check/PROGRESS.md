@@ -1820,3 +1820,205 @@ recorded as a MEASUREMENT for the re-review, not adjudicated as a split trigger.
   (`CF-115-4`).
 - `CF-115-1` … `-3` and `-5` … `-14` stand; `CF-75-5` and the phase-112 ALPN rider stand.
 - The next free ADR number is **`ADR-0203`**.
+
+# §5.2 STATE-3 RE-ENTRY (round 2) — the `REVIEW-2.md` §2 fixes
+
+**The work order is `REVIEW-2.md` §2 "Required disposition" items 1–4** (item 5, the full
+gate re-run and the fresh re-review writing `REVIEW-3.md`, belongs to states 4 and 5). The
+state-5 re-review CI record (`7aaf296`) closed the previous chain, so this session entered
+owing no CI record, detected STRUCTURALLY: `STATE.md`'s `## Last commit` block already
+carried the CI-confirmed answer for `8dbe19e` (run `35677237479`). HEAD at entry was
+`7aaf296`, tree clean. **`ADR-0203` fired** (the settle-last design, and the forward
+correction of `ADR-0202`'s open-socket statement). `ROADMAP.md` was NOT touched: row `115`
+stays `planned`. `REVIEW.md`, `REVIEW-2.md`, `SPEC.md` and `ADR-0200`/`0201`/`0202` are not
+edited.
+
+## Stop condition — re-measured from disk, all three legs FALSE
+
+```
+LEG (i)   rows=123  done=122  planned=1   not-done: row 115 at ROADMAP.md line 78
+          status = field 4 on ' | '; field-count histogram {6: 121, 7: 1, 10: 1}
+LEG (ii)  crates=14; envoy-{http3,grpc,wasm,protos,runtime,xds} all absent
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0 of 28 manifests; tokio=19
+          histogram=0 over crates/; gauge=365 (crates/) / 352 (crates/*/src/)
+LEG (iii) 11 headings 11/5/3/14/3/4/6/31/6/0/13 + 27 pre-heading = 123;
+          zero-row family: ### WASM host family
+```
+
+No `stop` file exists and none was created.
+
+## Fix 1 — settle the H1 headers-only framing LAST (item 1; `ADR-0203`)
+
+The cause (`REVIEW-2.md` I2-1): `decorate_filter_reply` pushed the H1 `HEAD`
+`transfer-encoding: chunked` at the decode-side `SynthFromDecode` site; the encode-side
+filter pass and `apply_grpc_local_reply` run later and can add a `content-length`.
+
+- `decorate_filter_reply` no longer pushes the `HEAD` framing header. It still strips any
+  filter-supplied `content-length`/`transfer-encoding`, and still pushes `content-length: 0`
+  for an H1 non-`HEAD` reply (the non-`HEAD` wire is unchanged in content and order).
+- NEW `pub fn settle_headers_only_framing(resp, head_request, grpc_transformed)`
+  (`crates/envoy-http1/src/hcm.rs`), called ONCE in the H1 serve loop right after the gRPC
+  transform, before the log/counter derivations and the wire write, whenever the reply is
+  headers-only. A new per-request local `headers_only_reply` is set at BOTH H1 decoration
+  sites (decode-side `SynthFromDecode`, encode-side `StopAndSend` replacement).
+- Rule: a gRPC-transformed `HEAD` drops the transform's `content-length: 0` (it models the
+  non-`HEAD` codec default); then a remaining `content-length` wins and every
+  `transfer-encoding` is dropped; otherwise, with no `transfer-encoding` present, a `HEAD`
+  gets `transfer-encoding: chunked` and anything else `content-length: 0`. Invariant: never
+  both framing headers.
+- `crate::grpc::apply_grpc_local_reply` now returns `true` exactly when that call
+  transformed the reply. The io_uring caller (`uring.rs`) ignores it; that worker never runs
+  the filter pipeline.
+- H2 is untouched (its decoration pushes no framing header; `REVIEW-2.md` measured the
+  `content-length: 7` composition at parity on H2). Other filters' local replies are
+  untouched. `CF-115-14` / `CF-115-15` are NOT fixed.
+
+## Fix 2 — the in-process pins, each RED first and RED by mutation (item 2)
+
+Written and RUN RED on the unfixed tree before any production code changed:
+
+```
+test hcm::tests::h1_health_check_head_intercept_keeps_a_later_content_length_alone ... FAILED
+    HEAD: ... transfer-encoding: chunked ... content-length: 7   (assert !transfer-encoding)
+test hcm::tests::h1_health_check_head_grpc_intercept_is_chunked_without_content_length ... FAILED
+    ... transfer-encoding: chunked ... content-length: 0          (assert !content-length)
+test hcm::tests::h1_health_check_head_intercept_is_chunked_and_bodyless ... ok
+```
+
+Both failed on exactly the predicted assertion. After the fix `envoy-http1 --lib`:
+**251 passed, 0 failed** (248 + the two end-to-end pins + the new unit test
+`settle_headers_only_framing_never_leaves_both_framing_headers`; the dispatcher unit test
+`decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method` is updated for the
+deferred `HEAD` push).
+
+Mutations — each target asserted to occur exactly once (one attempt whose target was NOT
+unique was refused by the script's assert and served as an extra unmutated control), each
+run with `Compiling envoy-http1` asserted, the file restored md5-identical
+(`1e87dbc3a82b2edf249b4fcbb1ed90a7`), the unmutated control GREEN at 251/0:
+
+| # | mutation | result |
+|---|---|---|
+| M1 | restore the `e569f5b` ORDERING: settle at the decode-side site (both H1 decoration arms), before the encode pass and the gRPC transform; the late call deleted | **249/2**: exactly the two end-to-end pins |
+| M2 | disable the gRPC-`HEAD` drop (`if false && head_request && grpc_transformed`) | **249/2**: G1 end-to-end + the unit test |
+| M3 | delete the `transfer-encoding` drop when a `content-length` is present | **250/1**: the unit test only |
+
+M3 reds no end-to-end cell because, with the `HEAD` push deferred, nothing reaches that
+branch unless a stage writes a `transfer-encoding` (the unit test pins it).
+
+## Fix 3 — the differential witnesses (item 3)
+
+- **G1 → probe `p12` in `0095`**, with NO config change: `HEAD /healthz` +
+  `extra_headers: content-type: application/grpc`, empty body, `set_equal_modulo_allow_list`.
+- **3a → the NEW fixture `0097-http-filter-health-check-framing`**: `[health_check,
+  header_mutation (response content-length: 7, OVERWRITE_IF_EXISTS_OR_ADD), router]`, a
+  `direct_response` catch-all, backend-free and cluster-free; `envoy.yaml` ≡
+  `envoy-rust.yaml` by `cmp`; test `tests/differential/tests/http_filter_health_check_framing.rs`.
+  ONE probe, `HEAD /healthz`: every `GET` reply on that listener carries `content-length: 7`
+  over a 0- or 4-byte body, which a content-length read cannot terminate on (MEASURED: a
+  `curl` readiness poll against it hung), so the `GET` cell stays in-process.
+
+```
+cargo build -p envoy-bin
+cargo test -p differential --test http_filter_health_check          1 passed (1.24s)
+cargo test -p differential --test http_filter_health_check_framing  1 passed (1.21s)
+```
+
+Negative control (V7 in `0095`'s README, V1 in `0097`'s): M1 applied, debug `envoy-bin`
+rebuilt (`Compiling envoy-http1` … `envoy-bin`; md5 `8f0daf79…` → `ac1af006…`), a 4 Hz
+`docker ps` poll through each run, a 10 s settle gap:
+
+```
+0095: fixture green: probe p12-head-grpc-intercept-chunked-no-content-length: diff_headers   (p1–p11 green)
+      poll: envoyproxy/envoy:v1.33.0 fe693d1f89e5  (one container)
+0097: fixture green: probe p1-head-intercept-later-content-length-alone: diff_headers
+      poll: envoyproxy/envoy:v1.33.0 c7bbd9fcf594  (one container)
+```
+
+Restored, rebuilt: `envoy-bin` md5 `8f0daf79d7cecf7af4ab6f10f31ec61e` — equal to the
+pre-mutation build — and both fixtures GREEN again (1.26 s each).
+
+**Raw-wire re-measurement, both proxies** (upstream `envoyproxy/envoy:v1.33.0`, image
+`sha256:56da5afd…770c2` by `docker inspect`, `docker run -p` onto free host ports, the
+fixtures' own `envoy.yaml` with `{{PORT}}`→10000; envoy-rust the fixed debug `envoy-bin` on
+the fixtures' `envoy-rust.yaml`; one request per connection under `Connection: close`; a
+**10 s** socket read; `date` stripped):
+
+```
+cell                       upstream                                                        envoy-rust
+HEAD /healthz              filter, server, connection: close, TE chunked      EOF 1.002s   same set                       EOF 0.001s
+GET  /healthz              filter, server, connection: close, CL 0            EOF 1.002s   same set                       EOF 0.000s
+HEAD /other                CL 4, content-type, server, connection: close      EOF 1.002s   same set + `MAIN` (CF-115-14)  EOF 0.000s
+GET  /other                CL 4, content-type, server, connection: close, MAIN EOF 1.002s  same                           EOF 0.000s
+HEAD /healthz + grpc (G1)  content-type grpc, grpc-status 2, filter, server,
+                           connection: close, TE chunked, NO CL               EOF 1.002s   same set                       EOF 0.000s
+HEAD /healthz, 0097 (3a)   CL 7, filter, server, connection: close, NO TE     EOF 1.003s   same set                       EOF 0.000s
+```
+
+## Fix 4 — the record (item 4; `REVIEW-2.md` R2-1 and M2-5)
+
+- **R2-1.** The table above re-measures it: upstream closes EVERY H1 cell, `HEAD` included,
+  after ~1 s. The `# §5.2 STATE-3 RE-ENTRY` Step 0 item 1 above ("left OPEN") was a 1 s
+  read timeout; it is left as written (this log is append-only) and corrected here and in
+  `ADR-0203`. Corrected in place where the claim is live: the `BEHAVIOR_CONTRACT.md`
+  wire-shape bullet, `0095`'s README, and the `drive_http1` comment in
+  `tests/differential/src/lib.rs`. The head-only `HEAD` read stays, on RFC 9110 §9.3.2.
+- **M2-5.** The contract lead "Each bullet below names its witness" is now true: the
+  `:path`-verbatim bullet and the four config-validity bullets are `[in-process]` (each
+  pinned by a landed `envoy-config` test — `pass_through_mode_is_required`,
+  `rejects_the_three_unimplemented_fields`, `rejects_pseudo_headers_other_than_path`,
+  `runs_the_shared_header_matcher_validation` — or by the filter's own unit tests), and the
+  three "does NOT match" bullets are labelled beside their CF numbers. The framing table
+  gains the G1 row (`[0095]` `p12`) and a settled-last paragraph (`[0097]` `p1`).
+
+## Verification at this re-entry
+
+State 4 re-runs the full §7.5 gate. What this session ran:
+
+```
+cargo fmt --all -- --check                               exit 0, 0 bytes
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+    (after touch -m of the envoy-http1 and envoy-http2 crate roots)
+                                                         exit 0, 8 Checking, 0 warning/error lines
+cargo build --workspace --all-targets                    exit 0
+cargo deny check                                         advisories ok, bans ok, licenses ok, sources ok
+cargo test --workspace --no-fail-fast                    exit 101
+    ANSI-stripped, regex `test result: (ok|FAILED)`:     173 rows = 166 ok + 7 FAILED
+    passed=2349 failed=7   passed + failed = 2356
+```
+
+**The identity moved exactly as PREDICTED before the run: binaries 172 → 173 (the new
+`http_filter_health_check_framing` test binary) and `2352 + 4 = 2356`** — the 3 new
+`envoy-http1` tests (two end-to-end pins, one unit test) and the 1 new fixture test.
+`Cargo.toml`, `Cargo.lock` and `.github/` are untouched. Seven local failures, by their
+`---- <name> stdout ----` markers, and NONE is on a path this fix touches:
+
+- `access_log_{h2_rcd,h2_uc,rcd,rf}_upstream_reset` and `admin_config_dump_server_info` —
+  the five PRE-EXISTING Family-A host reds the state-4 gates classified against an
+  interleaved pre-phase control. Not re-adjudicated here.
+- `upstream_tcp_health_check_fixture` (`upstream Envoy never became accept-ready … within
+  10s`) and `envoy-bin` `network_filter_rbac::connection_that_sends_nothing_is_never_evaluated`
+  (`admin up: … Connection refused`) — readiness reds under full-suite load. Each PASSED ALONE
+  2/2 with a 15 s settle gap (`1 passed`, asserted — not a filtered-out false green). Neither
+  configures the `health_check` HTTP filter. State 4 classifies them against a control.
+
+**CI prediction: `binaries=173 passed=2356 failed=0`.**
+
+Size: net **427** lines excluding `docs/` (458 insertions, 31 deletions over 11 files), read
+off `git diff --numstat` at staging time.
+
+## What this session did NOT do
+
+- **Did not run the §7.5 gate.** State 4 runs it in full; a fresh state-5 session writes
+  `REVIEW-3.md`. No state was chained.
+- **Did not touch `ROADMAP.md`** (row `115` stays `planned`), `REVIEW.md`, `REVIEW-2.md`,
+  `SPEC.md`, `ADR-0200`/`0201`/`0202`, or `known-failures.txt`.
+- **Did not widen** the settle-last rule to other filters' local replies or to H2, did not
+  reorder the gRPC transform against the encode pass, and did not fix `CF-115-14` or any
+  `CF-115-15` lead. Minors M2-1 … M2-4, M2-6 were not taken (M2-5 was, as item 4; M2-7 lives
+  in `REVIEW-2.md`).
+
+## For the §5 state-4 re-verification
+
+- Rebuild the DEBUG `envoy-bin` before the differential corpus. Fixture `0095` now has
+  TWELVE probes; `0097` is new (one probe). Both are backend-free.
+- The next free ADR number is **`ADR-0204`**.

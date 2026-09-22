@@ -1008,6 +1008,9 @@ async fn serve_connection(
         // CF-110-2). Defaults to `true` so a newly added synth arm is covered
         // by omission rather than silently skipped.
         let mut outgoing_local = true;
+        // ADR-0203: the reply is a filter's HEADERS-ONLY reply, whose H1
+        // framing is settled after the encode pass and the gRPC transform.
+        let mut headers_only_reply = false;
 
         // 8. Dispatch the request_path to the wire. 07.1 Task 6 wraps the
         // Task 5 writer-arm match inside `RequestPath::Match(outcome)`; the
@@ -1402,6 +1405,7 @@ async fn serve_connection(
                 }
             },
             RequestPath::SynthFromDecode(resp, details, headers_only) => {
+                headers_only_reply = headers_only;
                 // 07.1 Task 6: decode-side filter short-circuit. Unreachable
                 // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation
                 // (which never short-circuits via StopAndSend on production
@@ -1451,6 +1455,7 @@ async fn serve_connection(
             envoy_filter::Decision::StopAndSend(replacement) => {
                 // Replace outgoing entirely with the filter's substitute response.
                 let headers_only = replacement.headers_only;
+                headers_only_reply = headers_only;
                 outgoing_direct = false;
                 // 110.1: a filter's substitute response IS a local reply, even
                 // when it replaced a proxied one. MEASURED upstream: an RBAC
@@ -1502,6 +1507,7 @@ async fn serve_connection(
         // `envoy-http2` calls `envoy_http1::build_response`, so a transform
         // there would rewrite H2 route-decision replies while missing H2's own
         // `synth_h2_*` family (CF-110-1; the ADR-0049 class).
+        let mut grpc_transformed = false;
         if outgoing_local {
             // A local reply never takes the zero-copy direct-head path:
             // `direct_head: true` is set at exactly one site, the successful
@@ -1510,7 +1516,11 @@ async fn serve_connection(
                 !outgoing_direct,
                 "a local reply must never carry a pre-serialized direct head"
             );
-            crate::grpc::apply_grpc_local_reply(&mut outgoing, &req.headers);
+            grpc_transformed = crate::grpc::apply_grpc_local_reply(&mut outgoing, &req.headers);
+        }
+        // ADR-0203: LAST — no stage after this point writes a header.
+        if headers_only_reply {
+            settle_headers_only_framing(&mut outgoing, req.method == "HEAD", grpc_transformed);
         }
 
         let response_status_for_log: u16 = outgoing.status;
@@ -2636,9 +2646,11 @@ pub fn decorate_filter_synth_response(resp: &mut Response, connection: Option<&s
 /// wire (MEASURED against v1.33.0, phase-115 `REVIEW.md` I-1/I-2):
 ///
 /// - H1 (`connection` is `Some`), non-HEAD: `content-length: 0`;
-/// - H1 HEAD (`head_request`): `transfer-encoding: chunked`, NO
-///   `content-length`, and — the body being empty — no body bytes, not even a
-///   chunk terminator;
+/// - H1 HEAD (`head_request`): NO framing header HERE — the caller MUST run
+///   [`settle_headers_only_framing`] after every later stage, which settles
+///   `transfer-encoding: chunked` (NO `content-length`, and — the body being
+///   empty — no body bytes, not even a chunk terminator) unless a later
+///   stage wrote a `content-length` (ADR-0203);
 /// - H2 (`connection` is `None`): NO framing header.
 ///
 /// Any `content-length` / `transfer-encoding` the filter supplied is
@@ -2659,7 +2671,44 @@ pub fn decorate_filter_reply(
         !k.eq_ignore_ascii_case(headers::CONTENT_LENGTH)
             && !k.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
     });
-    if connection.is_some() {
+    // ADR-0203: an H1 `HEAD` reply's `transfer-encoding: chunked` is NOT
+    // pushed here — a later stage can still write a `content-length` — but by
+    // [`settle_headers_only_framing`], after every such stage.
+    if connection.is_some() && !head_request {
+        resp.headers
+            .push((headers::CONTENT_LENGTH.to_string(), "0".to_string()));
+    }
+    add_standard_filter_reply_headers(resp, connection);
+}
+
+/// ADR-0203: settle an H1 headers-only reply's framing LAST — after the
+/// encode-side filter pass and the gRPC local-reply transform, either of
+/// which can write a `content-length` after [`decorate_filter_reply`] ran.
+/// Upstream's codec frames the reply once, at the wire (MEASURED against
+/// v1.33.0, phase-115 `REVIEW-2.md` I2-1):
+///
+/// - a `content-length` a later stage wrote wins, and no
+///   `transfer-encoding` goes beside it;
+/// - with none, a `HEAD` reply is `transfer-encoding: chunked` and any
+///   other reply `content-length: 0`.
+///
+/// `grpc_transformed` means the gRPC transform rewrote this reply; its
+/// appended `content-length: 0` is the non-`HEAD` codec default rather than a
+/// header any stage chose, so on a `HEAD` it is dropped. Invariant: the
+/// reply never carries BOTH framing headers.
+pub fn settle_headers_only_framing(
+    resp: &mut Response,
+    head_request: bool,
+    grpc_transformed: bool,
+) {
+    let is_cl = |k: &str| k.eq_ignore_ascii_case(headers::CONTENT_LENGTH);
+    let is_te = |k: &str| k.eq_ignore_ascii_case(headers::TRANSFER_ENCODING);
+    if head_request && grpc_transformed {
+        resp.headers.retain(|(k, _)| !is_cl(k));
+    }
+    if resp.headers.iter().any(|(k, _)| is_cl(k)) {
+        resp.headers.retain(|(k, _)| !is_te(k));
+    } else if !resp.headers.iter().any(|(k, _)| is_te(k)) {
         let framing = if head_request {
             (headers::TRANSFER_ENCODING, "chunked")
         } else {
@@ -2668,7 +2717,6 @@ pub fn decorate_filter_reply(
         resp.headers
             .push((framing.0.to_string(), framing.1.to_string()));
     }
-    add_standard_filter_reply_headers(resp, connection);
 }
 
 /// The framing-independent half of the ADR-0033 decoration: `content-type`
@@ -3658,8 +3706,10 @@ static_resources:
 
     /// ADR-0202: a headers-only filter reply carries exactly the framing
     /// header its codec and method put on upstream's wire (MEASURED against
-    /// v1.33.0): H1 non-HEAD `content-length: 0`; H1 HEAD
-    /// `transfer-encoding: chunked` and NO `content-length`; H2 neither.
+    /// v1.33.0): H1 non-HEAD `content-length: 0`; H2 neither. ADR-0203: the
+    /// H1 HEAD `transfer-encoding: chunked` is NOT decided here but by
+    /// `settle_headers_only_framing`, after every stage that can still write
+    /// a `content-length`.
     #[test]
     fn decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method() {
         let decorated = |connection: Option<&str>, head: bool| {
@@ -3691,15 +3741,75 @@ static_resources:
         );
         assert_eq!(
             decorated(Some("keep-alive"), true),
-            [
-                "x-a=1",
-                "transfer-encoding=chunked",
-                "server=envoy-rust",
-                "connection=keep-alive"
-            ]
+            ["x-a=1", "server=envoy-rust", "connection=keep-alive"]
         );
         assert_eq!(decorated(None, false), ["x-a=1", "server=envoy-rust"]);
         assert_eq!(decorated(None, true), ["x-a=1", "server=envoy-rust"]);
+    }
+
+    /// ADR-0203: an H1 headers-only reply's framing is settled LAST. A
+    /// `content-length` a later stage wrote wins alone; without one a HEAD is
+    /// `transfer-encoding: chunked` and anything else `content-length: 0`; a
+    /// gRPC-transformed HEAD drops the transform's `content-length: 0`. No
+    /// cell ends with BOTH framing headers.
+    #[test]
+    fn settle_headers_only_framing_never_leaves_both_framing_headers() {
+        let settled = |hdrs: &[(&str, &str)], head: bool, grpc: bool| {
+            let mut resp = Response {
+                status: 200,
+                reason: None,
+                headers: hdrs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body: bytes::Bytes::new(),
+            };
+            super::settle_headers_only_framing(&mut resp, head, grpc);
+            resp.headers
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        // Nothing wrote a framing header: the codec default per method.
+        assert_eq!(
+            settled(&[("x-a", "1")], true, false),
+            ["x-a=1", "transfer-encoding=chunked"]
+        );
+        assert_eq!(
+            settled(&[("x-a", "1")], false, false),
+            ["x-a=1", "content-length=0"]
+        );
+        // A later stage's content-length wins, alone (REVIEW-2 cell 3a).
+        assert_eq!(
+            settled(&[("content-length", "7")], true, false),
+            ["content-length=7"]
+        );
+        assert_eq!(
+            settled(
+                &[("content-length", "0"), ("Transfer-Encoding", "chunked")],
+                false,
+                false
+            ),
+            ["content-length=0"]
+        );
+        // The gRPC transform's content-length: 0 on a HEAD (cell G1).
+        assert_eq!(
+            settled(&[("grpc-status", "2"), ("content-length", "0")], true, true),
+            ["grpc-status=2", "transfer-encoding=chunked"]
+        );
+        assert_eq!(
+            settled(
+                &[("grpc-status", "2"), ("content-length", "0")],
+                false,
+                true
+            ),
+            ["grpc-status=2", "content-length=0"]
+        );
+        // A transfer-encoding some stage wrote, with no content-length, stays.
+        assert_eq!(
+            settled(&[("transfer-encoding", "chunked")], true, false),
+            ["transfer-encoding=chunked"]
+        );
     }
 
     /// ADR-0202: `headers_only: false` keeps the ADR-0033 decoration exactly —
@@ -7449,6 +7559,16 @@ static_resources:
     async fn health_check_h1_config(
         log: &std::path::Path,
     ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
+        health_check_h1_config_with(log, "").await
+    }
+
+    /// [`health_check_h1_config`] with `after` — YAML `http_filters` entries
+    /// at the list's indentation — placed between the health_check filter
+    /// and the router.
+    async fn health_check_h1_config_with(
+        log: &std::path::Path,
+        after: &str,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
         let yaml = format!(
             r#"
 node: {{ id: n, cluster: hc-node-cluster }}
@@ -7486,7 +7606,7 @@ static_resources:
                       pass_through_mode: false
                       headers:
                         - {{ name: ":path", string_match: {{ exact: /healthz }} }}
-                  - name: envoy.filters.http.router
+{after}                  - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters: []
@@ -7596,6 +7716,83 @@ GET /other HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
             "nothing precedes the next reply: {rest:?}"
         );
         assert!(rest.ends_with("MAIN"), "{rest:?}");
+    }
+
+    /// Split an H1 reply into its lower-cased head and whatever follows it.
+    fn split_reply(wire: &[u8]) -> (String, String) {
+        let wire = String::from_utf8(wire.to_vec()).unwrap();
+        let (head, rest) = wire.split_once("\r\n\r\n").expect("a reply head");
+        (head.to_ascii_lowercase(), rest.to_string())
+    }
+
+    /// ADR-0203 (phase-115 `REVIEW-2.md` I2-1, cell 3a): a `header_mutation`
+    /// placed AFTER `health_check` that writes `content-length: 7` on the
+    /// response runs in the encode pass, AFTER the intercept. Upstream
+    /// settles framing last, so a `HEAD` intercept carries that
+    /// `content-length` ALONE — never beside `transfer-encoding: chunked`
+    /// (MEASURED against v1.33.0). The `GET` cell (3b) carries it too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_head_intercept_keeps_a_later_content_length_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after = r#"                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        response_mutations:
+                          - append:
+                              header: { key: content-length, value: "7" }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+"#;
+        let (config, _) = health_check_h1_config_with(&dir.path().join("a.log"), after).await;
+        for method in ["HEAD", "GET"] {
+            let req = format!("{method} /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            let (head, rest) = split_reply(&drive(Arc::clone(&config), req.as_bytes()).await);
+            assert!(head.starts_with("http/1.1 200 "), "{method}: {head}");
+            assert!(
+                head.contains("\r\nx-envoy-upstream-healthchecked-cluster: hc-node-cluster"),
+                "{method}: {head}"
+            );
+            assert_eq!(
+                head.matches("\r\ncontent-length: ").count(),
+                1,
+                "{method}: {head}"
+            );
+            assert!(head.contains("\r\ncontent-length: 7"), "{method}: {head}");
+            assert!(!head.contains("transfer-encoding"), "{method}: {head}");
+            assert_eq!(rest, "", "{method}: no body bytes");
+        }
+    }
+
+    /// ADR-0203 (phase-115 `REVIEW-2.md` I2-1, cell G1): a `HEAD` intercept of
+    /// a gRPC request passes through the gRPC local-reply transform, whose
+    /// appended `content-length: 0` is the non-`HEAD` codec default, not a
+    /// header any stage chose. Upstream frames the reply
+    /// `transfer-encoding: chunked` with `content-type: application/grpc`,
+    /// `grpc-status: 2` and NO `content-length` (MEASURED against v1.33.0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_head_grpc_intercept_is_chunked_without_content_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, _) = health_check_h1_config(&dir.path().join("a.log")).await;
+        let req = b"HEAD /healthz HTTP/1.1\r\nHost: x\r\ncontent-type: application/grpc\r\n\
+Connection: close\r\n\r\n";
+        let (head, rest) = split_reply(&drive(config, req).await);
+        assert!(head.starts_with("http/1.1 200 "), "{head}");
+        assert!(
+            head.contains("\r\nx-envoy-upstream-healthchecked-cluster: hc-node-cluster"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\ncontent-type: application/grpc"),
+            "{head}"
+        );
+        assert!(head.contains("\r\ngrpc-status: 2"), "{head}");
+        assert_eq!(
+            head.matches("\r\ntransfer-encoding: chunked").count(),
+            1,
+            "{head}"
+        );
+        assert!(!head.contains("content-length"), "{head}");
+        assert_eq!(rest, "", "no body bytes");
     }
 
     #[tokio::test]

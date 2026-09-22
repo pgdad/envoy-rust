@@ -2419,10 +2419,11 @@ pub async fn drive_http1(
     // which is what the harness always asks for via the close header).
     // A HEAD reply has NO body whatever its framing headers say (RFC 9110
     // §9.3.2): read nothing past the head. Upstream answers a health-check
-    // HEAD with `transfer-encoding: chunked` and leaves the socket open even
-    // under `Connection: close` (MEASURED, phase 115), so any further read
-    // would wait out the timeout. It follows that this driver cannot see
-    // stray bytes after a HEAD reply (CF-115-14).
+    // HEAD with `transfer-encoding: chunked` and closes only after a ~1 s
+    // delayed close under `Connection: close` (MEASURED with a 10 s read,
+    // ADR-0203 — the earlier "left open" reading was a 1 s read timeout), so
+    // a framing-driven read would stall on it. It follows that this driver
+    // cannot see stray bytes after a HEAD reply (CF-115-14).
     //
     // 06.1 Task 13 fix: this arm previously hard-defaulted content_length
     // to 0 and only handled the `Some(content_length)` shape, so an admin

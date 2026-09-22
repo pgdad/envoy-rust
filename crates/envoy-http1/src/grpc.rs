@@ -142,9 +142,16 @@ pub(crate) fn grpc_message_encode(body: &[u8]) -> String {
 /// `build_response`/`build_response_in`, because `envoy-http2` calls
 /// `envoy_http1::build_response` (`crates/envoy-http2/src/hcm.rs:518-522`).
 /// See the module doc.
-pub(crate) fn apply_grpc_local_reply(resp: &mut Response, req_headers: &[(String, String)]) {
+///
+/// Returns `true` exactly when THIS call transformed the reply, so a caller
+/// can tell the appended `content-length: 0` apart from a header an earlier
+/// stage chose (ADR-0203).
+pub(crate) fn apply_grpc_local_reply(
+    resp: &mut Response,
+    req_headers: &[(String, String)],
+) -> bool {
     if !is_grpc_request(req_headers) {
-        return;
+        return false;
     }
     // IDEMPOTENCE GUARD. The transform ALWAYS emits `grpc-status`, so its
     // presence is an exact sentinel for "this reply has already been
@@ -161,7 +168,7 @@ pub(crate) fn apply_grpc_local_reply(resp: &mut Response, req_headers: &[(String
     // reaches this function twice; the guard keeps that a property of the
     // FUNCTION rather than of the current call graph.
     if headers::find_header(&resp.headers, headers::GRPC_STATUS).is_some() {
-        return;
+        return false;
     }
 
     let grpc_status = http_to_grpc_status(resp.status);
@@ -218,6 +225,7 @@ pub(crate) fn apply_grpc_local_reply(resp: &mut Response, req_headers: &[(String
     resp.reason = None;
     resp.headers = out;
     resp.body = Bytes::new();
+    true
 }
 
 #[cfg(test)]

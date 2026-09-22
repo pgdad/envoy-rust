@@ -1,0 +1,24 @@
+# Phase 115 (ADR-0203; phase-115 REVIEW-2.md I2-1 cell 3a): ONE HTTP/1.1 probe
+# at a backend-free, CLUSTER-FREE HCM listener whose chain is
+#   [health_check (:path exact /healthz),
+#    header_mutation (response content-length: 7, OVERWRITE_IF_EXISTS_OR_ADD),
+#    router]
+#
+#   p1  HEAD /healthz — the intercept's framing is settled AFTER the encode
+#       pass, so the mutation's `content-length: 7` is its ONLY framing
+#       header; upstream sends no `transfer-encoding` beside it (MEASURED
+#       against envoyproxy/envoy:v1.33.0). The driver reads a HEAD reply's
+#       head only, so the header set is what discriminates.
+#
+# Why only HEAD: every GET reply here carries `content-length: 7` over a
+# 0- or 4-byte body, which a content-length read cannot terminate on.
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: p1-head-intercept-later-content-length-alone
+      method: head
+      path: "/healthz"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list

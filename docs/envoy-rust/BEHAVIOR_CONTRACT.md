@@ -1961,12 +1961,14 @@ encode-side behavior (cdn_loop is request-only).
 > liveness probe AT THE PROXY: a request matching every configured header matcher is
 > short-circuited with a local reply and never reaches the route; anything else continues down
 > the chain. Decode-side only, no per-route config. Witnessed differentially on **H1 only** by
-> fixtures `0095-http-filter-health-check` (eleven probes, the wire) and
-> `0096-http-filter-health-check-stats` (the counters) against `envoyproxy/envoy:v1.33.0`. **Each
-> bullet below names its witness** — `[0095]`/`[0096]` differential, `[in-process]` a unit or
-> in-process HCM test only, `[measured, no in-tree witness]` measured against upstream and pinned
-> by nothing in the tree (phase-115 `REVIEW.md` I-3 / N-10; corrected at the §5.2 state-3
-> re-entry, `ADR-0202`).
+> fixtures `0095-http-filter-health-check` (twelve probes, the wire),
+> `0096-http-filter-health-check-stats` (the counters) and `0097-http-filter-health-check-framing`
+> (the framing composed with a later encode-side filter) against `envoyproxy/envoy:v1.33.0`.
+> **Each bullet below names its witness** — `[0095]`/`[0096]`/`[0097]` differential,
+> `[in-process]` a unit or in-process HCM test only, `[measured, no in-tree witness]` measured
+> against upstream and pinned by nothing in the tree (phase-115 `REVIEW.md` I-3 / N-10; corrected
+> at the §5.2 state-3 re-entry, `ADR-0202`; the eight bullets that carried no label were labelled
+> at the round-2 re-entry, `REVIEW-2.md` M2-5, `ADR-0203`).
 
 **health_check intercept wire shape (MEASURED).**
 
@@ -1978,13 +1980,23 @@ encode-side behavior (cdn_loop is request-only).
   |---|---|---|
   | H1, non-`HEAD` (`GET`, `POST`) | `content-length: 0` | `[0095]` `p1`, `p6`–`p8`; `[in-process]` |
   | H1, `HEAD` | **`transfer-encoding: chunked`, NO `content-length`**, and no body bytes — not even a chunk terminator | `[0095]` `p11`; `[in-process]` (a `GET` pipelined behind it is answered) |
+  | H1, `HEAD`, gRPC request (`content-type: application/grpc`) | `transfer-encoding: chunked`, NO `content-length` — beside the gRPC local-reply headers `content-type: application/grpc` and `grpc-status: 2` | `[0095]` `p12`; `[in-process]` |
   | H2, `GET` and `HEAD` | **NONE** — no `content-length` | `[in-process]` only (CF-115-4) |
+
+  **On H1 the framing is settled LAST** (`ADR-0203`), after the encode-side filter pass and the
+  gRPC local-reply transform: a `content-length` a LATER stage writes is the reply's only framing
+  header — with `header_mutation` placed after `health_check` writing `content-length: 7`, a
+  `HEAD` intercept carries `content-length: 7` and NO `transfer-encoding` on both proxies
+  (`[0097]` `p1`; `[in-process]`, `GET` too). A headers-only reply never carries both framing
+  headers (`[in-process]`).
 
   **This framing is the health-check reply's alone.** Every other filter's local reply keeps the
   ADR-0033 decoration (`content-length` from `body.len()`); upstream's framing of those replies on
-  H2 and on HEAD is UNMEASURED and is not claimed here. Upstream leaves an H1 `HEAD` intercept's
-  connection OPEN even when the request and the reply both say `Connection: close`; envoy-rust
-  closes it. Connection lifetime is not compared (§7.2 timing row).
+  H2 and on HEAD is UNMEASURED and is not claimed here. Under `Connection: close` upstream closes
+  every H1 intercept's connection — `HEAD` and `GET` alike — after a delayed close of ~1 s
+  (MEASURED with a 10 s read at 1.002 s; the earlier "left OPEN" reading was a 1 s read timeout,
+  `REVIEW-2.md` R2-1, corrected by `ADR-0203`); envoy-rust closes at once. Connection lifetime is
+  not compared (§7.2 timing row). `[measured, no in-tree witness]`
 - One filter header, `x-envoy-upstream-healthchecked-cluster`, whose value is the bootstrap
   **`node.cluster`** — empty only when the bootstrap has no `node` (or an empty `cluster`). It is
   NOT an upstream cluster (an unrelated static cluster does not change it) and NOT an echo (a
@@ -2013,7 +2025,7 @@ encode-side behavior (cdn_loop is request-only).
 - Chain order is declaration order: `[health_check, fault(abort 100%)]` answers `/healthz` with
   200; `[fault, health_check]` answers it with the fault's 503. `[measured, no in-tree witness]`
 - envoy-rust feeds a `:path` matcher `FilterRequest::path` verbatim (both codecs keep the query
-  there); no codec puts pseudo-headers into the filter-visible header list.
+  there); no codec puts pseudo-headers into the filter-visible header list. `[in-process]`
 
 **health_check stats (MEASURED).**
 
@@ -2033,27 +2045,30 @@ encode-side behavior (cdn_loop is request-only).
 **health_check config validity (ALL BOOT-FATAL — ADR-0049).**
 
 - `pass_through_mode` is REQUIRED on both sides. `@type` =
-  `type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck`.
+  `type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck`. `[in-process]`
 - **Recorded REJECT-direction divergences** — upstream ACCEPTS, envoy-rust rejects with
   `ConfigError::UnsupportedHealthCheckField`: `pass_through_mode: true` (CF-115-5), any
   `cache_time` (CF-115-5; upstream rejects it only when `pass_through_mode` is `false`, with a
   message that misspells the field `path_through_mode` — envoy-rust does NOT reproduce the typo,
-  §7.4), and any `cluster_min_healthy_percentages` (CF-115-1).
+  §7.4), and any `cluster_min_healthy_percentages` (CF-115-1). `[in-process]`
 - A matcher naming `:method`, `:authority`, `:scheme` or any other `:`-prefixed name except
   `:path` is rejected with `ConfigError::UnsupportedHealthCheckPseudoHeader`; upstream MATCHES all
-  three (CF-115-6). `host` is an ordinary header on both sides.
+  three (CF-115-6). `host` is an ordinary header on both sides. `[in-process]`
 - Each matcher runs the shared `HeaderMatcher` validation (empty name, bad regex, bad range).
+  `[in-process]` (the empty name and the bad regex)
 
 **health_check — measured behaviour envoy-rust does NOT match.**
 
 - After `POST /healthcheck/fail` on the admin listener upstream answers a probe with **503**
   and decorates NON-health-check responses too with `x-envoy-immediate-health-check-fail: true`
   and `connection: close` — an HCM-level behaviour no landed driver can witness (CF-115-2).
+  `[measured, no in-tree witness]`
 - Upstream ticks `http.<stat_prefix>.tracing.health_check` per intercept; envoy-rust has no
-  `tracing.*` HCM stat family (CF-115-7).
+  `tracing.*` HCM stat family (CF-115-7). `[measured, no in-tree witness]`
 - The H2 behaviour is pinned in-process only; there is no H2 differential witness (CF-115-4).
   That gap hid a real divergence until the phase-115 review — every H2 intercept carried
   `content-length: 0` — now fixed (`ADR-0202`) and pinned in-process, GET and HEAD.
+  `[in-process]`
 
 **H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
 

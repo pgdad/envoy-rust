@@ -1,6 +1,6 @@
 # 0095 — `envoy.filters.http.health_check` (non-pass-through mode)
 
-Phase **115** (`ADR-0200` pick, `ADR-0201` PLAN-write). Eleven HTTP/1.1 probes against a
+Phase **115** (`ADR-0200` pick, `ADR-0201` PLAN-write). Twelve HTTP/1.1 probes against a
 **backend-free, CLUSTER-FREE** HCM listener whose chain is
 
 ```
@@ -33,11 +33,15 @@ probe asserts the body byte-exact, and `set_equal_modulo_allow_list` compares
 | `p9` | `GET /both` | `MAIN` | the list is AND, not OR |
 | `p10` | `GET /other` + `x-probe: yes` | `MAIN` | …in the other direction |
 | `p11` | `HEAD /healthz` | empty; `transfer-encoding: chunked`, NO `content-length` | a HEAD intercept is headers-only (`ADR-0202`) |
+| `p12` | `HEAD /healthz` + `content-type: application/grpc` | empty; `transfer-encoding: chunked`, `content-type: application/grpc`, `grpc-status: 2`, NO `content-length` | the framing is settled AFTER the gRPC transform (`ADR-0203`) |
 
-**`p11` is the only HEAD probe, and its reading is the HEAD itself.** Upstream answers it with
-`transfer-encoding: chunked`, no `content-length` and no body bytes, and — even under the driver's
-`Connection: close` — leaves the socket open (MEASURED, phase-115 §5.2 state-3 re-entry). The
-driver therefore reads a HEAD reply's head ONLY; the header-name set is what discriminates. It
+**`p11` and `p12` are the HEAD probes, and their reading is the HEAD itself.** Upstream answers
+`p11` with `transfer-encoding: chunked`, no `content-length` and no body bytes. A HEAD response has
+no content whatever its framing headers say (RFC 9110 §9.3.2), so the driver reads a HEAD reply's
+head ONLY; the header-name set (and every non-allow-listed value) is what discriminates.
+Upstream closes the connection ~1 s after the reply under `Connection: close` — the "left open"
+reading recorded at the §5.2 state-3 re-entry was a 1 s read timeout (`REVIEW-2.md` R2-1,
+`ADR-0203`). It
 follows that the driver cannot see stray bytes AFTER a HEAD reply, which is why no `HEAD /other`
 control is listed here: envoy-rust sends a `direct_response` body on a HEAD reply and upstream does
 not (`CF-115-14`, pre-existing, not this filter's), and a probe that cannot see that would read as a
@@ -76,3 +80,4 @@ Each mutation was applied, `envoy-bin` rebuilt, the fixture run, and the file re
 | V2 | strip the query string before matching `:path` | `p2` REDs (`MAIN` expected, empty returned) |
 | V3 | fold the matchers with `any` instead of `all` | `p9` REDs (`MAIN` expected, empty returned) |
 | V6 | restore the landed decoration on the H1 decode arm (`headers_only` ignored) | `p11` REDs on `diff_headers` (`content-length` vs `transfer-encoding`) |
+| V7 | restore the `e569f5b` ordering — settle the H1 framing at the decode site, before the gRPC transform (`ADR-0203`) | `p12` REDs on `diff_headers` (`p1`–`p11` green) |
