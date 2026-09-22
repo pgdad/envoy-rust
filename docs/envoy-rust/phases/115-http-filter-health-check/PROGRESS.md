@@ -2022,3 +2022,303 @@ off `git diff --numstat` at staging time.
 - Rebuild the DEBUG `envoy-bin` before the differential corpus. Fixture `0095` now has
   TWELVE probes; `0097` is new (one probe). Both are backend-free.
 - The next free ADR number is **`ADR-0204`**.
+
+# §5 STATE 4 (re-verification after the round-2 §5.2 re-entry)
+
+**One commit: this state-advance commit.** `REVIEW-2.md` §8 requires legs (a)–(e) to be
+re-run after the round-2 fix; (f) belongs to the fresh re-review that writes `REVIEW-3.md`.
+The round-2 re-entry's CI record (`1c85505`) closed the previous chain, so this session
+entered owing no CI record. That was detected STRUCTURALLY: `STATE.md`'s `## Last commit`
+block already carried the CI-confirmed answer for the re-entry push HEAD `00c4e37` (run
+`35713102642`, attempt 1, `success`, `binaries=173 passed=2356 failed=0`), and the record
+push `1c85505` itself ran `35714010102`, attempt 1, `success`. HEAD at entry was `1c85505`,
+tree clean. The code under test is the tree at `a1c1623`; nothing after it touches code.
+
+**No ADR fired**: nothing this gate measured contradicts a landed figure. `ROADMAP.md` was
+NOT touched, so row `115` stays `planned`. **Nothing was fixed** (§6.3; `ADR-0165`).
+`REVIEW.md`, `REVIEW-2.md`, `SPEC.md`, `ADR-0200`…`ADR-0203` and `known-failures.txt` were
+not edited.
+
+⚠ **Leg (f) — an approved review — is OUT OF SCOPE and is adjudicated as such, not as a
+pass.** Neither landed review approves and neither is ever edited; the re-review writes
+`REVIEW-3.md`.
+
+## Stop condition — re-measured from disk, all three legs FALSE
+
+```
+LEG (i)   rows=123  done=122  planned=1   not-done: row 115 at ROADMAP.md line 78
+          status = field 4 on ' | '; field-count histogram {6: 121, 7: 1, 10: 1}
+          (the FORBIDDEN NF==6 filter would read 121)
+LEG (ii)  crates=14; envoy-{http3,grpc,wasm,protos,runtime,xds} all absent by test -d
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0 of 28 manifests
+          (git ls-files '*Cargo.toml'); POSITIVE CONTROL tokio=19 of 28
+          histogram=0 over crates/; gauge=365 (crates/) / 352 (crates/*/src/) by `grep -ro`
+          (⚠ the form matters: `grep -rw` reads 208/199 and `grep -r` 354/341)
+LEG (iii) 11 headings 11/5/3/14/3/4/6/31/6/0/13 + 27 pre-heading = 123;
+          zero-row family: ### WASM host family
+```
+
+`ls stop` → `No such file or directory`. **No `stop` file was created.**
+
+## Leg (e) — the five `cargo` commands
+
+Before `build` and again before `clippy`, all **22** tracked crate roots got an
+mtime-only `touch -m`. The list came from `git ls-files`
+(`^(crates|tests)/.*src/(lib|main)\.rs$`), never a glob. `git status --porcelain` read
+empty after each touch.
+
+```
+cargo build  --workspace --all-targets                 exit 0   22 Compiling   Finished in 11.59s
+cargo clippy --workspace --all-targets --all-features
+             -- -D warnings                            exit 0   22 Checking    Finished in 3.73s
+             warning/error lines in build + clippy logs: 0 / 0
+             the 22 Compiling and 22 Checking names are IDENTICAL (sorted diff empty)
+cargo fmt    --all -- --check                          exit 0   (0 bytes of output)
+cargo deny   check                                     exit 0
+             advisories ok, bans ok, licenses ok, sources ok
+```
+
+**The 3.73 s clippy got the NEGATIVE CONTROL** both earlier gates used
+(`pub fn clippy_negative_control_probe() -> bool { let v = vec![1u8]; v.len() == 0 }`
+appended to `crates/envoy-filter/src/health_check.rs`):
+
+```
+exit 101
+    Checking envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+error: length comparison to zero
+error: useless use of `vec!`
+error: items after a test module
+error: could not compile `envoy-filter` (lib) due to 2 previous errors
+error: could not compile `envoy-filter` (lib test) due to 3 previous errors
+```
+
+Restored with `git checkout --`, md5-verified (`RESTORED-md5-ok`; porcelain empty); the
+re-run exited 0.
+
+### `cargo test --workspace --no-fail-fast` — the identity
+
+The DEBUG `envoy-bin` was rebuilt first (`cargo build -p envoy-bin`, exit 0, md5
+`8f0daf79d7cecf7af4ab6f10f31ec61e` — the same md5 the round-2 re-entry recorded for its
+fixed build). The run was redirected to a FILE, never through `tail`, ANSI-stripped and
+censused by the regex `test result: (ok|FAILED)\. (\d+) passed; (\d+) failed`, with `ok`
+and `FAILED` rows counted separately:
+
+```
+$ cargo test --workspace --no-fail-fast        (exit 101, real 6m30.79s)
+stripped log bytes 263016   test-result rows 173   ok 167   FAILED 6
+passed 2350   failed 6   passed + failed = 2356   Running lines 157   Doc-tests 16
+```
+
+**`binaries = 173` and `passed + failed = 2356` reproduce EXACTLY** the round-2 re-entry's
+local run and the CI identity on `00c4e37` (`binaries=173 passed=2356 failed=0`). The
+round-2 diff (`7aaf296..HEAD -- crates tests`) adds 4 `#[test]`/`#[tokio::test]` lines and
+removes 0: 2352 + 4 = 2356. So the flake-vs-regression identity closes.
+
+## Legs (a) and (b) — the differential corpus
+
+### Leg (a) — fixtures `0095` (now TWELVE probes), `0096` and the NEW `0097`
+
+```
+test http_filter_health_check_fixture ... ok
+test http_filter_health_check_stats_fixture ... ok
+test http_filter_health_check_framing_fixture ... ok
+```
+
+All three GREEN in the full run. Configs are **byte-identical** across the two proxies
+(`cmp` exit 0):
+
+```
+0095 envoy.yaml == envoy-rust.yaml   2484 bytes   md5 85b837a66319583bf8c5a81f6b15f4e1   12 probes p1..p12
+0096 envoy.yaml == envoy-rust.yaml   1738 bytes   md5 e66e8ad0cc20d41cf5d7f12ce42ecd65
+0097 envoy.yaml == envoy-rust.yaml   2397 bytes   md5 ff4d3dcdd04be05d1765fd3701095ce8    1 probe  p1
+```
+
+**The fast greens were AUDITED, not believed.** Each new-probe fixture was run ALONE while
+`docker ps --filter ancestor=envoyproxy/envoy:v1.33.0` was polled at 4 Hz: `0095` green in
+1.20 s (container `63a0fa163ad0`) and `0097` in 1.21 s (`aecf2719da5e`) — exactly one
+upstream container each, so the reference side really ran.
+
+**`p12` and `0097` `p1` were given their NEGATIVE CONTROL (`0095` README V7 = `0097` README
+V1): the `e569f5b` ORDERING restored.** In `crates/envoy-http1/src/hcm.rs`, by a script that
+asserted each target occurs EXACTLY ONCE: the late `if headers_only_reply {` settle call was
+disabled (`if false && …`), and `if headers_only { settle_headers_only_framing(&mut outgoing,
+req.method == "HEAD", false); }` was inserted right after BOTH H1 `decorate_filter_reply`
+calls (decode-side `SynthFromDecode` and encode-side `StopAndSend`), i.e. before the encode
+pass and the gRPC transform:
+
+```
+numstat 3 1   rebuild: 5 Compiling (envoy-http1 envoy-http2 envoy-admin envoy-health envoy-bin)
+              envoy-bin md5 8f0daf79… → e3014fff036da61b764bff26690701bf
+0095  FAILED 0/1   probe p12-head-grpc-intercept-chunked-no-content-length: diff_headers   (container 9374ab1d0d3e)
+0097  FAILED 0/1   probe p1-head-intercept-later-content-length-alone: diff_headers        (container a07177ada229)
+```
+
+Each went RED at exactly its round-2 probe, on exactly the header set. The file was restored
+(`RESTORED-md5-ok`, porcelain empty) and rebuilt (5 Compiling). Afterwards `0095` was GREEN
+(1.27 s).
+
+⚠ **Two things in the restore step did NOT go as scripted, and both were re-run rather
+than explained away.** (1) The restored `0097` run FAILED in 11.52 s at
+`upstream Envoy never became accept-ready … 127.0.0.1:55800 not accept-ready within 10s:
+Connection refused` — upstream's OWN readiness wait, before any probe; re-run alone after a
+15 s settle gap it was GREEN (1.11 s, `1 passed`, no `Compiling`). (2) The script's
+`envoy-bin` md5 equality check printed NOTHING (i.e. read unequal), although no later step
+recompiled (0 `Compiling` lines in every later log) and the binary read `8f0daf79…` right
+after. The logs do not explain it, so the property was RE-PROVED directly in the foreground:
+`if headers_only_reply {` → `if false && headers_only_reply {` (numstat `1 1`), 5 Compiling,
+md5 `58480f968c2af166a2c7cd4bdd09cb82`; restored (`RESTORED-md5-ok`), 5 Compiling, md5
+`8f0daf79d7cecf7af4ab6f10f31ec61e` = the pre-mutation md5 (`BIN-EQUAL`). The cause of the
+scripted check's silence is NOT established.
+
+As `ADR-0202`/`ADR-0203` record, the `HEAD` probes read the head only, so `CF-115-14`
+(stray body bytes after a non-intercepted `HEAD` reply) stays invisible to them by design,
+and the H2 cells stay pinned IN-PROCESS only (`CF-115-4`).
+
+### Leg (b) — the other fixtures, and the six local reds
+
+Censused from the `---- <name> stdout ----` markers, panic site beside each:
+
+```
+access_log_h2_rcd_upstream_reset   access_log_h2_rcd_upstream_reset.rs:28  byte-exact access-log mismatch
+access_log_h2_uc_upstream_reset    access_log_h2_uc_upstream_reset.rs:32   byte-exact access-log mismatch
+access_log_rcd_upstream_reset      access_log_rcd_upstream_reset.rs:33     byte-exact access-log mismatch
+access_log_rf_upstream_reset       access_log_rf_upstream_reset.rs:30      byte-exact access-log mismatch
+admin_config_dump_server_info      admin_config_dump_server_info.rs:18     admin body rule: /clusters
+envoy-http2 client::tests::send_request_maps_h2_handshake_failure_to_typed_error
+                                   crates/envoy-http2/src/client.rs:587    expected H2ClientHandshake, got Ok(ClientStream …)
+```
+
+The five Family-A reds are the pre-existing host reds. The sixth is the `envoy-http2`
+handshake host flake the first re-entry saw and the round-1 re-verification did not. The
+round-2 re-entry's two readiness reds (`upstream_tcp_health_check_fixture`, `envoy-bin`
+`network_filter_rbac::connection_that_sends_nothing_is_never_evaluated`) PASSED in this
+full run. **The red SET changed again on identical code; only `passed + failed` against
+CI's `passed` speaks to regression, and only the control classifies.**
+
+**The control.** A detached worktree at `7aaf296` (the commit before the round-2 fix;
+`0097` verified ABSENT there) with its OWN `CARGO_TARGET_DIR` under the scratchpad, built
+with `--workspace --all-targets` (exit 0; control `envoy-bin` md5
+`4ab85822d8e663185d007a4fc2fb17d2`). `subject::locate_envoy_bin()` honours
+`CARGO_TARGET_DIR`, so each side ran its OWN binary. Every red, plus the round-2 re-entry's
+two readiness reds, was run ALONE on the control and on this tree, **interleaved** (control
+first), a 20 s settle gap between cells, the envoy container poll running throughout:
+
+```
+control | access_log_h2_rcd_upstream_reset | FAILED 0/1 | access_log_h2_rcd_upstream_reset.rs:28 byte-exact mismatch | containers=1
+phase   | access_log_h2_rcd_upstream_reset | FAILED 0/1 | access_log_h2_rcd_upstream_reset.rs:28 byte-exact mismatch | containers=1
+control | access_log_h2_uc_upstream_reset  | FAILED 0/1 | access_log_h2_uc_upstream_reset.rs:32 byte-exact mismatch  | containers=1
+phase   | access_log_h2_uc_upstream_reset  | FAILED 0/1 | access_log_h2_uc_upstream_reset.rs:32 byte-exact mismatch  | containers=1
+control | access_log_rcd_upstream_reset    | FAILED 0/1 | access_log_rcd_upstream_reset.rs:33 byte-exact mismatch    | containers=1
+phase   | access_log_rcd_upstream_reset    | FAILED 0/1 | access_log_rcd_upstream_reset.rs:33 byte-exact mismatch    | containers=1
+control | access_log_rf_upstream_reset     | FAILED 0/1 | access_log_rf_upstream_reset.rs:30 byte-exact mismatch     | containers=1
+phase   | access_log_rf_upstream_reset     | FAILED 0/1 | access_log_rf_upstream_reset.rs:30 byte-exact mismatch     | containers=1
+control | admin_config_dump_server_info    | FAILED 0/1 | admin_config_dump_server_info.rs:18 admin body rule: /clusters | containers=1
+phase   | admin_config_dump_server_info    | FAILED 0/1 | admin_config_dump_server_info.rs:18 admin body rule: /clusters | containers=1
+control | upstream_tcp_health_check        | ok 1/0     |                                                        | containers=1
+phase   | upstream_tcp_health_check        | ok 1/0     |                                                        | containers=1
+control | h2 handshake (envoy-http2 --lib, --exact) | ok 1/0 |                                               | containers=0
+phase   | h2 handshake (envoy-http2 --lib, --exact) | ok 1/0 |                                               | containers=0
+control | envoy-bin network_filter_rbac connection_that_sends_nothing… | ok 1/0 |                        | containers=0
+phase   | envoy-bin network_filter_rbac connection_that_sends_nothing… | ok 1/0 |                        | containers=0
+DONE 2026-09-22T12:24:57-04:00
+```
+
+**Adjudication:**
+
+- **The five Family-A reds fail identically, at the SAME panic site (file:line and
+  message), on the pre-round-2 control and on this tree** — every pair agreed on the first
+  run, so no re-run was needed. A test that fails the same way before the fix existed was
+  not broken by it. CI on native Linux reported `failed=0` on this exact code tree at
+  `00c4e37` and is authoritative for all five.
+- **The H2 handshake flake and the two round-2 readiness reds PASS ALONE on BOTH trees.**
+  Not deterministic and not fix-dependent; they fail only inside the parallel
+  `--workspace` sweep. CI-authoritative. The neighbour workload was quiet
+  (`docker ps -a -q` = 22 throughout).
+
+The control worktree was removed afterwards (`git worktree list` shows no scratchpad
+entry). The `.claude/worktrees/agent-*` worktrees belong to a parallel workstream and were
+not touched; two weeks-old stopped `envoyproxy/envoy` containers not started by this
+session were left alone.
+
+## Leg (c) — conformance
+
+The local h2spec gate self-skips: `which h2spec` is empty (exit 1) and `tools/` does not
+exist. **Leg (c) is CI-AUTHORITATIVE.** Its positive control is `h2spec not found` = 0 in
+the ANSI-stripped CI job log: recorded for `00c4e37` (0 against 28 `h2spec` mentions), and
+this advance's own push is re-checked by the follow-up CI record. `known-failures.txt` was
+NOT trimmed.
+
+## Leg (d) — fuzzing
+
+**Phase 115 added NO fuzz target.** `git diff --name-status 04661b7..HEAD -- '*fuzz*'` is
+EMPTY (0 lines), so the letter of (d) is vacuous. All five pre-existing targets were run at
+the CI contract (`cargo +nightly fuzz run <target> -- -max_total_time=30`, each from its
+CRATE directory, as `ci.yml` does):
+
+```
+parse_bootstrap        | exit 0 | INFO: seed corpus: files: 14199 | Done 380407 runs in 31 second(s)   | crash lines 0
+jwt_parse              | exit 0 | INFO: seed corpus: files: 8750  | Done 8448247 runs in 31 second(s)  | crash lines 0
+cdn_loop_parse         | exit 0 | INFO: seed corpus: files: 1782  | Done 11210025 runs in 31 second(s) | crash lines 0
+accesslog_format_parse | exit 0 | INFO: seed corpus: files: 3781  | Done 5501770 runs in 31 second(s)  | crash lines 0
+grpc_health_decode     | exit 0 | INFO: seed corpus: files: 240   | Done 38604850 runs in 31 second(s) | crash lines 0
+```
+
+The corpus sizes are LOCAL, mostly gitignored. The TRACKED seed counts are
+**67 / 3 / 0 / 11 / 1**; `cdn_loop_parse` still has **0** tracked seeds (`CF-75-5`, open).
+`git status --porcelain` was empty after the runs.
+
+## Files that had to stay untouched
+
+```
+git diff --numstat 7aaf296..HEAD -- <file>        (round 2)     04661b7..HEAD (whole phase)
+Cargo.toml                       UNTOUCHED                      UNTOUCHED
+Cargo.lock                       UNTOUCHED                      UNTOUCHED
+.github/workflows/ci.yml         UNTOUCHED                      UNTOUCHED
+tests/differential/src/lib.rs    5 4 (the R2-1 comment)         70 1
+```
+
+## Doctrine checks
+
+```
+#![forbid(unsafe_code)] in all 14 crates/*/src/{lib,main}.rs: 14 present, 0 missing
+over `git diff -U0 7aaf296..HEAD -- crates tests` (round 2), added lines:
+  #[allow( 0   #[expect( 0   unsafe 0   #[ignore 0   todo! 0   unimplemented! 0   dbg! 0
+  POSITIVE CONTROL, same probe: #[test]/#[tokio::test] = 4 added, 0 removed → net 4
+```
+
+## Size, re-measured at this commit
+
+```
+git diff --numstat 7aaf296..HEAD -- . ':(exclude)docs/'   (round 2)
+  files=11  insertions=458  deletions=31  NET=427
+git diff --numstat 04661b7..HEAD -- . ':(exclude)docs/'   (the whole phase)
+  files=31  insertions=2308 deletions=87  NET=2221
+```
+
+Round 2's 427 matches its record, and 1794 + 427 = 2221. §6.1 is a PLAN-time gate that did
+not fire on the 1398-line plan; recorded as a MEASUREMENT for the re-review, not
+adjudicated as a split trigger.
+
+## What this session did NOT do
+
+- **No code, test or fixture changed.** The gate is docs-only. Its mutations (the clippy
+  negative control, the V7/V1 ordering mutation, and the one-line re-proof of the binary
+  restore) were each restored and md5-verified before anything else ran.
+- **`ROADMAP.md` untouched**; row `115` remains `planned`.
+- **No ADR fired.** No carry-forward was consumed and nothing was fixed, including
+  `CF-115-14` and the `CF-115-15` leads.
+- **`known-failures.txt` untouched.** `REVIEW.md` / `REVIEW-2.md` not edited.
+- **Leg (f) not attempted.** `REVIEW-3.md` is the re-review's product. No §5 state was
+  chained.
+
+## For the §5 state-5 re-review (writes `REVIEW-3.md`)
+
+- Read `REVIEW.md` and `REVIEW-2.md` first. Both are LANDED, NOT APPROVED and never edited.
+- The local reds are adjudicated here **by an interleaved pre-round-2 control at
+  `7aaf296`**, panic site recorded beside each. Do not re-litigate them from their text.
+- The V7/V1 negative control was re-run here and REDs at exactly `p12`/`p1 … diff_headers`.
+  `CF-115-14` is structurally invisible to every `HEAD` probe; the H2 cells are in-process
+  only (`CF-115-4`).
+- `CF-115-1` … `-3` and `-5` … `-15` stand; Minors M2-1 … M2-4, M2-6 stand; `CF-75-5` and
+  the phase-112 ALPN rider stand.
+- The next free ADR number is **`ADR-0204`**.
