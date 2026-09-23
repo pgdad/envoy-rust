@@ -1962,9 +1962,11 @@ encode-side behavior (cdn_loop is request-only).
 > short-circuited with a local reply and never reaches the route; anything else continues down
 > the chain. Decode-side only, no per-route config. Witnessed differentially on **H1 only** by
 > fixtures `0095-http-filter-health-check` (twelve probes, the wire),
-> `0096-http-filter-health-check-stats` (the counters) and `0097-http-filter-health-check-framing`
-> (the framing composed with a later encode-side filter) against `envoyproxy/envoy:v1.33.0`.
-> **Each bullet below names its witness** — `[0095]`/`[0096]`/`[0097]` differential,
+> `0096-http-filter-health-check-stats` (the counters), `0097-http-filter-health-check-framing`
+> (the framing composed with a later encode-side `content-length`) and
+> `0098-http-filter-health-check-transfer-encoding` (…with a later encode-side
+> `transfer-encoding`) against `envoyproxy/envoy:v1.33.0`.
+> **Each bullet below names its witness** — `[0095]`/`[0096]`/`[0097]`/`[0098]` differential,
 > `[in-process]` a unit or in-process HCM test only, `[measured, no in-tree witness]` measured
 > against upstream and pinned by nothing in the tree (phase-115 `REVIEW.md` I-3 / N-10; corrected
 > at the §5.2 state-3 re-entry, `ADR-0202`; the eight bullets that carried no label were labelled
@@ -1983,12 +1985,23 @@ encode-side behavior (cdn_loop is request-only).
   | H1, `HEAD`, gRPC request (`content-type: application/grpc`) | `transfer-encoding: chunked`, NO `content-length` — beside the gRPC local-reply headers `content-type: application/grpc` and `grpc-status: 2` | `[0095]` `p12`; `[in-process]` |
   | H2, `GET` and `HEAD` | **NONE** — no `content-length` | `[in-process]` only (CF-115-4) |
 
-  **On H1 the framing is settled LAST** (`ADR-0203`), after the encode-side filter pass and the
-  gRPC local-reply transform: a `content-length` a LATER stage writes is the reply's only framing
-  header — with `header_mutation` placed after `health_check` writing `content-length: 7`, a
-  `HEAD` intercept carries `content-length: 7` and NO `transfer-encoding` on both proxies
-  (`[0097]` `p1`; `[in-process]`, `GET` too). A headers-only reply never carries both framing
-  headers (`[in-process]`).
+  **On H1 the framing is settled LAST, for EVERY method** (`ADR-0203`, completed by `ADR-0204`),
+  after the encode-side filter pass and the gRPC local-reply transform. Upstream's headers-only
+  reply carries NO framing header through its encode pass; its codec frames it at the wire. So:
+  (1) a `transfer-encoding` a stage wrote never reaches the wire — `header_mutation` after
+  `health_check` writing `transfer-encoding: gzip` (`OVERWRITE_IF_EXISTS_OR_ADD` or
+  `APPEND_IF_EXISTS_OR_ADD`) gives a `HEAD` intercept `transfer-encoding: chunked` alone and a
+  `GET` intercept `content-length: 0` alone (`[0098]` `p1`/`p2`, `APPEND`; `[in-process]`, both
+  actions); (2) a `content-length` a stage wrote is the reply's only framing header, on `GET` and
+  `HEAD` alike and whether the stage OVERWRITES or APPENDS — `content-length: 7` from a
+  `header_mutation` placed after or BEFORE `health_check` gives ONE row, `content-length: 7`, and
+  an appended `content-length: 0` gives ONE `content-length: 0` row (`[0097]` `p1`, `HEAD` +
+  OVERWRITE; `[in-process]` for the `GET`, `APPEND`, before-placement and value-`0` cells — a
+  `GET` carrying `content-length: 7` over an empty body cannot be read by the probe driver, and
+  `diff_headers` compares the FIRST value per name, so it cannot tell one `content-length: 0` row
+  from two); (3) otherwise `HEAD` → `transfer-encoding: chunked`, anything else →
+  `content-length: 0`. A headers-only reply never carries both framing headers (`[in-process]`).
+  Measured on both proxies at phase-115 `REVIEW-3.md` I3-1 (cells A1, A3, B4, B6, B7).
 
   **This framing is the health-check reply's alone.** Every other filter's local reply keeps the
   ADR-0033 decoration (`content-length` from `body.len()`); upstream's framing of those replies on

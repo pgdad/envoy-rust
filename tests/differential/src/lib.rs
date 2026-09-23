@@ -1099,9 +1099,11 @@ pub enum Http1Method {
     Post,
     /// Phase 115 NEW: HEAD is required by fixture 0095's HEAD health probe
     /// (`REVIEW.md` I-2). `drive_http1` reads a HEAD reply's head ONLY — the
-    /// reply has no body whatever its framing headers say — so upstream's
-    /// chunked-framed, never-closed HEAD reply is read without waiting. HEAD
-    /// is never driven over H2 (the `drive_http2` debug_assert stays).
+    /// reply has no body whatever its framing headers say (RFC 9110 §9.3.2)
+    /// — so upstream's chunked-framed HEAD reply is read without waiting for
+    /// a chunk or for upstream's ~1 s delayed close (ADR-0203 corrected the
+    /// earlier "never closed" reading; ADR-0204). HEAD is never driven over
+    /// H2 (the `drive_http2` debug_assert stays).
     Head,
 }
 
@@ -11568,10 +11570,12 @@ mod drive_http1_body_tests {
 
     /// Phase 115 (`REVIEW.md` I-2): a HEAD reply has no body whatever its
     /// framing headers say (RFC 9110 §9.3.2), and upstream v1.33.0 answers a
-    /// health-check `HEAD` with `transfer-encoding: chunked` and then leaves
-    /// the socket OPEN even under `Connection: close` (MEASURED). The driver
-    /// must return at the end of the head — never wait for a chunk, a length
-    /// or an EOF that never comes.
+    /// health-check `HEAD` with `transfer-encoding: chunked` and no body. The
+    /// driver must return at the end of the head — never wait for a chunk, a
+    /// length or the EOF. (Upstream closes under `Connection: close` after a
+    /// ~1 s delay, MEASURED with a 10 s read — `ADR-0203`/`ADR-0204` correct
+    /// the earlier "left open" reading; the mock below holds its socket open
+    /// only so that waiting for EOF would time the test out.)
     #[tokio::test]
     async fn drive_http1_head_reads_the_head_only() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11590,7 +11594,7 @@ mod drive_http1_body_tests {
                     b"HTTP/1.1 200 OK\r\nserver: envoy\r\ntransfer-encoding: chunked\r\n\r\n",
                 )
                 .await;
-            // Hold the socket open, as upstream does.
+            // Hold the socket open: a driver that waited for EOF would hang.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
         let resp = tokio::time::timeout(

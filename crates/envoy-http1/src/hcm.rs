@@ -1419,14 +1419,10 @@ async fn serve_connection(
                 // the 5 standard HTTP/1.1 response headers if the filter did
                 // not provide them, and ALWAYS overwrite content-length from
                 // body.len() (the filter's body is the source of truth) —
-                // unless the reply is headers-only (ADR-0202), whose framing
-                // header depends on whether the request was a HEAD.
-                decorate_filter_reply(
-                    &mut outgoing,
-                    headers_only,
-                    Some(connection_value(close)),
-                    req.method == "HEAD",
-                );
+                // unless the reply is headers-only (ADR-0202), which gets NO
+                // framing header here: `settle_headers_only_framing` frames it
+                // after every later stage (ADR-0204).
+                decorate_filter_reply(&mut outgoing, headers_only, Some(connection_value(close)));
             }
         }
 
@@ -1474,12 +1470,7 @@ async fn serve_connection(
                 // future filters that emit encode-side StopAndSend (e.g., a
                 // hypothetical RBAC-on-encode rejection) inherit the standard
                 // HTTP/1.1 response header set on the wire.
-                decorate_filter_reply(
-                    &mut outgoing,
-                    headers_only,
-                    Some(connection_value(close)),
-                    req.method == "HEAD",
-                );
+                decorate_filter_reply(&mut outgoing, headers_only, Some(connection_value(close)));
             }
         }
 
@@ -2642,26 +2633,20 @@ pub fn decorate_filter_synth_response(resp: &mut Response, connection: Option<&s
 ///
 /// With `headers_only` the reply is upstream's HEADERS-ONLY shape — a filter
 /// encoding headers with end-of-stream, as `envoy.filters.http.health_check`
-/// does — and carries exactly the framing header upstream's codec puts on the
-/// wire (MEASURED against v1.33.0, phase-115 `REVIEW.md` I-1/I-2):
-///
-/// - H1 (`connection` is `Some`), non-HEAD: `content-length: 0`;
-/// - H1 HEAD (`head_request`): NO framing header HERE — the caller MUST run
-///   [`settle_headers_only_framing`] after every later stage, which settles
-///   `transfer-encoding: chunked` (NO `content-length`, and — the body being
-///   empty — no body bytes, not even a chunk terminator) unless a later
-///   stage wrote a `content-length` (ADR-0203);
-/// - H2 (`connection` is `None`): NO framing header.
+/// does — and this function pushes NO framing header on either codec or
+/// method (ADR-0204): upstream's headers-only reply carries none through its
+/// encode pass, so a later stage sees what upstream's stages see. On H1 the
+/// caller MUST run [`settle_headers_only_framing`] after every later stage;
+/// it frames the reply (MEASURED against v1.33.0, phase-115 `REVIEW.md`
+/// I-1/I-2, `REVIEW-2.md` I2-1, `REVIEW-3.md` I3-1) — a `content-length` a
+/// later stage wrote, else `HEAD` `transfer-encoding: chunked` (no body
+/// bytes, not even a chunk terminator) and non-`HEAD` `content-length: 0`.
+/// H2 (`connection` is `None`) carries no framing header.
 ///
 /// Any `content-length` / `transfer-encoding` the filter supplied is
-/// replaced. The standard `server` / `date` / `connection` headers follow
+/// dropped. The standard `server` / `date` / `connection` headers follow
 /// the ADR-0033 only-if-missing rule either way.
-pub fn decorate_filter_reply(
-    resp: &mut Response,
-    headers_only: bool,
-    connection: Option<&str>,
-    head_request: bool,
-) {
+pub fn decorate_filter_reply(resp: &mut Response, headers_only: bool, connection: Option<&str>) {
     if !headers_only {
         decorate_filter_synth_response(resp, connection);
         return;
@@ -2671,24 +2656,20 @@ pub fn decorate_filter_reply(
         !k.eq_ignore_ascii_case(headers::CONTENT_LENGTH)
             && !k.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
     });
-    // ADR-0203: an H1 `HEAD` reply's `transfer-encoding: chunked` is NOT
-    // pushed here — a later stage can still write a `content-length` — but by
+    // ADR-0204: NO framing header is pushed here, for `HEAD` or not — a later
+    // stage can still write a `content-length` — but by
     // [`settle_headers_only_framing`], after every such stage.
-    if connection.is_some() && !head_request {
-        resp.headers
-            .push((headers::CONTENT_LENGTH.to_string(), "0".to_string()));
-    }
     add_standard_filter_reply_headers(resp, connection);
 }
 
-/// ADR-0203: settle an H1 headers-only reply's framing LAST — after the
-/// encode-side filter pass and the gRPC local-reply transform, either of
-/// which can write a `content-length` after [`decorate_filter_reply`] ran.
-/// Upstream's codec frames the reply once, at the wire (MEASURED against
-/// v1.33.0, phase-115 `REVIEW-2.md` I2-1):
+/// ADR-0203/ADR-0204: settle an H1 headers-only reply's framing LAST —
+/// after the encode-side filter pass and the gRPC local-reply transform,
+/// either of which can write a framing header after [`decorate_filter_reply`]
+/// ran. Upstream's codec frames the reply once, at the wire (MEASURED against
+/// v1.33.0, phase-115 `REVIEW-2.md` I2-1, `REVIEW-3.md` I3-1):
 ///
-/// - a `content-length` a later stage wrote wins, and no
-///   `transfer-encoding` goes beside it;
+/// - the codec owns `transfer-encoding`: one a stage wrote is dropped;
+/// - a `content-length` a later stage wrote wins, alone;
 /// - with none, a `HEAD` reply is `transfer-encoding: chunked` and any
 ///   other reply `content-length: 0`.
 ///
@@ -2706,9 +2687,8 @@ pub fn settle_headers_only_framing(
     if head_request && grpc_transformed {
         resp.headers.retain(|(k, _)| !is_cl(k));
     }
-    if resp.headers.iter().any(|(k, _)| is_cl(k)) {
-        resp.headers.retain(|(k, _)| !is_te(k));
-    } else if !resp.headers.iter().any(|(k, _)| is_te(k)) {
+    resp.headers.retain(|(k, _)| !is_te(k));
+    if !resp.headers.iter().any(|(k, _)| is_cl(k)) {
         let framing = if head_request {
             (headers::TRANSFER_ENCODING, "chunked")
         } else {
@@ -3704,51 +3684,41 @@ static_resources:
         );
     }
 
-    /// ADR-0202: a headers-only filter reply carries exactly the framing
-    /// header its codec and method put on upstream's wire (MEASURED against
-    /// v1.33.0): H1 non-HEAD `content-length: 0`; H2 neither. ADR-0203: the
-    /// H1 HEAD `transfer-encoding: chunked` is NOT decided here but by
-    /// `settle_headers_only_framing`, after every stage that can still write
-    /// a `content-length`.
+    /// ADR-0204: a headers-only filter reply gets NO framing header from the
+    /// dispatcher, on H1 (`HEAD` or not) or H2 — upstream's reply carries none
+    /// through its encode pass; `settle_headers_only_framing` frames the H1
+    /// reply after every later stage. A filter-supplied framing header is
+    /// dropped.
     #[test]
     fn decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method() {
-        let decorated = |connection: Option<&str>, head: bool| {
+        let decorated = |connection: Option<&str>| {
             let mut resp = Response {
                 status: 200,
                 reason: None,
-                headers: vec![("x-a".to_string(), "1".to_string())],
+                headers: vec![
+                    ("x-a".to_string(), "1".to_string()),
+                    ("content-length".to_string(), "9".to_string()),
+                    ("transfer-encoding".to_string(), "gzip".to_string()),
+                ],
                 body: bytes::Bytes::new(),
             };
-            super::decorate_filter_reply(&mut resp, true, connection, head);
-            let names: Vec<String> = resp
-                .headers
+            super::decorate_filter_reply(&mut resp, true, connection);
+            resp.headers
                 .into_iter()
                 .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            names
-                .into_iter()
                 .filter(|kv| !kv.starts_with("date="))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            decorated(Some("close"), false),
-            [
-                "x-a=1",
-                "content-length=0",
-                "server=envoy-rust",
-                "connection=close"
-            ]
+            decorated(Some("close")),
+            ["x-a=1", "server=envoy-rust", "connection=close"]
         );
-        assert_eq!(
-            decorated(Some("keep-alive"), true),
-            ["x-a=1", "server=envoy-rust", "connection=keep-alive"]
-        );
-        assert_eq!(decorated(None, false), ["x-a=1", "server=envoy-rust"]);
-        assert_eq!(decorated(None, true), ["x-a=1", "server=envoy-rust"]);
+        assert_eq!(decorated(None), ["x-a=1", "server=envoy-rust"]);
     }
 
-    /// ADR-0203: an H1 headers-only reply's framing is settled LAST. A
-    /// `content-length` a later stage wrote wins alone; without one a HEAD is
+    /// ADR-0203/ADR-0204: an H1 headers-only reply's framing is settled LAST.
+    /// A `transfer-encoding` a stage wrote is dropped; a `content-length` a
+    /// later stage wrote wins alone; without one a HEAD is
     /// `transfer-encoding: chunked` and anything else `content-length: 0`; a
     /// gRPC-transformed HEAD drops the transform's `content-length: 0`. No
     /// cell ends with BOTH framing headers.
@@ -3805,38 +3775,42 @@ static_resources:
             ),
             ["grpc-status=2", "content-length=0"]
         );
-        // A transfer-encoding some stage wrote, with no content-length, stays.
+        // ADR-0204: the codec owns transfer-encoding — one a stage wrote is
+        // replaced by the method's default (REVIEW-3 cells A3/B7, A2).
         assert_eq!(
-            settled(&[("transfer-encoding", "chunked")], true, false),
+            settled(&[("transfer-encoding", "gzip")], true, false),
             ["transfer-encoding=chunked"]
+        );
+        assert_eq!(
+            settled(&[("transfer-encoding", "chunked")], false, false),
+            ["content-length=0"]
         );
     }
 
     /// ADR-0202: `headers_only: false` keeps the ADR-0033 decoration exactly —
-    /// `content-length` from `body.len()`, HEAD or not.
+    /// `content-length` from `body.len()` (the dispatcher no longer takes the
+    /// method, ADR-0204, so it cannot vary with it).
     #[test]
     fn decorate_filter_reply_without_headers_only_is_the_adr_0033_decoration() {
-        for head in [false, true] {
-            let mut resp = Response {
-                status: 403,
-                reason: None,
-                headers: vec![],
-                body: bytes::Bytes::from_static(b"denied"),
-            };
-            super::decorate_filter_reply(&mut resp, false, Some("close"), head);
-            let cl = resp
+        let mut resp = Response {
+            status: 403,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"denied"),
+        };
+        super::decorate_filter_reply(&mut resp, false, Some("close"));
+        let cl = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == headers::CONTENT_LENGTH)
+            .map(|(_, v)| v.as_str());
+        assert_eq!(cl, Some("6"));
+        assert!(
+            !resp
                 .headers
                 .iter()
-                .find(|(k, _)| k == headers::CONTENT_LENGTH)
-                .map(|(_, v)| v.as_str());
-            assert_eq!(cl, Some("6"), "head={head}");
-            assert!(
-                !resp
-                    .headers
-                    .iter()
-                    .any(|(k, _)| k == headers::TRANSFER_ENCODING)
-            );
-        }
+                .any(|(k, _)| k == headers::TRANSFER_ENCODING)
+        );
     }
 
     // ── 04.2 header-matcher HCM integration tests ────────────────────────────
@@ -7569,6 +7543,16 @@ static_resources:
         log: &std::path::Path,
         after: &str,
     ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
+        health_check_h1_config_around(log, "", after).await
+    }
+
+    /// [`health_check_h1_config_with`] with `before` — YAML `http_filters`
+    /// entries placed ahead of the health_check filter.
+    async fn health_check_h1_config_around(
+        log: &std::path::Path,
+        before: &str,
+        after: &str,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
         let yaml = format!(
             r#"
 node: {{ id: n, cluster: hc-node-cluster }}
@@ -7600,7 +7584,7 @@ static_resources:
                         - match: {{ prefix: "/" }}
                           direct_response: {{ status: 200, body: {{ inline_string: MAIN }} }}
                 http_filters:
-                  - name: envoy.filters.http.health_check
+{before}                  - name: envoy.filters.http.health_check
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
                       pass_through_mode: false
@@ -7793,6 +7777,139 @@ Connection: close\r\n\r\n";
         );
         assert!(!head.contains("content-length"), "{head}");
         assert_eq!(rest, "", "no body bytes");
+    }
+
+    /// A `header_mutation` response entry at the http_filters list's
+    /// indentation, writing `key: value` with `action`.
+    fn response_mutation(key: &str, value: &str, action: &str) -> String {
+        format!(
+            r#"                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        response_mutations:
+                          - append:
+                              header: {{ key: {key}, value: "{value}" }}
+                              append_action: {action}
+"#
+        )
+    }
+
+    /// ADR-0204 (phase-115 `REVIEW-3.md` I3-1, cells A1/B4/B6): upstream's
+    /// headers-only reply carries NO `content-length` through its encode
+    /// pass, so a `header_mutation` that APPENDS one — upstream's proto
+    /// default action — writes the reply's ONLY `content-length` row, with
+    /// the mutation placed after `health_check` (A1) or before it (B4), and
+    /// with the value `0` too (B6) (MEASURED against v1.33.0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_intercept_keeps_an_appended_content_length_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("a.log");
+        let appended =
+            |value: &str| response_mutation("content-length", value, "APPEND_IF_EXISTS_OR_ADD");
+        for (cell, before, after, value) in [
+            ("A1", String::new(), appended("7"), "7"),
+            ("B4", appended("7"), String::new(), "7"),
+            ("B6", String::new(), appended("0"), "0"),
+        ] {
+            let (config, _) = health_check_h1_config_around(&log, &before, &after).await;
+            for method in ["GET", "HEAD"] {
+                let req =
+                    format!("{method} /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+                let (head, rest) = split_reply(&drive(Arc::clone(&config), req.as_bytes()).await);
+                assert!(head.starts_with("http/1.1 200 "), "{cell} {method}: {head}");
+                assert!(
+                    head.contains("\r\nx-envoy-upstream-healthchecked-cluster: hc-node-cluster"),
+                    "{cell} {method}: {head}"
+                );
+                assert_eq!(
+                    head.matches("\r\ncontent-length: ").count(),
+                    1,
+                    "{cell} {method}: {head}"
+                );
+                assert!(
+                    head.contains(&format!("\r\ncontent-length: {value}")),
+                    "{cell} {method}: {head}"
+                );
+                assert!(
+                    !head.contains("transfer-encoding"),
+                    "{cell} {method}: {head}"
+                );
+                assert_eq!(rest, "", "{cell} {method}: no body bytes");
+            }
+        }
+    }
+
+    /// ADR-0204 (phase-115 `REVIEW-3.md` I3-1, cells A3/B7): upstream's codec
+    /// owns an H1 headers-only reply's `transfer-encoding`. A `HEAD`
+    /// intercept whose encode pass wrote `transfer-encoding: gzip` —
+    /// OVERWRITE (A3) or APPEND (B7) — goes out `transfer-encoding: chunked`
+    /// alone, and the `GET` twin `content-length: 0` alone (MEASURED against
+    /// v1.33.0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_health_check_intercept_replaces_a_stage_written_transfer_encoding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("a.log");
+        for (cell, action) in [
+            ("A3", "OVERWRITE_IF_EXISTS_OR_ADD"),
+            ("B7", "APPEND_IF_EXISTS_OR_ADD"),
+        ] {
+            let after = response_mutation("transfer-encoding", "gzip", action);
+            let (config, _) = health_check_h1_config_with(&log, &after).await;
+            for (method, framing) in [
+                ("HEAD", "transfer-encoding: chunked"),
+                ("GET", "content-length: 0"),
+            ] {
+                let req =
+                    format!("{method} /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+                let (head, rest) = split_reply(&drive(Arc::clone(&config), req.as_bytes()).await);
+                assert!(head.starts_with("http/1.1 200 "), "{cell} {method}: {head}");
+                let framing_rows = head
+                    .split("\r\n")
+                    .filter(|l| {
+                        l.starts_with("content-length:") || l.starts_with("transfer-encoding:")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(framing_rows, [framing], "{cell} {method}: {head}");
+                assert_eq!(rest, "", "{cell} {method}: no body bytes");
+            }
+        }
+    }
+
+    /// ADR-0204 (phase-115 `REVIEW-3.md` M3-1): an ENCODE-side filter that
+    /// replaces the reply with a headers-only one is framed by
+    /// `settle_headers_only_framing` too — `HEAD` `transfer-encoding:
+    /// chunked`, anything else `content-length: 0`, never both, no body.
+    #[tokio::test]
+    async fn h1_encode_side_headers_only_replacement_is_framed_last() {
+        for (method, framing) in [
+            ("HEAD", "transfer-encoding: chunked"),
+            ("GET", "content-length: 0"),
+        ] {
+            let stop_resp = envoy_filter::FilterResponse {
+                status: 200,
+                reason: None,
+                headers: vec![("x-stub".to_string(), "1".to_string())],
+                body: Bytes::new(),
+                details: None,
+                headers_only: true,
+            };
+            let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+                envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
+                envoy_filter::HttpFilterInstance::test_router(),
+            ]));
+            let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+            let req = format!("{method} / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            let (head, rest) = split_reply(&drive(config, req.as_bytes()).await);
+            assert!(head.starts_with("http/1.1 200 "), "{method}: {head}");
+            assert!(head.contains("\r\nx-stub: 1"), "{method}: {head}");
+            let framing_rows = head
+                .split("\r\n")
+                .filter(|l| l.starts_with("content-length:") || l.starts_with("transfer-encoding:"))
+                .collect::<Vec<_>>();
+            assert_eq!(framing_rows, [framing], "{method}: {head}");
+            assert_eq!(rest, "", "{method}: no body bytes");
+        }
     }
 
     #[tokio::test]

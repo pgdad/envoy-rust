@@ -189,9 +189,11 @@ mod tests {
         assert_eq!(resp.details, Some("health_check_ok"));
     }
 
-    /// ADR-0202: the intercept is a HEADERS-ONLY reply — the codec frames it
-    /// (H1 non-HEAD `content-length: 0`, H1 HEAD `transfer-encoding: chunked`,
-    /// H2 no framing header), never from `body.len()`.
+    /// ADR-0202: the intercept is a HEADERS-ONLY reply — the codec frames it,
+    /// never from `body.len()`: on H1 last (ADR-0203/ADR-0204) — a
+    /// `content-length` a later stage wrote, else non-HEAD `content-length: 0`
+    /// and HEAD `transfer-encoding: chunked` — and on H2 with no framing
+    /// header.
     #[test]
     fn intercept_is_a_headers_only_reply() {
         for method in ["GET", "HEAD"] {

@@ -62,9 +62,12 @@ pub struct FilterResponse {
     /// encode side and the Continue write-back ignore it.
     pub details: Option<&'static str>,
     /// ADR-0202: a HEADERS-ONLY reply (upstream: a filter encoding headers
-    /// with end-of-stream). The codec frames it — H1 non-HEAD
-    /// `content-length: 0`, H1 HEAD `transfer-encoding: chunked`, H2 no
-    /// framing header — instead of writing `content-length` from `body.len()`.
+    /// with end-of-stream). The codec frames it instead of writing
+    /// `content-length` from `body.len()`: on H1 LAST, after every later stage
+    /// (ADR-0203/ADR-0204) — a `content-length` a later stage wrote, else
+    /// non-HEAD `content-length: 0` and HEAD `transfer-encoding: chunked`; a
+    /// stage-written `transfer-encoding` never survives — and on H2 with no
+    /// framing header.
     /// The body must be empty. Set ONLY by `health_check`; every other filter
     /// sets `false`, because upstream frames its other local replies with a
     /// `content-length`.

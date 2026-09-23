@@ -71,7 +71,7 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
 /// path has decorated filter-synth responses since 09 ADR-0033 Commit C; this
 /// brings the H2 writer path to parity.
 pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response, headers_only: bool) {
-    envoy_http1::hcm::decorate_filter_reply(resp, headers_only, None, false);
+    envoy_http1::hcm::decorate_filter_reply(resp, headers_only, None);
 }
 
 /// Translate a trailer block into an `http::HeaderMap` for

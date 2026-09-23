@@ -2322,3 +2322,217 @@ adjudicated as a split trigger.
 - `CF-115-1` … `-3` and `-5` … `-15` stand; Minors M2-1 … M2-4, M2-6 stand; `CF-75-5` and
   the phase-112 ALPN rider stand.
 - The next free ADR number is **`ADR-0204`**.
+
+# §5.2 STATE-3 RE-ENTRY (round 3) — the `REVIEW-3.md` §2 fixes
+
+**The work order is `REVIEW-3.md` §2 "Required disposition" items 1–4** (item 5, the full
+gate re-run and the fresh re-review writing `REVIEW-4.md`, belongs to states 4 and 5). The
+state-5 re-review (round 3) CI record (`4fa7e71`) closed the previous chain, so this session
+entered owing no CI record, detected STRUCTURALLY: `STATE.md`'s `## Last commit` block already
+carried the CI-confirmed answer for `ebb3528` (run `35805482707`). HEAD at entry was `4fa7e71`,
+tree clean. **`ADR-0204` fired** (the settle-everything-last design, and the forward correction
+of `ADR-0203`). `ROADMAP.md` was NOT touched: row `115` stays `planned`. `REVIEW.md`,
+`REVIEW-2.md`, `REVIEW-3.md`, `SPEC.md` and `ADR-0200` … `ADR-0203` are not edited.
+Executed inline (`superpowers:executing-plans`, `superpowers:test-driven-development`); **no
+subagent was dispatched**, so no scratch file could collide.
+
+## Stop condition — re-measured from disk, all three legs FALSE
+
+```
+LEG (i)   rows=123  done=122  planned=1   not-done: row 115 at ROADMAP.md line 78
+          status = field 4 on ' | '; field-count histogram {6: 121, 7: 1, 10: 1}
+LEG (ii)  crates=14; envoy-{http3,grpc,wasm,protos,runtime,xds} all absent
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0 of 28 manifests; tokio=19
+          histogram=0 over crates/; gauge=365 (crates/) / 352 (crates/*/src/), by grep -ro
+LEG (iii) 11 headings 11/5/3/14/3/4/6/31/6/0/13 + 27 pre-heading = 123;
+          zero-row family: ### WASM host family
+```
+
+No `stop` file exists and none was created.
+
+## Fix 1 — settle ALL of the H1 headers-only framing last (item 1; `ADR-0204`)
+
+The cause (`REVIEW-3.md` I3-1): `decorate_filter_reply` pushed the H1 non-`HEAD`
+`content-length: 0` at the decode-side `SynthFromDecode` site, before `pipeline.encode_headers`,
+so an encode-side `header_mutation` that APPENDS a `content-length` left two rows; and
+`settle_headers_only_framing`'s rule (3) kept a `transfer-encoding` a stage wrote.
+
+- `decorate_filter_reply(resp, headers_only, connection)` pushes NO framing header for a
+  headers-only reply, on either method or codec. Its `head_request` parameter is REMOVED (nothing
+  depends on the method any more); the two H1 call sites, the H2 wrapper
+  (`crates/envoy-http2/src/response.rs`) and the two dispatcher unit tests follow.
+- `settle_headers_only_framing` now: (1) a gRPC-transformed `HEAD` drops its `content-length`
+  (unchanged); (2) EVERY `transfer-encoding` is dropped; (3) if no `content-length` remains,
+  `HEAD` → `transfer-encoding: chunked`, anything else → `content-length: 0`.
+- Scope unchanged (`ADR-0203` DECISION 2): only `health_check` sets `headers_only`; other
+  filters' replies, H2 behaviour, the gRPC transform's placement (`CF-115-16` (a)) and
+  `CF-115-14` are untouched.
+
+## Fix 2 — the pins, RED first and by mutation (item 2)
+
+Three NEW `envoy-http1` tests and two updated unit tests:
+
+- `h1_health_check_intercept_keeps_an_appended_content_length_alone` — A1 (`APPEND`
+  `content-length: 7` after `health_check`), B4 (the same placed BEFORE it, via a new
+  `health_check_h1_config_around` helper) and B6 (value `0`), each on `GET` and `HEAD`: exactly
+  one `content-length` row with the written value, no `transfer-encoding`, no body bytes.
+- `h1_health_check_intercept_replaces_a_stage_written_transfer_encoding` — A3 (`OVERWRITE`
+  `transfer-encoding: gzip`) and B7 (`APPEND`), each on `HEAD` (→ exactly the one framing row
+  `transfer-encoding: chunked`) and `GET` (→ exactly `content-length: 0`).
+- `h1_encode_side_headers_only_replacement_is_framed_last` — the `REVIEW-3.md` **M3-1** rider:
+  the `test_stop_and_send_on_encode` stub replaces the reply with a headers-only one; `HEAD` →
+  `transfer-encoding: chunked` alone, `GET` → `content-length: 0` alone, no body.
+- `settle_headers_only_framing_never_leaves_both_framing_headers`: the "a transfer-encoding some
+  stage wrote … stays" cell is REPLACED by two cells — `HEAD` + `gzip` → `chunked`; non-`HEAD` +
+  `chunked` → `content-length: 0`.
+- `decorate_filter_reply_frames_a_headers_only_reply_per_codec_and_method`: loses its method
+  axis; H1 and H2 both get no framing header, and a filter-supplied `content-length: 9` /
+  `transfer-encoding: gzip` is dropped. `…_without_headers_only_is_the_adr_0033_decoration`
+  loses its (now meaningless) method loop.
+
+RED on the unfixed tree (`cargo test -p envoy-http1 --lib -- h1_health_check h1_encode_side
+settle_headers_only decorate_filter_reply` → `6 passed; 4 failed`), each on the predicted
+assertion:
+
+```
+decorate_filter_reply_frames_…            left ["x-a=1","content-length=0","server=envoy-rust","connection=close"]
+settle_headers_only_framing_…             left ["transfer-encoding=gzip"]  right ["transfer-encoding=chunked"]
+h1_health_check_intercept_keeps_…         A1 GET: … content-length: 0 … content-length: 7   (row count 2 ≠ 1)
+h1_health_check_intercept_replaces_…      A3 HEAD: framing rows ["transfer-encoding: gzip"]
+h1_encode_side_headers_only_…             ok  (a characterization pin — proved by M3 below)
+```
+
+After the fix `envoy-http1 --lib`: **254 passed, 0 failed** (251 + the three new tests).
+
+Mutations — each target asserted to occur EXACTLY once by the mutation script, each run with
+`Compiling envoy-http1` asserted (1 line each), the file restored md5-identical
+(`0e4f5787c3d013f08c5136eb60548479`), the unmutated control GREEN at **254/0**:
+
+| # | mutation | result |
+|---|---|---|
+| M1 | restore the decode-site non-`HEAD` `content-length: 0` push (`if headers_only && req.method != "HEAD"`, after the `SynthFromDecode` decoration) | **253/1**: exactly the A1 test |
+| M2 | restore the old rule (3): drop `transfer-encoding` only beside a `content-length`, else keep a stage-written one | **252/2**: exactly the A3 test and the settle unit test |
+| M3 | delete the ENCODE-side `headers_only_reply = headers_only` | **253/1**: exactly the M3-1 pin |
+
+## Fix 3 — the differential witnesses (item 3)
+
+`diff_headers` (`tests/differential/src/lib.rs`) was READ before any witness was claimed: it
+compares the lower-cased header-NAME set, then the FIRST value of each name not allow-listed as
+`NameRequired` (only `server`, `date`, `x-envoy-upstream-service-time` are). Consequences:
+
+- **A3/B7 are witnessable** — both proxies send a `transfer-encoding`, but `gzip` ≠ `chunked`.
+- **B6 is NOT** — one `content-length: 0` row and two agree on the name set and on the first
+  value. Stays in-process (the A1 test's B6 cell).
+- **A1/B4 are NOT** — a `GET` carrying `content-length: 7` over an empty body cannot be
+  terminated by the driver's content-length read (the reason `0097` has no `GET` probe). Stays
+  in-process.
+
+**B7 → the NEW fixture `0098-http-filter-health-check-transfer-encoding`**: `[health_check,
+header_mutation (response transfer-encoding: gzip, APPEND_IF_EXISTS_OR_ADD), router]`, a
+`direct_response` catch-all, backend-free and cluster-free, derived from `0097`'s config by three
+`sed` substitutions (`diff` shows exactly the comment, the node id, the header and the action);
+`envoy.yaml` ≡ `envoy-rust.yaml` by `cp`/`cmp`; test
+`tests/differential/tests/http_filter_health_check_transfer_encoding.rs`. `p1` `HEAD /healthz`
+→ `transfer-encoding: chunked`; `p2` `GET /healthz` → `content-length: 0`. No `/other` probe:
+`CF-115-16` (d) and `CF-115-14` would red it on divergences this phase does not own.
+
+RED first, against the UNFIXED debug `envoy-bin` (the `crates/` change stashed, `cargo build -p
+envoy-bin` with `Compiling envoy-http1`; md5 `8f0daf79d7cecf7af4ab6f10f31ec61e`, the md5 the
+round-2 state-4 gate recorded; `hcm.rs` md5 `1e87dbc3…` = `a1c1623`):
+
+```
+fixture green: probe p1-head-intercept-stage-te-replaced-by-chunked: diff_headers
+    header `transfer-encoding`: envoy=`chunked` envoy-rust=`gzip`            (1.20 s)
+```
+
+That is also the upstream MEASUREMENT of B7's `HEAD` cell, taken by the fixture itself
+(`envoyproxy/envoy:v1.33.0`, `RepoDigests` `sha256:56da5afd…770c2`). After the fix (stash
+popped, rebuilt, md5 `4c8fefd49941b365c9c6f486d2e6d4cc`), each run 10 s apart:
+
+```
+cargo test -p differential --test http_filter_health_check_transfer_encoding  1 passed (1.27s)
+cargo test -p differential --test http_filter_health_check_framing            1 passed (1.56s)
+cargo test -p differential --test http_filter_health_check                    1 passed (1.30s)
+cargo test -p differential --test http_filter_health_check_stats              1 passed (1.50s)
+```
+
+`p2` passing is the upstream measurement of B7's `GET` cell (`content-length: 0`, no
+`transfer-encoding`). Negative control **V2** (`0098`'s README): M2 applied, debug `envoy-bin`
+rebuilt (md5 `67578e840dc33e40ca594a2f41889d22`). The FIRST run failed in 11.45 s at
+`upstream Envoy never became accept-ready … within 10s` — upstream's own readiness wait, before
+any probe, which says nothing about the binary; after a 20 s settle the re-run red at exactly
+`p1 … diff_headers` (1.12 s). Restored: `hcm.rs` md5-identical, `envoy-bin` md5 equal to the
+pre-mutation build (`BIN-EQUAL`, twice), `0098` GREEN again (1.23 s, 1.25 s). M1 has no
+differential witness, for the A1/B6 reasons above.
+
+## Fix 4 — the record (item 4; `REVIEW-3.md` R3-1 and the contract)
+
+- **R3-1.** The three live statements in `tests/differential/src/lib.rs` are corrected: the
+  `Http1Method::Head` doc no longer says "never-closed" (it cites RFC 9110 §9.3.2 and
+  upstream's ~1 s delayed close); the `drive_http1_head_reads_the_head_only` doc no longer says
+  upstream "leaves the socket OPEN … an EOF that never comes"; the mock's comment now says why it
+  holds the socket open ("a driver that waited for EOF would hang"), not that upstream does.
+  `grep -n 'never-closed\|OPEN even\|as upstream does\|never comes'` over the file → 0 lines.
+  Recorded in `ADR-0204`.
+- **Contract.** `BEHAVIOR_CONTRACT.md`'s settled-last paragraph ("a `content-length` a LATER
+  stage writes is the reply's only framing header", false under APPEND) is rewritten for every
+  method and both actions, with a witness on each clause (`[0097]`, `[0098]`, `[in-process]`)
+  and the reasons A1/B4/B6 have no differential witness; the section lead names `0098`.
+- **M3-3 rider.** `FilterResponse::headers_only` (`crates/envoy-filter/src/types.rs`) and the
+  doc of `intercept_is_a_headers_only_reply` (`crates/envoy-filter/src/health_check.rs`) now
+  state the settled-last rule; so does the `SynthFromDecode` call-site comment in `hcm.rs`.
+- **M3-5** is recorded in `0098`'s README for its own `p1`; `0097`'s README is not touched.
+  M3-2 (`decorate_filter_reply` is `pub`) is NOT taken: the H2 wrapper in another crate calls
+  it, and the doc now says an H1 headers-only reply needs the settle step.
+
+## Verification at this re-entry
+
+State 4 re-runs the full §7.5 gate. What this session ran:
+
+```
+cargo fmt --all -- --check                               exit 0, 0 bytes
+cargo build --workspace --all-targets                    exit 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+    (after touch -m of the envoy-http1, envoy-http2 and envoy-filter crate roots)
+                                                         exit 0, 8 Checking, 0 warning/error lines
+cargo deny check                                         advisories ok, bans ok, licenses ok, sources ok
+cargo test --workspace --no-fail-fast                    exit 101
+    ANSI-stripped, regex `test result: (ok|FAILED)`:     174 rows = 168 ok + 6 FAILED
+    passed=2354 failed=6   passed + failed = 2360
+```
+
+**The identity moved exactly as PREDICTED before the run: binaries 173 → 174 (the new
+`http_filter_health_check_transfer_encoding` test binary; `tests/differential/tests` 96 → 97
+files) and `2356 + 4 = 2360`** — the diff adds 3 test-attribute lines in `hcm.rs` and removes 0,
+plus the 1 in the new test file. `Cargo.toml`, `Cargo.lock` and `.github/` are untouched. Six
+local failures, by their `---- <name> stdout ----` markers, NONE on a path this fix touches:
+
+- `access_log_{h2_rcd,h2_uc,rcd,rf}_upstream_reset` and `admin_config_dump_server_info` — the
+  five PRE-EXISTING Family-A host reds the state-4 gates classified against interleaved
+  controls. Not re-adjudicated here.
+- `access_log_header_filter` (fixture `0078`) — panic site `upstream Envoy never became
+  accept-ready … within 10s`, upstream's own readiness wait before any probe. PASSED ALONE 2/2
+  with a 15 s settle gap (`1 passed` each, asserted — not a filtered-out false green). Its config
+  has no `health_check` filter. State 4 classifies it against a control.
+
+**CI prediction: `binaries=174 passed=2360 failed=0`.**
+
+Size: net **351** lines excluding `docs/` (465 insertions, 114 deletions over 10 files), read
+off `git diff --cached --numstat` at staging time. Most of `hcm.rs`'s 99 deletions are the two
+rewritten dispatcher unit tests and the removed `head_request` argument at four call sites.
+
+## What this session did NOT do
+
+- **Did not run the §7.5 gate.** State 4 runs it in full; a fresh state-5 session writes
+  `REVIEW-4.md`. No state was chained.
+- **Did not touch `ROADMAP.md`** (row `115` stays `planned`), `REVIEW.md`, `REVIEW-2.md`,
+  `REVIEW-3.md`, `SPEC.md`, `ADR-0200` … `ADR-0203`, `0097`'s files, or `known-failures.txt`.
+- **Did not widen** the change to other filters' local replies (`CF-115-16` (c)/(d)), move the
+  gRPC transform (`CF-115-16` (a), M3-4), fix `CF-115-14`, or change H2 behaviour. Minors
+  M2-1 … M2-4, M2-6, M3-2 and M3-4 were not taken; M3-1, M3-3 and (for `0098`) M3-5 were.
+
+## For the §5 state-4 re-verification (round 3)
+
+- Rebuild the DEBUG `envoy-bin` before the differential corpus. Fixture `0098` is new (two
+  probes, backend-free); `0095` (twelve), `0096` and `0097` (one) are unchanged.
+- The next free ADR number is **`ADR-0205`**.
