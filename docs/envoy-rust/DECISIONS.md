@@ -2402,6 +2402,100 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0205: Phase-116 pick + scope — **continue the Observability family with the `not_health_check_filter` access-log FILTER arm, the EIGHTH of the twelve `AccessLogFilter` oneof arms.** It is taken because phase 115 DISCHARGED the one ground `ADR-0196` gave for rejecting it, and that discharge was RE-TESTED against the pin rather than inherited.
+
+- **Date:** 2026-10-06
+- **Status:** accepted
+- **Phase:** 116 (`docs/envoy-rust/phases/116-accesslog-not-health-check-filter/`), §5 state-0/1 next-phase pick
+- **Supersedes:** nothing. **Superseded by:** nothing. It does **not** supersede `ADR-0196`, `ADR-0200` or `ADR-0167`. It **acts on** `ADR-0196` rejected-alternative (c) and `CF-115-3`. `ADR-0196` (c) rejected this arm because no downstream health-check filter existed. `ADR-0200` built that filter as phase 115, and `CF-115-3` banked this arm as phase 115's successor.
+
+**Context.** Phase 115 closed at `5e7978e1fcba4153474b50d409fac4784552e8d4`. Its CI record followed at `17f35c5ab6ee9e9bac66fed66a9ba03ba23ce6a2`, which was this session's entry `HEAD`: tree clean, branch `main`, identical to `origin/main`. The record's presence was checked **STRUCTURALLY**: the `## Last commit` close-out block is followed by a CI-confirmed line. This session therefore owed no inherited CI record. There was no active phase, so the §5 detection rule reads state 0/1, and this session is the next-phase pick.
+
+**The entry census, RE-DERIVED from disk: 123 ROADMAP rows, ALL `done`, not-done set EMPTY.** Stop-condition leg (i) was TRUE at entry, for the **seventh** time. **The mission is NOT complete, and NO `stop` file was created** (`test -e stop`: absent).
+
+- **Leg (ii) is FALSE.** There are **14** crates; `envoy-{http3,grpc,wasm,protos,runtime,xds}` are all absent by `test -d`. `quinn`/`wasmtime`/`tonic`/`opentelemetry`/`prost` each read **0/28** across the manifests from `git ls-files '*Cargo.toml'`, against a `tokio` control of **19/28** taken with the identical invocation. `histogram` reads **0** against `gauge` **365** (`grep -ro … crates/ | wc -l`).
+- **Leg (iii) is FALSE.** There are **11** `### ` family headings reading 11/5/3/14/3/4/6/31/6/**0**/13, plus **27** pre-heading rows, summing to 123. `### WASM host family` carries ZERO rows. The census seeds every heading at 0, so the zero-row heading is counted rather than skipped.
+- The field-count histogram under `' | '` is `{6: 121, 7: 1, 10: 1}`. The odd rows sit at file lines 169 and 170. They are append-only history and were NOT "fixed".
+
+`ADR-0167` DECISION 2 and `ROADMAP.md:58` govern. **This pick's row flips leg (i) back to FALSE**: the census after the edit is **124 rows / 123 `done` / 1 `planned`**, the not-done set is exactly `{116}`, and the Observability heading moves **31 → 32**.
+
+**The measurements this pick rests on (upstream Envoy v1.33.0, THIS session).** Container ownership was proved by `docker inspect <cid> --format '{{.Image}}'`, which returned the `ENVOY_TARGET.md` pin `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`. Host ports came from a bound-then-released `socket.bind(('127.0.0.1',0))`. **Readiness was gated on a real HTTP 200 from a throwaway path on EACH listener**, per `ADR-0200` DECISION 4. Full tables are in `phases/116-accesslog-not-health-check-filter/SPEC.md` §2.
+
+**DECISION 1 — the pick is the `not_health_check_filter` arm, and the ground is a DISCHARGED blocker that was RE-TESTED, not a re-ranking.**
+
+- `ADR-0196` (c) rejected the arm on one measured ground: no downstream health-check filter existed.
+- Phase 115 built that filter. `health_check` reads **1347** occurrences in `crates/`. Both HCMs already compute a "this request was answered by the health-check filter" predicate, `details == health_check_ok`, at `crates/envoy-http1/src/hcm.rs:1554` and `crates/envoy-http2/src/hcm.rs:1133`.
+- The arm itself still reads **0** across `crates/`, `tests/` and `BEHAVIOR_CONTRACT.md`, against built-arm controls `grpc_status_filter` **46/10/6** and `response_flag_filter` **60/11/11** taken with the identical invocation.
+
+The re-test found more than the phase-115 pick's six-request witness could show. That witness had no non-health-check request matching the health-check path, so it could not tell "matched the config" from "answered by the filter". This session's ten-cell, six-sink, two-listener probe can (DECISION 2).
+
+**DECISION 2 — the governing runtime rule: the arm drops EXACTLY the requests the health-check filter ANSWERED, and the marking comes from the filter's DECISION, not from the request.** Five cells establish it.
+
+- **(a)** Intercepted `GET /healthz` and `POST /healthz` are dropped. Every other record on both listeners is kept, including `GET /healthz?x=1`, which falls through.
+- **(b)** The same `GET /healthz` sent to a listener with **no** health-check filter is **kept**.
+- **(c)** A request carrying upstream's own health-checker user-agent `Envoy/HC` is kept, and so is one carrying `x-envoy-internal: true`.
+- **(d)** ⚠ **A `GET /healthz` that an RBAC DENY earlier in the chain answers with 403 is KEPT.** The path matches the health-check matcher, but the filter never ran.
+- **(e)** The arm composes as an ordinary leaf. In `or_filter` with a `header_filter`, the intercepted record is rescued by the other leg. In `and_filter` with `status_code_filter{GE 300}`, only the 403 survives.
+
+**Consequence for the implementation:** the health-check bit must be computed **after** the decode-side filter pass has decided the response, never from the request. Cells (b), (c) and (d) are what a request-derived bit fails.
+
+**DECISION 3 — the config surface is an empty, closed message, and a YAML null is an UNSET oneof.**
+
+- `not_health_check_filter: {}` validates, alone and nested in `and_filter`/`or_filter`.
+- `{ foo: 1 }` is rejected with `no such field`. `[]` and `true` are rejected with `invalid JSON`. Pairing the arm with a second arm is rejected with `oneof`.
+- ⚠ **`not_health_check_filter: ~` is rejected as `filter_specifier … is required`.** A null arm reads as no arm at all, not as an empty message.
+- A `bogus_filter_xyz: {}` negative control is rejected, so `--mode validate` genuinely resolves the oneof.
+
+The envoy-rust side of the null cell is SPEC PV-6. Serde will likely read it as `None`, and the existing validator would then reject it as "no filter variant is set", which is the same class of rejection. That is a prediction to measure, not a finding.
+
+**DECISION 4 — the scope is the arm, the data axis and one HTTP/1.1 fixture. Four things are OUT, each banked or fail-loud.**
+
+- **(a)** The four other unbuilt arms keep their standing grounds untouched. `duration_filter` and `runtime_filter` keep `ADR-0192` (d)/(c); `traceable_filter` and `extension_filter` keep `ADR-0196` (d)/(e). Banked as **CF-116-1**.
+- **(b)** The H2 differential witness is banked as **CF-116-2**, with an in-process pin, consistent with `CF-114-3` and `CF-115-4`.
+- **(c)** Pass-through mode stays `CF-115-5`'s phase. Upstream marks pass-through health checks too, so when that mode lands the bit must be set by the filter's **match** and not by its local reply.
+- **(d)** ⚠ **A pre-existing, unrelated divergence was found by this pick's measurement.** envoy-rust's RBAC filter sets no `%RESPONSE_CODE_DETAILS%`, whereas upstream renders `rbac_access_denied_matched_policy[deny-flagged]`. It is banked as **CF-116-3**. It constrains the fixture: the sink's format must not render that operator while an RBAC-denied row is kept.
+
+**Rejected alternatives, each on a measurement recorded here.**
+
+- **(a) `duration_filter` and `runtime_filter`**, on their standing `ADR-0192` grounds. Timing is excluded from comparison by default, and a sampling predicate is assertable only at its degenerate cells. Neither ground has moved.
+- **(b) `traceable_filter`**: `traceable` still reads **0** in `crates/`, and there is no tracing decision to read. It is a tracing-family prerequisite, not a filter arm.
+- **(c) `extension_filter`**: it needs an unbuilt extension-registry seam and is unbounded.
+- **(d) A histogram primitive in `envoy-stats`**: still a genuine unbuilt leaf (`histogram` **0** against `gauge` **365**). `ADR-0192` (j)'s rejection stands, because cross-proxy byte-exactness needs Envoy's quantile/bucket exposition formula.
+- **(e) Stats sinks, gRPC ALS and OTLP**: `opentelemetry`, `tonic` and `prost` each read **0/28**. Each needs new sink and transport infrastructure in the harness. These are multi-phase.
+- **(f) HTTP/3 + QUIC, the gRPC data path, xDS-over-gRPC and hot restart**: `envoy-http3`, `envoy-grpc`, `envoy-protos`, `envoy-xds` and `envoy-runtime` are all absent by `test -d`. `ADR-0177`/`ADR-0183` blockers stand. These are multi-phase.
+- **(g) The WASM host**: the only edit that moves leg (iii). `ADR-0183` (e) measured it unreachable without a `MISSION.md` amendment and a mandatory three-way split. Not this session.
+- **(h) The phase-115 banked arms.**
+  - `CF-115-1` (`cluster_min_healthy_percentages`) needs cluster health state and is non-deterministic at the boundary.
+  - `CF-115-5` (pass-through mode and `cache_time`) is timing-dependent and needs a backend.
+  - `CF-115-2` (admin `/healthcheck/fail`) needs driver work no landed probe supports.
+
+  Each is a larger or a less witnessable slice than this arm.
+- **(i) `RouteMatch.query_parameters` and the `RouteMatch.safe_regex` path arm**: `ADR-0200` (c)/(d) recorded both as legitimate, cheap future picks. They are rejected here only because neither discharges a recorded blocker or consumes a banked successor, and this arm does both.
+
+**§6.1 split — NOT projected, and NO ADR number is reserved.** The bottom-up central estimate is ≈**730** net code lines (band 565–890). ⚠ The landed access-log filter-arm comparators sit ABOVE that band: phase 71 **917**, phase 72 **1064**, phase 73 **873** (from `ADR-0196`) and phase 114 **1038** (from `ADR-0198`). That suggests the bottom-up figure is low. At the worst recorded PROJECTED multiplier (1.66×) the top of the band lands near **1480**, just under the gate. The task count is projected at 7–9.
+
+The state-2 PLAN-write **must** re-measure on a prototype in a scratch worktree with its own `CARGO_TARGET_DIR`, and again after the final edit to the plan. Per `ADR-0194` DECISION 2, a whole-slice prototype validates the SLICE, never a TASK BOUNDARY. If the gate fires, the cut is pre-declared: **`116.1`** is the in-process surface and **`116.2`** is fixture `0099` plus the contract section and the parent close.
+
+**Method note.** The main session took every measurement in this ADR directly. **No subagent was dispatched.** ⚠ One of this session's own probe artifacts is recorded so it is not mistaken for a finding. The config-validation variants were produced by a `sed` substitution of the literal `filter: { not_health_check_filter: {} }`. That literal occurs on TWO sinks (listener A's BBB and listener B's FFF), so every variant mutated both. The rejection readings are unaffected, since one bad sink rejects the bootstrap. But "the substitution count is 2" is the expected value, not a sign that something else matched.
+
+**Consequences.** This state-0/1 session changes no code. It touches:
+
+- `ROADMAP.md` (`1 0`, one new row under `### Observability family`, proved byte-reversible by md5);
+- `DECISIONS.md` (this ADR);
+- `STATE.md`;
+- `STATE_HISTORY.md` (the ADR-0035 relocation);
+- the new `phases/116-accesslog-not-health-check-filter/SPEC.md`.
+
+**ZERO executable lines, no `PLAN.md`, no landed artifact edited, nothing fixed** (§6.3; `ADR-0165`).
+
+- **Opens** **CF-116-1** … **CF-116-3**.
+- **CONSUMES `CF-115-3`.**
+- **AMENDS `CF-114-2`**: its five-arm list becomes four.
+
+Every other banked carry-forward stands INTACT, including `CF-115-1`, `CF-115-2`, `CF-115-4` … `CF-115-16`, `CF-75-5` and the phase-112 ALPN rider (`ADR-0192` DECISION 5). The ADR head after this ADR is **ADR-0205**, derived by sorting the `^## ADR-` numbers. The next free number is **ADR-0206**, and NOTHING is reserved. The next session runs the §5 state-2 PLAN-write (`superpowers:writing-plans`) and must discharge SPEC §8's **PV-1 … PV-8** before writing a task list.
+
+---
+
 ## ADR-0204: Phase-115 §5.2 state-3 re-entry (round 3) — **an H1 headers-only reply's framing is settled LAST for EVERY method, not only `HEAD`: `decorate_filter_reply` pushes NO framing header for a headers-only reply, and `settle_headers_only_framing` owns `transfer-encoding` — it drops every one a stage wrote, keeps a `content-length` a stage wrote, and otherwise pushes `transfer-encoding: chunked` for a `HEAD` and `content-length: 0` for anything else.** Fixes `REVIEW-3.md` I3-1 (cells A1, B4, B6, A3, B7), adds the new fixture `0098-http-filter-health-check-transfer-encoding`, and **corrects `ADR-0203` FORWARD**: its headline ("a `content-length` a later stage writes wins alone") was false on the non-`HEAD` arm, its option-(c) rejection reasons do not hold, and its R2-1 correction missed three live statements in the harness (R3-1).
 
 - **Date:** 2026-09-22
