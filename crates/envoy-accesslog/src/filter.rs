@@ -106,6 +106,11 @@ pub enum LogFilter {
         codes: Vec<u8>,
         exclude: bool,
     },
+    /// Phase 116: emit a record iff the health_check filter did NOT answer the
+    /// request (`not_health_check_filter`). The config message is EMPTY, so
+    /// the variant carries nothing; the bit arrives as the `is_health_check`
+    /// argument, which the HCMs derive from the filter's DECISION.
+    NotHealthCheck,
 }
 
 impl LogFilter {
@@ -116,12 +121,10 @@ impl LogFilter {
     /// should be emitted. The `StatusCode` arm reads only `status`; the
     /// `ResponseFlag` arm only `response_flags`; the `Header` arm only
     /// `headers`; the phase-74 `Metadata` arm only `dynamic_metadata`; the
-    /// phase-114 `GrpcStatus` arm only `grpc_status_code`. The status
+    /// phase-114 `GrpcStatus` arm only `grpc_status_code`; the phase-116
+    /// `NotHealthCheck` arm only `is_health_check`. The status
     /// comparison is widened to `u32` (lossless; status is always in `u16`
     /// range).
-    // TRANSIENT (phase 116 Task 1): no arm reads `is_health_check` until Task 2
-    // lands `LogFilter::NotHealthCheck`. Task 2 DELETES this allow.
-    #[allow(clippy::only_used_in_recursion)]
     pub fn should_log(
         &self,
         status: u16,
@@ -201,6 +204,9 @@ impl LogFilter {
             LogFilter::GrpcStatus { codes, exclude } => {
                 codes.contains(&grpc_status_code) != *exclude
             }
+            // Phase 116: drop exactly the requests the health_check filter
+            // answered (MEASURED, `SPEC.md` §2.2 rule 1).
+            LogFilter::NotHealthCheck => !is_health_check,
         }
     }
 }
@@ -598,5 +604,49 @@ mod tests {
         for code in 0..=16u8 {
             assert!(!f.should_log(200, "-", &[], &Default::default(), code, false));
         }
+    }
+
+    // ── Phase 116: the `NotHealthCheck` arm ───────────────────────────────────
+    #[test]
+    fn not_health_check_arm_drops_exactly_the_health_checks() {
+        let f = LogFilter::NotHealthCheck;
+        assert!(!f.should_log(200, "-", &[], &Default::default(), 2, true));
+        assert!(f.should_log(200, "-", &[], &Default::default(), 2, false));
+    }
+
+    #[test]
+    fn not_health_check_arm_reads_only_the_bit() {
+        // MEASURED (`SPEC.md` §2.2 rule 2): the arm keys on the filter's
+        // decision, never on the request — so no status, flag, header,
+        // metadata or gRPC status can make it drop a non-health-check.
+        let f = LogFilter::NotHealthCheck;
+        let ua = [("user-agent".to_string(), "Envoy/HC".to_string())];
+        let internal = [("x-envoy-internal".to_string(), "true".to_string())];
+        for status in [200u16, 403, 404, 503] {
+            for headers in [&[][..], &ua[..], &internal[..]] {
+                assert!(f.should_log(status, "-", headers, &Default::default(), 2, false));
+                assert!(!f.should_log(status, "NR", headers, &Default::default(), 14, true));
+            }
+        }
+    }
+
+    #[test]
+    fn not_health_check_arm_composes_as_a_leaf() {
+        // MEASURED (`SPEC.md` §2.2 rule 4): sinks CCC and DDD. The composition
+        // arms must THREAD the bit to the nested leaf — a recursion that drops
+        // it goes red here.
+        let keep = || LogFilter::Header {
+            matcher: std::sync::Arc::new(HasHeaderValue("x-keep", "1")),
+        };
+        let or = LogFilter::Or(vec![LogFilter::NotHealthCheck, keep()]);
+        let x_keep = vec![("x-keep".to_string(), "1".to_string())];
+        assert!(!or.should_log(200, "-", &[], &Default::default(), 2, true));
+        assert!(or.should_log(200, "-", &x_keep, &Default::default(), 2, true));
+        assert!(or.should_log(200, "-", &[], &Default::default(), 2, false));
+
+        let and = LogFilter::And(vec![LogFilter::NotHealthCheck, ge(300)]);
+        assert!(and.should_log(403, "-", &[], &Default::default(), 2, false));
+        assert!(!and.should_log(200, "-", &[], &Default::default(), 2, false));
+        assert!(!and.should_log(403, "-", &[], &Default::default(), 2, true));
     }
 }
