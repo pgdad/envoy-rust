@@ -3669,6 +3669,96 @@ where **5** are expected, the three lost being exactly those three, with the
 unmutated control GREEN from the same tree. Assertion is pure cross-proxy
 equality plus an exact per-side count.
 
+### Phase 116 (ADR-0205/0206): `not_health_check_filter` — the EIGHTH emission-gate arm (the HEALTH-CHECK-DECISION gate)
+
+> `filter: { not_health_check_filter: {} }`
+
+Upstream `envoy.config.accesslog.v3.NotHealthCheckFilter`. Drops a record iff
+the request was **answered by the downstream `envoy.filters.http.health_check`
+filter** (phase 115). Every rule below was MEASURED against
+`envoyproxy/envoy:v1.33.0`
+(`sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`), on
+the config surface via `--mode validate` with a negative control, and at runtime
+via six sinks over two listeners.
+
+**§A The config surface — an EMPTY, CLOSED message.**
+
+| `filter:` | verdict | envoy-rust |
+|---|---|---|
+| `not_health_check_filter: {}`, alone, or nested in `and_filter` / `or_filter` | **ACCEPT** | loads |
+| `not_health_check_filter: { foo: 1 }` | **REJECT** | serde: unknown field |
+| `not_health_check_filter: []`, `[1]`, `true`, `0`, `""` | **REJECT** | serde: invalid type |
+| `not_health_check_filter: ~`, or the bare key with no value | **REJECT** — read as an UNSET oneof (`filter_specifier … is required`), not as an empty message | `None`, then `ConfigError::AmbiguousAccessLogFilter { "no filter variant is set" }` |
+| `not_health_check_filter: {}` plus a second arm | **REJECT** (oneof) | `AmbiguousAccessLogFilter { "more than one filter variant is set" }` |
+
+⚠ **`[]` is the trap.** A DERIVED serde `Deserialize` on an empty braced struct
+accepts a zero-length SEQUENCE, so the obvious one-line struct would LOAD a
+config upstream rejects. `NotHealthCheckFilter` therefore carries a hand-rolled
+map-only visitor (`crates/envoy-config/src/bootstrap.rs`).
+
+**§B The runtime rule — the arm reads the filter's DECISION, never the request.**
+
+1. It drops EXACTLY the requests the health_check filter answered, whatever the
+   method; a `/healthz?x=1` that falls through to the route is KEPT.
+2. The same `GET /healthz` is KEPT on a listener with no health_check filter. A
+   request carrying upstream's active-health-checker user-agent `Envoy/HC`, or
+   `x-envoy-internal: true`, is KEPT.
+3. A `/healthz` that an earlier filter answers first — an RBAC deny, 403 — is
+   KEPT, although its path matches the health_check matcher. The filter must
+   actually RUN and answer.
+4. It composes like any other leaf inside `and_filter` / `or_filter`.
+
+envoy-rust: `LogFilter::NotHealthCheck` evaluates `!is_health_check`, the sixth
+`should_log` argument. Both HCMs compute it AFTER the decode-side filter pass,
+from the final `%RESPONSE_CODE_DETAILS%`, by
+`envoy_filter::health_check::answered_by_health_check` — the SAME predicate that
+excludes an intercepted request from `downstream_rq_Nxx` (phase 115), so the
+two consumers cannot disagree. ⚠ A future filter that reuses the
+`health_check_ok` details string is a health check to BOTH.
+
+**§C Mutual exclusion.** `not_health_check_filter` joins the `AccessLogFilter`
+oneof as the **EIGHTH** arm — exactly one may be set at each level, enforced by
+`validate_access_logs`, NOT by serde.
+
+**§D envoy-rust scope — what is and is not implemented.**
+
+- **Both codecs implement the arm.** The H2 arm has no cross-proxy fixture and is
+  pinned in-process only — **`CF-116-2`**.
+- **Pass-through mode is not reopened.** Upstream also marks a request as a
+  health check in `pass_through_mode: true`, while forwarding it. envoy-rust
+  rejects `pass_through_mode: true` at load (`CF-115-5`), so the cell cannot be
+  expressed. When it lands, the bit must follow the filter's MATCH, not its local
+  reply.
+- **Four arms remain unbuilt**: `duration_filter`, `runtime_filter`,
+  `traceable_filter`, `extension_filter` — **`CF-116-1`**.
+
+**§E Authoritative fixture.** `0099-accesslog-not-health-check-filter`: chain
+`[rbac DENY on x-deny present, health_check :path exact /healthz, router]`, one
+sink, format `NHC %REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE% UA=%REQ(USER-AGENT)%`,
+`clusters: []`, no backend. **SIX probes, FOUR kept.**
+
+| probe | request | observed | kept | the rule it pins |
+|---|---|---|---|---|
+| 1 | `GET /healthz` | 200 (intercepted) | no | §B 1 |
+| 2 | `POST /healthz` | 200 (intercepted) | no | §B 1, method-agnostic |
+| 3 | `GET /healthz?x=1` | 200 `MAIN` | **yes** | §B 1, a near-miss falls through |
+| 4 | `GET /other` | 200 `MAIN` | **yes** | the control |
+| 5 | `GET /healthz` + `x-deny: 1` | **403** | **yes** ⚠ | §B 3, the filter must RUN |
+| 6 | `GET /ua` + `user-agent: Envoy/HC` | 200 `MAIN` | **yes** ⚠ | §B 2, not keyed on the request |
+
+The format does NOT render `%RESPONSE_CODE_DETAILS%`: probe 5 is a kept RBAC
+403, and envoy-rust's RBAC sets no details where upstream renders
+`rbac_access_denied_matched_policy[deny-flagged]` — pre-existing, **`CF-116-3`**.
+§B 2's no-health-check-listener cell cannot share a fixture with this chain; it
+is pinned in-process on both codecs.
+
+**Probes 5 and 6 (⚠) are the non-vacuity witnesses.** Proved by MUTATION, not
+asserted: deriving the bit from the request path makes envoy-rust emit **2**
+lines where **4** are expected (probes 3 and 5 lost); forcing it `true` emits 0
+and forcing it `false` leaks both intercepts; the unmutated control is GREEN
+from the same tree. Assertion is pure cross-proxy equality plus an exact
+per-side count.
+
 ### Phase 75 (ADR-0156/0157/0158/0159/0161/0162): `HeaderMatcher` ABSENCE semantics — the `present_match` POLARITY rule and its two-consumer witnesses
 
 > Fixtures `0083-headermatcher-absence-parity` (ROUTE path, sub-phase 75.1) +
