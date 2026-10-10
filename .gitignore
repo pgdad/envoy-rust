@@ -11,4 +11,5 @@
 
 # operator scratch (session-local; never committed)
 /next-prompt.txt
-/.claude/
+/.claude/*
+!/.claude/settings.json
