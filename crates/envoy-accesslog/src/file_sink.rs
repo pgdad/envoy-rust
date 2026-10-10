@@ -96,10 +96,11 @@ impl FileSink {
         }
     }
 
-    /// Phase 70/71/72/73/74/114: returns `true` iff a record with final response
-    /// `status`, `response_flags` token, request `headers`, per-request
-    /// `dynamic_metadata` and UNGATED effective `grpc_status_code` should be
-    /// emitted to this sink. A sink with no filter always logs.
+    /// Phase 70/71/72/73/74/114/116: returns `true` iff a record with final
+    /// response `status`, `response_flags` token, request `headers`, per-request
+    /// `dynamic_metadata`, UNGATED effective `grpc_status_code` and
+    /// `is_health_check` bit should be emitted to this sink. A sink with no
+    /// filter always logs.
     pub fn should_log(
         &self,
         status: u16,
@@ -110,6 +111,7 @@ impl FileSink {
             std::collections::BTreeMap<String, String>,
         >,
         grpc_status_code: u8,
+        is_health_check: bool,
     ) -> bool {
         match &self.filter {
             Some(f) => f.should_log(
@@ -118,6 +120,7 @@ impl FileSink {
                 headers,
                 dynamic_metadata,
                 grpc_status_code,
+                is_health_check,
             ),
             None => true,
         }
@@ -369,16 +372,16 @@ mod tests {
         let sink = FileSink::new(path, CompiledFormat::default(), filter)
             .await
             .expect("open");
-        assert!(!sink.should_log(200, "-", &[], &Default::default(), 2));
-        assert!(sink.should_log(503, "-", &[], &Default::default(), 2));
+        assert!(!sink.should_log(200, "-", &[], &Default::default(), 2, false));
+        assert!(sink.should_log(503, "-", &[], &Default::default(), 2, false));
 
         // A sink with no filter logs everything.
         let dir2 = tempdir().expect("tempdir");
         let sink2 = FileSink::new(dir2.path().join("al2.log"), CompiledFormat::default(), None)
             .await
             .expect("open");
-        assert!(sink2.should_log(200, "-", &[], &Default::default(), 2));
-        assert!(sink2.should_log(503, "NR", &[], &Default::default(), 2));
+        assert!(sink2.should_log(200, "-", &[], &Default::default(), 2, false));
+        assert!(sink2.should_log(503, "NR", &[], &Default::default(), 2, false));
     }
 
     #[tokio::test]

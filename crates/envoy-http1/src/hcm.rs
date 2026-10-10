@@ -1550,9 +1550,9 @@ async fn serve_connection(
         //
         // Phase 115 (MEASURED): a request the health_check filter answered is
         // NOT counted here.
-        if response_code_details_for_log.as_deref()
-            != Some(envoy_filter::health_check::HEALTH_CHECK_OK)
-        {
+        if !envoy_filter::health_check::answered_by_health_check(
+            response_code_details_for_log.as_deref(),
+        ) {
             match response_status_for_log / 100 {
                 2 => config.stats.downstream_rq_2xx.inc(),
                 3 => config.stats.downstream_rq_3xx.inc(),
@@ -1608,6 +1608,12 @@ async fn serve_connection(
                     &req.headers,
                     &record.dynamic_metadata,
                     record.grpc_status_code,
+                    // Phase 116: the health_check filter's DECISION, read from
+                    // the final details AFTER the decode-side pass decided the
+                    // response — never from the request.
+                    envoy_filter::health_check::answered_by_health_check(
+                        record.response_code_details.as_deref(),
+                    ),
                 ) {
                     continue;
                 }
@@ -5246,7 +5252,7 @@ static_resources:
             let sink = &config.access_log[0];
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    sink.should_log(*status, "-", &[], &Default::default(), 2),
+                    sink.should_log(*status, "-", &[], &Default::default(), 2, false),
                     *must_log,
                     "{op:?} {threshold} filter on status {status}: expected should_log={must_log}",
                 );
@@ -5349,9 +5355,9 @@ static_resources:
         let path = dir.path().join("rf.log");
         let config = hcm_config_with_response_flag_access_log(&["NR"], &path).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(404, "NR", &[], &Default::default(), 2)); // kept
-        assert!(!sink.should_log(503, "-", &[], &Default::default(), 2)); // dropped (no flag)
-        assert!(!sink.should_log(200, "UH", &[], &Default::default(), 2)); // dropped (UH ∉ ["NR"])
+        assert!(sink.should_log(404, "NR", &[], &Default::default(), 2, false)); // kept
+        assert!(!sink.should_log(503, "-", &[], &Default::default(), 2, false)); // dropped (no flag)
+        assert!(!sink.should_log(200, "UH", &[], &Default::default(), 2, false)); // dropped (UH ∉ ["NR"])
     }
 
     /// Phase 72 T5: `compile_access_log_filter` builds the `header_filter` arm
@@ -5385,6 +5391,7 @@ static_resources:
             &[("x-log".into(), "yes".into())],
             &Default::default(),
             2,
+            false,
         ));
         assert!(!compiled.should_log(
             200,
@@ -5392,8 +5399,9 @@ static_resources:
             &[("x-log".into(), "no".into())],
             &Default::default(),
             2,
+            false,
         ));
-        assert!(!compiled.should_log(200, "-", &[], &Default::default(), 2)); // absent → drop
+        assert!(!compiled.should_log(200, "-", &[], &Default::default(), 2, false)); // absent → drop
     }
 
     /// Phase 73 T4: `compile_access_log_filter` builds the `and_filter`/`or_filter`
@@ -5437,8 +5445,8 @@ static_resources:
             ("x-a".to_string(), "1".to_string()),
             ("x-b".to_string(), "1".to_string()),
         ];
-        assert!(!compiled.should_log(200, "-", &a, &Default::default(), 2)); // only x-a → AND false → drop
-        assert!(compiled.should_log(200, "-", &ab, &Default::default(), 2)); // both → AND true → keep
+        assert!(!compiled.should_log(200, "-", &a, &Default::default(), 2, false)); // only x-a → AND false → drop
+        assert!(compiled.should_log(200, "-", &ab, &Default::default(), 2, false)); // both → AND true → keep
 
         // or_filter { [ and_filter{[x-a,x-b]}, header{x-c} ] } (depth-2).
         let or = envoy_config::AccessLogFilter {
@@ -5468,9 +5476,9 @@ static_resources:
         let compiled = compile_access_log_filter(&or);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
         let c = [("x-c".to_string(), "1".to_string())];
-        assert!(compiled.should_log(200, "-", &ab, &Default::default(), 2)); // AND-child true → OR keep
-        assert!(compiled.should_log(200, "-", &c, &Default::default(), 2)); // leaf true → OR keep
-        assert!(!compiled.should_log(200, "-", &a, &Default::default(), 2)); // AND-child false, leaf false → drop
+        assert!(compiled.should_log(200, "-", &ab, &Default::default(), 2, false)); // AND-child true → OR keep
+        assert!(compiled.should_log(200, "-", &c, &Default::default(), 2, false)); // leaf true → OR keep
+        assert!(!compiled.should_log(200, "-", &a, &Default::default(), 2, false)); // AND-child false, leaf false → drop
     }
 
     /// Phase 74 T6: `compile_access_log_filter` builds the `metadata_filter`
@@ -5516,9 +5524,9 @@ static_resources:
                 match_if_key_not_found: true
             }
         ));
-        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1"), 2)); // match
-        assert!(!compiled.should_log(200, "-", &[], &md("com.example", "k", "2"), 2)); // mismatch
-        assert!(compiled.should_log(200, "-", &[], &empty, 2)); // absent → default true
+        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1"), 2, false)); // match
+        assert!(!compiled.should_log(200, "-", &[], &md("com.example", "k", "2"), 2, false)); // mismatch
+        assert!(compiled.should_log(200, "-", &[], &empty, 2, false)); // absent → default true
 
         // (b) explicit `false` → key-absent records are DROPPED (the R-0.4
         //     polarity flip that `--mode validate` cannot reach).
@@ -5537,8 +5545,8 @@ static_resources:
                 ..
             }
         ));
-        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1"), 2));
-        assert!(!compiled.should_log(200, "-", &[], &empty, 2)); // absent → drop
+        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1"), 2, false));
+        assert!(!compiled.should_log(200, "-", &[], &empty, 2, false)); // absent → drop
 
         // (c) MATCHER-LESS (upstream accepts `metadata_filter: {}`, R-0.2) →
         //     `matcher: None`, every record takes the not-found policy.
@@ -5554,7 +5562,7 @@ static_resources:
                 match_if_key_not_found: true
             }
         ));
-        assert!(compiled.should_log(200, "-", &[], &empty, 2));
+        assert!(compiled.should_log(200, "-", &[], &empty, 2, false));
 
         // (d) nested inside a composition arm (phase-73 recursion).
         let nested = envoy_config::AccessLogFilter {
@@ -5577,7 +5585,7 @@ static_resources:
         };
         let compiled = compile_access_log_filter(&nested);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
-        assert!(compiled.should_log(200, "-", &[], &empty, 2)); // second child keeps
+        assert!(compiled.should_log(200, "-", &[], &empty, 2, false)); // second child keeps
     }
 
     /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
@@ -5612,9 +5620,9 @@ static_resources:
 
         // exact: keep "yes"; drop mismatch AND absent.
         let f = compile_mode(M::ExactMatch("yes".into()));
-        assert!(f.should_log(200, "-", &yes, &Default::default(), 2));
-        assert!(!f.should_log(200, "-", &no, &Default::default(), 2));
-        assert!(!f.should_log(200, "-", &absent, &Default::default(), 2));
+        assert!(f.should_log(200, "-", &yes, &Default::default(), 2, false));
+        assert!(!f.should_log(200, "-", &no, &Default::default(), 2, false));
+        assert!(!f.should_log(200, "-", &absent, &Default::default(), 2, false));
 
         // prefix / suffix match on the value; drop absent.
         assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(
@@ -5623,6 +5631,7 @@ static_resources:
             &yes,
             &Default::default(),
             2,
+            false,
         ));
         assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(
             200,
@@ -5630,6 +5639,7 @@ static_resources:
             &absent,
             &Default::default(),
             2,
+            false,
         ));
         assert!(compile_mode(M::SuffixMatch("es".into())).should_log(
             200,
@@ -5637,6 +5647,7 @@ static_resources:
             &yes,
             &Default::default(),
             2,
+            false,
         ));
 
         // present: any value keeps; absent drops.
@@ -5646,6 +5657,7 @@ static_resources:
             &yes,
             &Default::default(),
             2,
+            false,
         ));
         assert!(!compile_mode(M::PresentMatch(true)).should_log(
             200,
@@ -5653,6 +5665,7 @@ static_resources:
             &absent,
             &Default::default(),
             2,
+            false,
         ));
 
         // string_match { exact } — the fixture-0078 mode.
@@ -5661,9 +5674,9 @@ static_resources:
             ignore_case: false,
         };
         let f = compile_mode(M::StringMatch(sm));
-        assert!(f.should_log(200, "-", &yes, &Default::default(), 2));
-        assert!(!f.should_log(200, "-", &no, &Default::default(), 2));
-        assert!(!f.should_log(200, "-", &absent, &Default::default(), 2));
+        assert!(f.should_log(200, "-", &yes, &Default::default(), 2, false));
+        assert!(!f.should_log(200, "-", &no, &Default::default(), 2, false));
+        assert!(!f.should_log(200, "-", &absent, &Default::default(), 2, false));
     }
 
     /// Phase-71 state-5 review probe (REVIEW.md §2): the H1 EMIT LOOP threads
@@ -5719,9 +5732,9 @@ static_resources:
         let config =
             hcm_config_with_filtered_access_log(None, &dir.path().join("plain.log"), 200).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(200, "-", &[], &Default::default(), 2));
-        assert!(sink.should_log(503, "NR", &[], &Default::default(), 2));
-        assert!(sink.should_log(404, "UF", &[], &Default::default(), 2));
+        assert!(sink.should_log(200, "-", &[], &Default::default(), 2, false));
+        assert!(sink.should_log(503, "NR", &[], &Default::default(), 2, false));
+        assert!(sink.should_log(404, "UF", &[], &Default::default(), 2, false));
     }
 
     /// Phase 72 §5.2 state-3 (REVIEW.md F-3, closes M71-5): TWO sinks with
@@ -5895,10 +5908,10 @@ static_resources:
         )
         .await;
         let sink = &config.access_log[0];
-        assert!(!sink.should_log(200, "NR", &[], &Default::default(), 2)); // status-only: 200 < 500 drops
-        assert!(!sink.should_log(200, "-", &[], &Default::default(), 2));
-        assert!(sink.should_log(503, "-", &[], &Default::default(), 2)); // 503 >= 500 keeps
-        assert!(sink.should_log(503, "NR", &[], &Default::default(), 2));
+        assert!(!sink.should_log(200, "NR", &[], &Default::default(), 2, false)); // status-only: 200 < 500 drops
+        assert!(!sink.should_log(200, "-", &[], &Default::default(), 2, false));
+        assert!(sink.should_log(503, "-", &[], &Default::default(), 2, false)); // 503 >= 500 keeps
+        assert!(sink.should_log(503, "NR", &[], &Default::default(), 2, false));
     }
 
     /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the
@@ -6094,12 +6107,12 @@ static_resources:
 
         for status in [200u16, 499, 500, 503] {
             assert_eq!(
-                inert.should_log(status, "-", &[], &Default::default(), 2),
-                named.should_log(status, "-", &[], &Default::default(), 2),
+                inert.should_log(status, "-", &[], &Default::default(), 2, false),
+                named.should_log(status, "-", &[], &Default::default(), 2, false),
                 "runtime_key must not alter should_log({status}): \
                  runtime_key=unused -> {}, runtime_key=some.key -> {}",
-                inert.should_log(status, "-", &[], &Default::default(), 2),
-                named.should_log(status, "-", &[], &Default::default(), 2),
+                inert.should_log(status, "-", &[], &Default::default(), 2, false),
+                named.should_log(status, "-", &[], &Default::default(), 2, false),
             );
         }
 
@@ -6124,11 +6137,11 @@ static_resources:
         // Sanity: the shared `GE 500` threshold really is the one in effect,
         // so the equality above is not two identically-vacuous filters.
         assert!(
-            !inert.should_log(499, "-", &[], &Default::default(), 2),
+            !inert.should_log(499, "-", &[], &Default::default(), 2, false),
             "GE 500 must reject a 499"
         );
         assert!(
-            inert.should_log(500, "-", &[], &Default::default(), 2),
+            inert.should_log(500, "-", &[], &Default::default(), 2, false),
             "GE 500 must accept a 500"
         );
     }
@@ -6170,7 +6183,7 @@ static_resources:
         let sink = &config.access_log[0];
         for status in [200u16, 499, 500, 503] {
             assert!(
-                sink.should_log(status, "-", &[], &Default::default(), 2),
+                sink.should_log(status, "-", &[], &Default::default(), 2, false),
                 "a sink with no filter must log every record; should_log({status}) was false"
             );
         }
@@ -6211,7 +6224,7 @@ static_resources:
             .expect("filter compiles");
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    filter.should_log(*status, "-", &[], &Default::default(), 2),
+                    filter.should_log(*status, "-", &[], &Default::default(), 2, false),
                     *must_log,
                     "op: {token} {threshold} on status {status}: expected should_log={must_log} \
                      (the YAML token compiled to the wrong FilterOp)",
@@ -11502,11 +11515,11 @@ static_resources:
         // D1: value matcher + invert + ABSENT → the record is now DROPPED.
         let f = compile(M::ExactMatch("v".into()), true);
         assert!(
-            f.should_log(200, "-", &present, &Default::default(), 2),
+            f.should_log(200, "-", &present, &Default::default(), 2, false),
             "value+invert, present non-matching → KEEP"
         );
         assert!(
-            !f.should_log(200, "-", &absent, &Default::default(), 2),
+            !f.should_log(200, "-", &absent, &Default::default(), 2, false),
             "value+invert, ABSENT → DROP (D1 / CF-72-1 closed) — this is the \
              divergence fixture 0078's README recorded as deferred"
         );
@@ -11514,22 +11527,22 @@ static_resources:
         // D2: plain `present_match: false` requires ABSENCE.
         let f = compile(M::PresentMatch(false), false);
         assert!(
-            !f.should_log(200, "-", &present, &Default::default(), 2),
+            !f.should_log(200, "-", &present, &Default::default(), 2, false),
             "present_match:false, PRESENT → DROP (D2)"
         );
         assert!(
-            f.should_log(200, "-", &absent, &Default::default(), 2),
+            f.should_log(200, "-", &absent, &Default::default(), 2, false),
             "present_match:false, ABSENT → KEEP"
         );
 
         // P1 THE GUARD — must stay KEEP through the seam.
         let f = compile(M::PresentMatch(true), true);
         assert!(
-            f.should_log(200, "-", &absent, &Default::default(), 2),
+            f.should_log(200, "-", &absent, &Default::default(), 2, false),
             "present_match:true+invert, ABSENT → STILL KEEP (P1 parity)"
         );
         assert!(
-            !f.should_log(200, "-", &present, &Default::default(), 2),
+            !f.should_log(200, "-", &present, &Default::default(), 2, false),
             "present_match:true+invert, PRESENT → DROP"
         );
 
@@ -11542,6 +11555,7 @@ static_resources:
                 &empty,
                 &Default::default(),
                 2,
+                false,
             ),
             "an EMPTY header value is PRESENT, so present_match:false DROPs"
         );

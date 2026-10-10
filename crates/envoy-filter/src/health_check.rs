@@ -30,6 +30,21 @@ pub const X_ENVOY_UPSTREAM_HEALTHCHECKED_CLUSTER: &str = "x-envoy-upstream-healt
 /// `%RESPONSE_CODE_DETAILS%` of an intercepted probe.
 pub const HEALTH_CHECK_OK: &str = "health_check_ok";
 
+/// Phase 116: `true` iff a request's final `%RESPONSE_CODE_DETAILS%` says the
+/// health_check filter ANSWERED it. The ONE definition behind both HCMs'
+/// `downstream_rq_Nxx` exclusion (phase 115) and the `not_health_check_filter`
+/// access-log arm (phase 116), so the two can never disagree.
+///
+/// It reads the filter's DECISION, never the request: a `/healthz` that falls
+/// through, that an earlier filter answers, or that reaches a listener with no
+/// health_check filter carries other details and is NOT a health check
+/// (MEASURED, phase-116 `SPEC.md` §2.2 rules 2 and 3). ⚠ Any future filter
+/// that reuses the `health_check_ok` details string is treated as a health
+/// check by BOTH consumers.
+pub fn answered_by_health_check(details: Option<&str>) -> bool {
+    details == Some(HEALTH_CHECK_OK)
+}
+
 /// The eight counters upstream registers under `http.<stat_prefix>.health_check.`
 /// (MEASURED). Only `request_total` and `ok` move in non-pass-through mode;
 /// the rest stay 0 (their triggers are CF-115-1 / CF-115-2 / CF-115-5).
@@ -140,6 +155,24 @@ mod tests {
     use super::*;
     use crate::types::header_matcher_exact;
     use envoy_config::{HeaderMatcher, HealthCheckFilterConfig};
+
+    #[test]
+    fn answered_by_health_check_reads_only_the_intercept_details() {
+        assert!(answered_by_health_check(Some(HEALTH_CHECK_OK)));
+        // Every other details value, and none at all, is NOT a health check:
+        // a fall-through route, an earlier filter's local reply, a route miss.
+        for other in [
+            "direct_response",
+            "rbac_access_denied_matched_policy[deny-flagged]",
+            "route_not_found",
+            "via_upstream",
+            "health_check_ok ",
+            "HEALTH_CHECK_OK",
+        ] {
+            assert!(!answered_by_health_check(Some(other)), "{other}");
+        }
+        assert!(!answered_by_health_check(None));
+    }
 
     fn cfg(headers: Vec<HeaderMatcher>) -> HealthCheckFilterConfig {
         HealthCheckFilterConfig {

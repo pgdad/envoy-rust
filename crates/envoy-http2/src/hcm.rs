@@ -1129,9 +1129,9 @@ async fn finalize_h2_stream(
     //
     // Phase 115 (MEASURED): a request the health_check filter answered is NOT
     // counted here.
-    if response_code_details_for_log_h2.as_deref()
-        != Some(envoy_filter::health_check::HEALTH_CHECK_OK)
-    {
+    if !envoy_filter::health_check::answered_by_health_check(
+        response_code_details_for_log_h2.as_deref(),
+    ) {
         match response_status_for_log / 100 {
             2 => config.inner.stats.downstream_rq_2xx.inc(),
             3 => config.inner.stats.downstream_rq_3xx.inc(),
@@ -1239,6 +1239,11 @@ async fn finalize_h2_stream(
                 &envoy_req.headers,
                 &record.dynamic_metadata,
                 record.grpc_status_code,
+                // Phase 116: the health_check filter's DECISION (see the H1
+                // site) — the same predicate as the counter exclusion above.
+                envoy_filter::health_check::answered_by_health_check(
+                    record.response_code_details.as_deref(),
+                ),
             ) {
                 continue;
             }
