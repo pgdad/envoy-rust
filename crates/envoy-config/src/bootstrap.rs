@@ -718,11 +718,12 @@ pub struct AccessLog {
 }
 
 /// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
-/// predicate carried by an `AccessLog` entry. This type models SEVEN oneof arms —
+/// predicate carried by an `AccessLog` entry. This type models EIGHT oneof arms —
 /// `status_code_filter` (phase 70), `response_flag_filter` (phase 71),
 /// `header_filter` (phase 72), the recursive `and_filter` / `or_filter`
-/// composition (phase 73), `metadata_filter` (phase 74) and
-/// `grpc_status_filter` (phase 114); future
+/// composition (phase 73), `metadata_filter` (phase 74),
+/// `grpc_status_filter` (phase 114) and `not_health_check_filter` (phase 116);
+/// future
 /// filter-family phases add further `Option` arms here rather than reshaping the
 /// type. Cardinality (exactly one arm set) is enforced by `validate_access_logs`
 /// (`ConfigError::AmbiguousAccessLogFilter`), NOT by serde — mirroring the
@@ -756,6 +757,50 @@ pub struct AccessLogFilter {
     /// present, else the phase-110 HTTP->gRPC map over the response code).
     /// Mutually exclusive with the other arms.
     pub grpc_status_filter: Option<GrpcStatusFilter>,
+    /// Phase 116: the EIGHTH `AccessLogFilter` arm — drops a record iff the
+    /// health_check filter ANSWERED the request. Mutually exclusive with the
+    /// other arms. ⚠ A YAML null (`not_health_check_filter: ~`) is `None` here,
+    /// an UNSET arm — exactly as upstream reads it (MEASURED).
+    pub not_health_check_filter: Option<NotHealthCheckFilter>,
+}
+
+/// Phase 116: `envoy.config.accesslog.v3.NotHealthCheckFilter` — an EMPTY,
+/// closed message. A MAP with no keys (`{}`) is its only spelling; any key,
+/// and any non-map value (`[]`, `[1]`, `true`, `0`, `""`), is REJECTED
+/// (MEASURED upstream with `--mode validate`).
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub struct NotHealthCheckFilter {}
+
+/// Hand-rolled because a DERIVED `Deserialize` on an empty braced struct also
+/// accepts a zero-length SEQUENCE: `not_health_check_filter: []` would load,
+/// where upstream rejects it (MEASURED). The visitor accepts maps only, and
+/// rejects the first key it sees.
+impl<'de> serde::Deserialize<'de> for NotHealthCheckFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = NotHealthCheckFilter;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an empty NotHealthCheckFilter map (`{}`)")
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<NotHealthCheckFilter, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                match map.next_key::<String>()? {
+                    Some(key) => Err(M::Error::unknown_field(&key, &[])),
+                    None => Ok(NotHealthCheckFilter {}),
+                }
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
 }
 
 /// Phase 114: `envoy.config.accesslog.v3.GrpcStatusFilter`. `statuses` holds
@@ -5899,7 +5944,7 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
 }
 
 /// Phase 73: recursively validate one `AccessLogFilter` oneof. Enforces exactly
-/// one arm is set (cardinality, all SEVEN arms — no `..`, so a future arm cannot
+/// one arm is set (cardinality, all EIGHT arms — no `..`, so a future arm cannot
 /// be added without updating this [M70-R1]), the per-leaf checks (status-code
 /// runtime_key, response-flag token membership, header-matcher compile-in-place),
 /// and — for the composition arms — `filters.len() >= 2` plus a recursive descent
@@ -5914,6 +5959,7 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         or_filter,
         metadata_filter,
         grpc_status_filter,
+        not_health_check_filter,
     } = filter;
     let set_arms = [
         status_code_filter.is_some(),
@@ -5923,6 +5969,8 @@ fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate:
         or_filter.is_some(),
         metadata_filter.is_some(),
         grpc_status_filter.is_some(),
+        // Phase 116: the empty message has nothing else to validate.
+        not_health_check_filter.is_some(),
     ]
     .iter()
     .filter(|set| **set)
@@ -14739,6 +14787,7 @@ or_filter: null
                 or_filter: None,
                 metadata_filter: None,
                 grpc_status_filter: None,
+                not_health_check_filter: None,
             }),
         }];
         let err = validate_access_logs(&mut logs).expect_err("ambiguous");
@@ -14776,6 +14825,7 @@ or_filter: null
             or_filter: None,
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         }
     }
 
@@ -14837,6 +14887,7 @@ or_filter: null
             or_filter: None,
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         };
         let f = AccessLogFilter {
             or_filter: Some(OrFilter {
@@ -14966,12 +15017,12 @@ metadata_filter:
     }
 
     #[test]
-    fn seven_arm_cardinality_counts_every_arm() {
+    fn eight_arm_cardinality_counts_every_arm() {
         // PV-3: the destructure is compiler-forced (no `..`), but the `set_arms`
         // ARRAY is not length-checked — an arm present in the struct yet missing
         // from the array would count as ZERO, turning a valid single-arm filter
         // into `AmbiguousAccessLogFilter{"no filter variant is set"}`. Assert
-        // each of the SEVEN arms ALONE validates, and that all seven together are
+        // each of the EIGHT arms ALONE validates, and that all eight together are
         // "more than one".
         let single_arms: Vec<AccessLogFilter> = vec![
             AccessLogFilter {
@@ -15016,14 +15067,18 @@ metadata_filter:
                 }),
                 ..AccessLogFilter::default()
             },
+            AccessLogFilter {
+                not_health_check_filter: Some(NotHealthCheckFilter {}),
+                ..AccessLogFilter::default()
+            },
         ];
-        assert_eq!(single_arms.len(), 7, "seven arms must be covered");
+        assert_eq!(single_arms.len(), 8, "eight arms must be covered");
         for (idx, f) in single_arms.into_iter().enumerate() {
             validate_access_logs(&mut file_log_with_filter(f))
                 .unwrap_or_else(|e| panic!("arm {idx} alone must validate, got {e:?}"));
         }
 
-        let all_seven = AccessLogFilter {
+        let all_eight = AccessLogFilter {
             status_code_filter: Some(StatusCodeFilter {
                 comparison: ComparisonFilter {
                     op: ComparisonOp::Ge,
@@ -15054,9 +15109,10 @@ metadata_filter:
                 statuses: vec![GrpcStatusToken::Name("NOT_FOUND".into())],
                 exclude: false,
             }),
+            not_health_check_filter: Some(NotHealthCheckFilter {}),
         };
         let err =
-            validate_access_logs(&mut file_log_with_filter(all_seven)).expect_err("ambiguous");
+            validate_access_logs(&mut file_log_with_filter(all_eight)).expect_err("ambiguous");
         assert!(matches!(
             err,
             crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
@@ -15073,6 +15129,86 @@ metadata_filter:
             matches!(&err, crate::ConfigError::UnknownGrpcStatus { token } if token == "CANCELLED"),
             "got {err:?}"
         );
+    }
+
+    // --- phase 116: the `not_health_check_filter` arm ---
+
+    #[test]
+    fn not_health_check_filter_loads_alone_and_nested() {
+        // MEASURED: `{}` validates upstream, alone and nested inside both
+        // composition arms on one bootstrap.
+        for arm in [
+            "not_health_check_filter: {}",
+            "or_filter: { filters: [ { not_health_check_filter: {} }, { header_filter: { header: { name: x-keep, present_match: true } } } ] }",
+            "and_filter: { filters: [ { not_health_check_filter: {} }, { status_code_filter: { comparison: { op: GE, value: { default_value: 300, runtime_key: k } } } } ] }",
+        ] {
+            crate::parse_bootstrap(&access_log_filter_yaml(arm))
+                .unwrap_or_else(|e| panic!("MEASURED ACCEPT upstream: {arm} -> {e:?}"));
+        }
+    }
+
+    #[test]
+    fn not_health_check_filter_rejects_every_measured_reject() {
+        // MEASURED REJECT upstream (`--mode validate`): the message is EMPTY
+        // and CLOSED. `[]` is the trap — a DERIVED `Deserialize` accepts it.
+        for arm in [
+            "not_health_check_filter: { foo: 1 }",
+            "not_health_check_filter: []",
+            "not_health_check_filter: [1]",
+            "not_health_check_filter: true",
+            "not_health_check_filter: 0",
+            "not_health_check_filter: \"\"",
+        ] {
+            let err = crate::parse_bootstrap(&access_log_filter_yaml(arm))
+                .expect_err("MEASURED REJECT upstream");
+            assert!(
+                matches!(err, crate::ConfigError::Yaml(_)),
+                "{arm}: must be a serde rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_health_check_filter_null_is_an_unset_arm() {
+        // MEASURED: upstream reads a YAML null as an UNSET oneof (`filter_specifier
+        // … is required`), not as an empty message. Here it is `None`, so the
+        // validator's zero-arm branch rejects it — the same class.
+        for arm in ["not_health_check_filter: ~", "not_health_check_filter:"] {
+            let err = crate::parse_bootstrap(&access_log_filter_yaml(arm))
+                .expect_err("a null arm is unset");
+            assert!(
+                matches!(
+                    &err,
+                    crate::ConfigError::AmbiguousAccessLogFilter { detail }
+                        if detail == "no filter variant is set"
+                ),
+                "{arm}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_health_check_filter_with_a_second_arm_is_ambiguous() {
+        let arm = "{ not_health_check_filter: {}, status_code_filter: { comparison: { op: GE, value: { default_value: 300, runtime_key: k } } } }";
+        let err = crate::parse_bootstrap(&access_log_filter_yaml(arm)).expect_err("two arms");
+        assert!(
+            matches!(
+                &err,
+                crate::ConfigError::AmbiguousAccessLogFilter { detail }
+                    if detail == "more than one filter variant is set"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_health_check_filter_round_trips_as_an_empty_map() {
+        // The admin config_dump path serializes the config: the arm must come
+        // back as `{}`, which the map-only visitor accepts.
+        let json = serde_json::to_string(&NotHealthCheckFilter {}).expect("serializes");
+        assert_eq!(json, "{}");
+        let back: NotHealthCheckFilter = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, NotHealthCheckFilter {});
     }
 
     #[test]

@@ -1874,15 +1874,16 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
     Ok(seen.unwrap_or(0))
 }
 
-/// Phase 70/71/72/73/74/114 — translate a config-side `AccessLogFilter` into the
+/// Phase 70/71/72/73/74/114/116 — translate a config-side `AccessLogFilter` into the
 /// runtime `LogFilter` predicate the sink evaluates per record. The envoy-config
 /// validator (`validate_access_logs`) already enforced that exactly one oneof
 /// arm is set, so the 0/multi-arm cases are `unreachable!` (CF-70-1: the
-/// zero-arm `expect()` is gone). SEVEN arms ship: `status_code_filter` (phase
+/// zero-arm `expect()` is gone). EIGHT arms ship: `status_code_filter` (phase
 /// 70), `response_flag_filter` (phase 71), `header_filter` (phase 72), the
 /// recursive `and_filter`/`or_filter` composition arms (phase 73), which map
 /// each nested child via `.iter().map(compile_access_log_filter)`,
-/// `metadata_filter` (phase 74) and `grpc_status_filter` (phase 114).
+/// `metadata_filter` (phase 74), `grpc_status_filter` (phase 114) and
+/// `not_health_check_filter` (phase 116).
 fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accesslog::LogFilter {
     match (
         &f.status_code_filter,
@@ -1892,8 +1893,9 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
         &f.or_filter,
         &f.metadata_filter,
         &f.grpc_status_filter,
+        &f.not_health_check_filter,
     ) {
-        (Some(scf), None, None, None, None, None, None) => {
+        (Some(scf), None, None, None, None, None, None, None) => {
             let op = match scf.comparison.op {
                 envoy_config::ComparisonOp::Eq => envoy_accesslog::FilterOp::Eq,
                 envoy_config::ComparisonOp::Ge => envoy_accesslog::FilterOp::Ge,
@@ -1906,7 +1908,7 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
                 threshold: scf.comparison.value.default_value,
             })
         }
-        (None, Some(rff), None, None, None, None, None) => {
+        (None, Some(rff), None, None, None, None, None, None) => {
             envoy_accesslog::LogFilter::ResponseFlag {
                 flags: rff.flags.clone(),
             }
@@ -1914,14 +1916,16 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
         // Phase 72 (ADR-0150): box the config `HeaderMatcher` into the injected
         // `HeaderMatch` seam. The validator already compiled its SafeRegex, so
         // the runtime `matches` never hits its `.expect()`.
-        (None, None, Some(hf), None, None, None, None) => envoy_accesslog::LogFilter::Header {
-            matcher: std::sync::Arc::new(hf.header.clone()),
-        },
+        (None, None, Some(hf), None, None, None, None, None) => {
+            envoy_accesslog::LogFilter::Header {
+                matcher: std::sync::Arc::new(hf.header.clone()),
+            }
+        }
         // Phase 73: the two composition arms map each child recursively.
-        (None, None, None, Some(af), None, None, None) => envoy_accesslog::LogFilter::And(
+        (None, None, None, Some(af), None, None, None, None) => envoy_accesslog::LogFilter::And(
             af.filters.iter().map(compile_access_log_filter).collect(),
         ),
-        (None, None, None, None, Some(of), None, None) => envoy_accesslog::LogFilter::Or(
+        (None, None, None, None, Some(of), None, None, None) => envoy_accesslog::LogFilter::Or(
             of.filters.iter().map(compile_access_log_filter).collect(),
         ),
         // Phase 74 (ADR-0150/ADR-0155): box the config `MetadataMatcher` into
@@ -1932,26 +1936,37 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
         // reach this). A matcher-less `metadata_filter` (accepted upstream,
         // R-0.2) compiles to `matcher: None`, so every record takes the
         // not-found policy.
-        (None, None, None, None, None, Some(mf), None) => envoy_accesslog::LogFilter::Metadata {
-            matcher: mf.matcher.as_ref().map(|m| {
-                std::sync::Arc::new(m.clone()) as std::sync::Arc<dyn envoy_accesslog::MetadataMatch>
-            }),
-            match_if_key_not_found: mf.match_if_key_not_found.unwrap_or(true),
-        },
+        (None, None, None, None, None, Some(mf), None, None) => {
+            envoy_accesslog::LogFilter::Metadata {
+                matcher: mf.matcher.as_ref().map(|m| {
+                    std::sync::Arc::new(m.clone())
+                        as std::sync::Arc<dyn envoy_accesslog::MetadataMatch>
+                }),
+                match_if_key_not_found: mf.match_if_key_not_found.unwrap_or(true),
+            }
+        }
         // Phase 114: the seventh arm. `statuses` tokens are resolved to codes
         // here (the validator already proved every one resolves), so the runtime
         // predicate is a plain integer membership test.
-        (None, None, None, None, None, None, Some(gsf)) => envoy_accesslog::LogFilter::GrpcStatus {
-            codes: gsf
-                .statuses
-                .iter()
-                .map(|t| {
-                    envoy_config::resolve_grpc_status_token(t)
-                        .expect("validated by validate_access_logs: every status token resolves")
-                })
-                .collect(),
-            exclude: gsf.exclude,
-        },
+        (None, None, None, None, None, None, Some(gsf), None) => {
+            envoy_accesslog::LogFilter::GrpcStatus {
+                codes: gsf
+                    .statuses
+                    .iter()
+                    .map(|t| {
+                        envoy_config::resolve_grpc_status_token(t).expect(
+                            "validated by validate_access_logs: every status token resolves",
+                        )
+                    })
+                    .collect(),
+                exclude: gsf.exclude,
+            }
+        }
+        // Phase 116: the eighth arm. The message is empty, so there is nothing
+        // to carry; the bit is supplied per record by the HCM.
+        (None, None, None, None, None, None, None, Some(_)) => {
+            envoy_accesslog::LogFilter::NotHealthCheck
+        }
         _ => unreachable!("validated by validate_access_logs: exactly one filter arm is set"),
     }
 }
@@ -5142,6 +5157,7 @@ static_resources:
                     or_filter: None,
                     metadata_filter: None,
                     grpc_status_filter: None,
+                    not_health_check_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -5291,6 +5307,7 @@ static_resources:
                     or_filter: None,
                     metadata_filter: None,
                     grpc_status_filter: None,
+                    not_health_check_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -5379,6 +5396,7 @@ static_resources:
             or_filter: None,
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         };
         let compiled = compile_access_log_filter(&filter);
         assert!(matches!(
@@ -5424,6 +5442,7 @@ static_resources:
             or_filter: None,
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         };
 
         // and_filter { [x-a=1, x-b=1] } → LogFilter::And([Header, Header]).
@@ -5437,6 +5456,7 @@ static_resources:
             or_filter: None,
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         };
         let compiled = compile_access_log_filter(&and);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::And(ref v) if v.len() == 2));
@@ -5466,12 +5486,14 @@ static_resources:
                         or_filter: None,
                         metadata_filter: None,
                         grpc_status_filter: None,
+                        not_health_check_filter: None,
                     },
                     hdr("x-c", "1"),
                 ],
             }),
             metadata_filter: None,
             grpc_status_filter: None,
+            not_health_check_filter: None,
         };
         let compiled = compile_access_log_filter(&or);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
@@ -5588,6 +5610,50 @@ static_resources:
         assert!(compiled.should_log(200, "-", &[], &empty, 2, false)); // second child keeps
     }
 
+    /// Phase 116: the eighth tuple arm compiles `not_health_check_filter: {}`
+    /// to the unit `NotHealthCheck` predicate, and it also compiles NESTED —
+    /// the composition arms recurse through the same function.
+    #[test]
+    fn compile_access_log_filter_builds_not_health_check_arm() {
+        let leaf = envoy_config::AccessLogFilter {
+            not_health_check_filter: Some(envoy_config::NotHealthCheckFilter {}),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&leaf);
+        assert!(matches!(
+            compiled,
+            envoy_accesslog::LogFilter::NotHealthCheck
+        ));
+        assert!(!compiled.should_log(200, "-", &[], &Default::default(), 2, true));
+        assert!(compiled.should_log(200, "-", &[], &Default::default(), 2, false));
+
+        let nested = envoy_config::AccessLogFilter {
+            and_filter: Some(envoy_config::AndFilter {
+                filters: vec![
+                    envoy_config::AccessLogFilter {
+                        not_health_check_filter: Some(envoy_config::NotHealthCheckFilter {}),
+                        ..Default::default()
+                    },
+                    envoy_config::AccessLogFilter {
+                        not_health_check_filter: Some(envoy_config::NotHealthCheckFilter {}),
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&nested);
+        assert!(matches!(
+            &compiled,
+            envoy_accesslog::LogFilter::And(children)
+                if children.len() == 2
+                    && children
+                        .iter()
+                        .all(|c| matches!(c, envoy_accesslog::LogFilter::NotHealthCheck))
+        ));
+        assert!(!compiled.should_log(200, "-", &[], &Default::default(), 2, true));
+    }
+
     /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
     /// supported modes + the absent-drop, end-to-end through
     /// `compile_access_log_filter` → `LogFilter::Header::should_log`. SafeRegex
@@ -5612,6 +5678,7 @@ static_resources:
                 or_filter: None,
                 metadata_filter: None,
                 grpc_status_filter: None,
+                not_health_check_filter: None,
             })
         };
         let yes = [("x-log".to_string(), "yes".to_string())];
@@ -5790,6 +5857,7 @@ static_resources:
                         or_filter: None,
                         metadata_filter: None,
                         grpc_status_filter: None,
+                        not_health_check_filter: None,
                     },
                 ),
                 // Sink B — status_code_filter { EQ 200 }.
@@ -5811,6 +5879,7 @@ static_resources:
                         or_filter: None,
                         metadata_filter: None,
                         grpc_status_filter: None,
+                        not_health_check_filter: None,
                     },
                 ),
             ],
@@ -11507,6 +11576,7 @@ static_resources:
                 or_filter: None,
                 metadata_filter: None,
                 grpc_status_filter: None,
+                not_health_check_filter: None,
             })
         };
         let present = [("x-a".to_string(), "zzz".to_string())];
