@@ -1,0 +1,64 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0099-envoy-mount/access.log
+    envoy_rust: /tmp/0099-envoy-rust-mount/access.log
+  # The sink's filter is `not_health_check_filter: {}`: drop a record iff the
+  # health_check filter ANSWERED the request. Six probes on six distinct
+  # (method, path, header) combinations; two suppressed, four KEPT.
+  probes:
+    # Probe 1 — SUPPRESSED, the decisive drop. The health_check filter
+    # answers `GET /healthz` (200, empty body).
+    - method: get
+      path: /healthz
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — SUPPRESSED. The filter is method-agnostic, so the drop is too.
+    - method: post
+      path: /healthz
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: false
+    # Probe 3 — KEPT. `:path` is matched WITH its query string, so this
+    # near-miss falls through to the route ("MAIN") and is not a health check.
+    - method: get
+      path: /healthz?x=1
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: true
+    # Probe 4 — KEPT. The plain control.
+    - method: get
+      path: /other
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: true
+    # Probe 5 — KEPT, and THE CELL THAT NEEDS THE FILTER TO RUN. The path
+    # matches the health_check matcher, but RBAC answers 403 FIRST, so the
+    # health_check filter never decides it. An arm that re-evaluates the
+    # matcher against the request drops this row; the correct arm keeps it.
+    - method: get
+      path: /healthz
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-deny", "1"]
+      expected_status: 403
+      expect_logged: true
+    # Probe 6 — KEPT, and LAST so the driver pays the SHORT suppression
+    # settle. Upstream's own active-health-checker user-agent does NOT make a
+    # request a health check: the arm keys on the filter's decision only.
+    - method: get
+      path: /ua
+      host: envoy-rust.test
+      extra_headers:
+        - ["user-agent", "Envoy/HC"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`), plus an exact
+  # per-side line count. Four lines per side, MEASURED at the PLAN-write
+  # against both real proxies:
+  #   NHC GET /healthz?x=1 200 UA=-
+  #   NHC GET /other 200 UA=-
+  #   NHC GET /healthz 403 UA=-
+  #   NHC GET /ua 200 UA=Envoy/HC
+  # Every route is a direct_response -> `clusters: []`, no backend spawns.
