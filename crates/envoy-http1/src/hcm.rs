@@ -7679,7 +7679,16 @@ static_resources:
 "#,
             log = log.display()
         );
-        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap loads");
+        h1_config_from_bootstrap_yaml(&yaml).await
+    }
+
+    /// Build the H1 `HCMConfig` of the FIRST listener's HCM in `yaml`, through
+    /// `parse_bootstrap` (which stamps `node.cluster`) and
+    /// `HCMConfig::from_config`.
+    async fn h1_config_from_bootstrap_yaml(
+        yaml: &str,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap loads");
         let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) =
             &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0].typed_config
         else {
@@ -7698,6 +7707,138 @@ static_resources:
             .expect("HCM config builds"),
         );
         (config, registry)
+    }
+
+    /// Phase 116: an H1 HCM whose ONE sink carries
+    /// `filter: { not_health_check_filter: {} }`, over the fixture-`0099`
+    /// chain `[rbac DENY on x-deny present, health_check :path exact /healthz,
+    /// router]` — or, with `with_health_check: false`, the same chain without
+    /// the health_check filter (`SPEC.md` §2.2 listener B).
+    async fn not_health_check_h1_config(
+        log: &std::path::Path,
+        with_health_check: bool,
+    ) -> Arc<HCMConfig> {
+        let health_check = if with_health_check {
+            r#"                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                      pass_through_mode: false
+                      headers:
+                        - { name: ":path", string_match: { exact: /healthz } }
+"#
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r#"
+node: {{ id: n, cluster: hc-node-cluster }}
+static_resources:
+  listeners:
+    - name: l
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                access_log:
+                  - name: envoy.access_loggers.file
+                    filter:
+                      not_health_check_filter: {{}}
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {log}
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE%\n"
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: MAIN }} }}
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: DENY
+                        policies:
+                          deny-flagged:
+                            permissions: [ {{ any: true }} ]
+                            principals: [ {{ header: {{ name: x-deny, present_match: true }} }} ]
+{health_check}                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#,
+            log = log.display()
+        );
+        h1_config_from_bootstrap_yaml(&yaml).await.0
+    }
+
+    /// Phase 116: `not_health_check_filter` end to end on H1 — every cell of
+    /// `SPEC.md` §2.2 that one H1 listener can express, plus listener B (no
+    /// health_check filter, row 8), which fixture `0099` cannot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_not_health_check_filter_drops_exactly_the_intercepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let send = |method: &str, path: &str, header: &str| {
+            format!("{method} {path} HTTP/1.1\r\nHost: x\r\n{header}Connection: close\r\n\r\n")
+        };
+
+        let log_a = dir.path().join("a.log");
+        let config = not_health_check_h1_config(&log_a, true).await;
+        for (req, status) in [
+            (send("GET", "/healthz", ""), "200"),     // row 1: dropped
+            (send("POST", "/healthz", ""), "200"),    // row 2: dropped
+            (send("GET", "/healthz?x=1", ""), "200"), // row 3: falls through
+            (send("GET", "/other", ""), "200"),       // row 4
+            (send("GET", "/healthz", "x-deny: 1\r\n"), "403"), // row 6: RBAC answers first
+            (send("GET", "/ua", "user-agent: Envoy/HC\r\n"), "200"), // row 7
+            (send("HEAD", "/healthz", ""), "200"),    // a HEAD intercept: dropped
+        ] {
+            let resp = String::from_utf8(drive(Arc::clone(&config), req.as_bytes()).await).unwrap();
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{req:?} -> {resp}"
+            );
+        }
+        // The bit is per REQUEST: on one keep-alive connection the intercept is
+        // dropped and its neighbour kept, in either order (MEASURED upstream).
+        for pipelined in [
+            "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            "GET /before HTTP/1.1\r\nHost: x\r\n\r\nGET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        ] {
+            let resp =
+                String::from_utf8(drive(Arc::clone(&config), pipelined.as_bytes()).await).unwrap();
+            assert_eq!(resp.matches("HTTP/1.1 200 ").count(), 2, "{resp}");
+        }
+
+        let log_b = dir.path().join("b.log");
+        let config = not_health_check_h1_config(&log_b, false).await;
+        for req in [
+            send("GET", "/healthz", ""), // row 8: no filter to answer
+            send("GET", "/int", "x-envoy-internal: true\r\n"), // row 10
+        ] {
+            let resp = String::from_utf8(drive(Arc::clone(&config), req.as_bytes()).await).unwrap();
+            assert!(resp.ends_with("MAIN"), "{req:?} -> {resp}");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            tokio::fs::read_to_string(&log_a).await.expect("log a"),
+            "GET /healthz?x=1 200\nGET /other 200\nGET /healthz 403\nGET /ua 200\n\
+             GET /after 200\nGET /before 200\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&log_b).await.expect("log b"),
+            "GET /healthz 200\nGET /int 200\n"
+        );
     }
 
     /// Phase 115: `envoy.filters.http.health_check` end to end on H1, from

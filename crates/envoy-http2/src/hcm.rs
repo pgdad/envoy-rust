@@ -4715,6 +4715,152 @@ static_resources:
         );
     }
 
+    /// One `h2_not_health_check_run` request: method, URI, one optional header.
+    type H2Probe<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+
+    /// Phase 116 (`CF-116-2`: the H2 arm has no differential witness, so it is
+    /// pinned HERE): drive `requests` over ONE H2 connection to an HCM whose
+    /// one sink carries `filter: { not_health_check_filter: {} }`, over the
+    /// chain `[rbac DENY on x-deny present, health_check :path exact /healthz,
+    /// router]` — without the health_check filter when `with_health_check` is
+    /// false. Returns each response status and the access log.
+    async fn h2_not_health_check_run(
+        with_health_check: bool,
+        requests: &[H2Probe<'_>],
+    ) -> (Vec<u16>, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("access.log");
+        let health_check = if with_health_check {
+            r#"                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                      pass_through_mode: false
+                      headers:
+                        - { name: ":path", string_match: { exact: /healthz } }
+"#
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r#"
+node: {{ id: n, cluster: hc-node-cluster }}
+static_resources:
+  listeners:
+    - name: l
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http_h2
+                codec_type: HTTP2
+                access_log:
+                  - name: envoy.access_loggers.file
+                    filter:
+                      not_health_check_filter: {{}}
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {log}
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE%\n"
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: MAIN }} }}
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: DENY
+                        policies:
+                          deny-flagged:
+                            permissions: [ {{ any: true }} ]
+                            principals: [ {{ header: {{ name: x-deny, present_match: true }} }} ]
+{health_check}                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#,
+            log = log.display()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap loads");
+        let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) =
+            &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0].typed_config
+        else {
+            panic!("HCM expected");
+        };
+        let config = Arc::new(
+            Http1HCMConfig::from_config(
+                hcm,
+                Arc::new(envoy_cluster::ClusterManager::empty()),
+                Arc::new(envoy_stats::StatsRegistry::new()),
+                None,
+                Arc::new(RuntimeSnapshot::default()),
+            )
+            .await
+            .expect("HCM config builds"),
+        );
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut statuses = Vec::new();
+        for (method, uri, header) in requests {
+            let mut req = http::Request::builder().method(*method).uri(*uri);
+            if let Some((name, value)) = header {
+                req = req.header(*name, *value);
+            }
+            let (response_fut, _) = send_request
+                .send_request(req.body(()).unwrap(), true)
+                .unwrap();
+            let (parts, mut body) = response_fut.await.expect("response").into_parts();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            statuses.push(parts.status.as_u16());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let lines = tokio::fs::read_to_string(&log).await.unwrap_or_default();
+        (statuses, lines)
+    }
+
+    /// Phase 116: `not_health_check_filter` on H2 — the `SPEC.md` §2.2 cells,
+    /// listener B (row 8) included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_not_health_check_filter_drops_exactly_the_intercepts() {
+        let (statuses, lines) = h2_not_health_check_run(
+            true,
+            &[
+                ("GET", "http://x/healthz", None),
+                ("POST", "http://x/healthz", None),
+                ("GET", "http://x/healthz?x=1", None),
+                ("GET", "http://x/healthz", Some(("x-deny", "1"))),
+                ("GET", "http://x/ua", Some(("user-agent", "Envoy/HC"))),
+            ],
+        )
+        .await;
+        assert_eq!(statuses, [200, 200, 200, 403, 200]);
+        assert_eq!(
+            lines,
+            "GET /healthz?x=1 200\nGET /healthz 403\nGET /ua 200\n"
+        );
+
+        let (statuses, lines) =
+            h2_not_health_check_run(false, &[("GET", "http://x/healthz", None)]).await;
+        assert_eq!(statuses, [200]);
+        assert_eq!(lines, "GET /healthz 200\n");
+    }
+
     /// Phase 115: `envoy.filters.http.health_check` on H2 (CF-115-4 pins the
     /// H2 cell in-process only): the `:path` matcher sees the query string, a
     /// match carries the stamped `local_cluster` and logs `health_check_ok`.
