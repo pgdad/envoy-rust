@@ -2402,6 +2402,38 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0207: Phase-116 §5 state-4 gate — **`cargo deny check` went RED on advisory-DB drift: bump `rustls` 0.23.45 → 0.23.46 (four vulnerabilities), and scope-ignore `RUSTSEC-2024-0449` (`unsafe-libyaml` unmaintained) on the `serde_yaml` production chain.**
+
+- **Date:** 2026-10-15
+- **Status:** accepted
+- **Phase:** 116 (`docs/envoy-rust/phases/116-accesslog-not-health-check-filter/`), §5 state-4 verification gate
+- **Supersedes:** nothing. **Superseded by:** nothing. It EXTENDS the `ADR-0005` `[advisories].ignore` discipline to a production (not dev-only) chain, which `ADR-0005` does not cover — hence a new ADR rather than a "tracked via ADR-0005" annotation.
+
+**Context.** The phase-116 §5 state-4 gate ran `cargo deny check` on `6ceae47cbc04b6e05183a37816623ee0ecd6b33f` (a tree whose `Cargo.lock` is byte-identical to the one CI recorded `advisories ok` for at run `38057389166` on `79dfbde`) and it exited **1**: `advisories FAILED, bans ok, licenses ok, sources ok`. The RustSec database had gained five entries against existing, untouched dependencies — nothing in the phase-116 diff caused them:
+
+- `RUSTSEC-2026-0346`, `-0347`, `-0348`, `-0349` — four `error[vulnerability]` entries against `rustls 0.23.45`, each with `Solution: Upgrade to >=0.23.46`.
+- `RUSTSEC-2024-0449` — `error[unmaintained]`: `unsafe-libyaml 0.2.11`, repository archived 2024-03-25, `Solution: No safe upgrade is available!`. Its only parent is `serde_yaml 0.9.34+deprecated`, a direct dependency of `envoy-bin`, `envoy-config`, `envoy-admin`, `envoy-listener`, `envoy-filter` and `differential` — i.e. the PRODUCTION config parser.
+
+**Options considered.**
+1. For `rustls`: `cargo update -p rustls` (the `RUSTSEC-2026-0190` / `-0285` precedent, `0cb1f67`) versus an ignore. A patched release exists, so an ignore is not justifiable.
+2. For `unsafe-libyaml`: (a) replace `serde_yaml` with a safe-Rust YAML stack (`serde-saphyr`, `noyalib`); (b) an `[advisories].ignore` entry; (c) leave CI red.
+   - (a) changes the parser of every config the project loads. YAML 1.1 scalar semantics (booleans, octal, float rendering) are load-bearing across ~100 differential fixtures and the `BEHAVIOR_CONTRACT.md`, and `serde_yaml` is named as a permitted foundation in doctrine D-3.2. That is its own phase with its own differential re-baselining, not a gate-session side effect (§6.3; `ADR-0165`).
+   - (c) violates D-3.6 for every subsequent push.
+
+**Decision.**
+1. `cargo update -p rustls` → `0.23.46`. It moves ONLY `rustls` (`Cargo.lock` `2 2`); `rustls-webpki` `0.103.15`, `aws-lc-rs` `1.18.1` and `aws-lc-sys` `0.45.0` are unchanged.
+2. Add ONE scoped `deny.toml` `[advisories].ignore` entry for `RUSTSEC-2024-0449`, annotated with the `serde_yaml` path, the informational (`unmaintained`, no vulnerability) nature of the advisory and this ADR number. No other ignore is added or widened.
+3. Both land as ONE separate `deps:` maintenance commit (`Cargo.lock`, `deny.toml`, this ADR) BEFORE the phase-116 state-4 advance, so the gate is graded on the post-fix tree.
+
+**Rationale.** The `rustls` advisories are real, fixable and patched in a semver-compatible release — the same remedy as the two prior drift events. The `unsafe-libyaml` advisory reports no vulnerability, only that the crate will receive no further fixes; the advisory itself recommends migrating `serde_yaml` users to a different YAML stack, which is exactly the doctrine-level change (D-3.2's named foundation) that a verification gate must not make.
+
+**Consequences.**
+- `cargo deny check` reads `advisories ok, bans ok, licenses ok, sources ok` (exit 0) on the post-fix tree; the five `license-not-encountered` warnings are pre-existing.
+- The phase-116 SPEC's PV-8 claim that `Cargo.lock` is untouched by the phase's own commits still holds for the six task commits; this `deps:` commit is out-of-phase maintenance and is recorded as such in `PROGRESS.md`.
+- **A future phase should evaluate replacing `serde_yaml`/`unsafe-libyaml`** with a maintained safe-Rust YAML parser under the D-3.2 / D-3.7 re-baselining discipline; when it lands it supersedes this ADR and removes the `RUSTSEC-2024-0449` ignore.
+
+---
+
 ## ADR-0206: Phase-116 §5 state-2 PLAN-write — **`PLAN.md` written as 6 TDD tasks; the §6.1 split gate is MEASURED at 978 net LoC and DOES NOT FIRE.** The health-check bit reaches `should_log` as a sixth argument computed by ONE shared predicate, `envoy_filter::health_check::answered_by_health_check`, which both HCMs' `downstream_rq_Nxx` exclusion is rewired to as well. **CORRECTS THREE LANDED `SPEC.md` CLAIMS** — the most consequential being that the SPEC's prescribed derive would LOAD `not_health_check_filter: []`, which upstream rejects; the others are the production `should_log` site count (five, not two) and the size estimate, which the SPEC's own calibration paragraph predicted to be low.
 
 - **Date:** 2026-10-07

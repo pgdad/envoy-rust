@@ -30,6 +30,12 @@ ignore = [
     # ENVOY_RUST_URING=1 opt-in) → fxhash 0.2.1. Upstream monoio pins this
     # fxhash version; "no safe upgrade is available". See ADR-0005.
     { id = "RUSTSEC-2025-0057", reason = "monoio's io_uring prototype (optional `uring` feature, off by default) pins fxhash; no safe upgrade; tracked via ADR-0005" },
+    # RUSTSEC-2024-0449 — unsafe-libyaml unmaintained (repository archived
+    # 2024-03-25; an INFORMATIONAL `unmaintained` advisory, no known
+    # vulnerability). Path: serde_yaml 0.9 (a D-3.2 permitted foundation) →
+    # unsafe-libyaml 0.2.11, in production config parsing. "No safe upgrade
+    # is available"; replacing serde_yaml is its own phase. See ADR-0207.
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml (D-3.2 permitted foundation) pins unsafe-libyaml; unmaintained, no vulnerability, no safe upgrade; tracked via ADR-0207" },
 ]
 
 [licenses]
