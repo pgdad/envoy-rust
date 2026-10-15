@@ -396,3 +396,304 @@ authoritative.
   censused at this state.
 - **No §5 state was chained.** The next unit is the §5 STATE-4 VERIFICATION
   GATE, a separate session (§5.1; `ADR-0127`).
+
+---
+
+# §5 STATE 4 — the §7.5 verification gate
+
+**Two commits: a `deps:` maintenance commit, then this state-advance commit.**
+The state-3 CI record (`6ceae47`) closed the previous chain, so this session
+entered owing no CI record — detected STRUCTURALLY by reading `STATE.md`'s
+`## Last commit` block, which already carries a CI-confirmed line below its
+PENDING line (run `38057389166`, attempt 1, `success`,
+`binaries=175 passed=2374 failed=0` on `79dfbde`). At entry `git status
+--porcelain` was empty and `HEAD` = `origin/main` =
+`6ceae47cbc04b6e05183a37816623ee0ecd6b33f`, a docs-only commit on top of the
+state-3 code tree `d7aeabe`. `git check-ignore next-prompt.txt` exit 0, run
+standalone. `CARGO_TARGET_DIR` unset (the default absolute `target/`).
+
+**ONE ADR fired: `ADR-0207`** — because §7.5 leg (e) was RED at entry (below).
+`ROADMAP.md` was NOT touched — row `116` stays `planned` until the state-6
+close-out. **No phase code, test or fixture changed** (§6.3; `ADR-0165`) and no
+carry-forward was consumed.
+
+⚠ **§7.5 leg (f) — `REVIEW.md` is approved — is OUT OF SCOPE and is adjudicated
+as such, not as a pass.** It is state 5's product; `116/REVIEW.md` does not
+exist, which is the correct state at the end of a state-4 gate.
+
+## Stop condition — all three legs re-measured from disk, all three FALSE
+
+```
+LEG (i)   rows=124  done=123  planned=1     SUM 124==124
+          not-done: row 116 at ROADMAP.md line 198
+          field-count histogram on ' | ': {6: 122, 7: 1, 10: 1}
+LEG (ii)  crates=14   tracked manifests=28 (git ls-files '*Cargo.toml')
+          envoy-http3/grpc/wasm/protos/runtime/xds: all six absent by test -d
+          quinn=0 wasmtime=0 tonic=0 opentelemetry=0 prost=0  of 28
+          POSITIVE CONTROL, identical invocation: tokio=19 of 28
+          histogram over crates/ = 0 ; gauge = 365 by `grep -ro 'gauge' crates/ | wc -l`
+LEG (iii) headings=11  slices=11/5/3/14/3/4/6/32/6/0/13  pre-heading=27
+          SUM=124   zero-row family: ['### WASM host family']
+```
+
+`ls stop` → `No such file or directory`. **No `stop` file was created.**
+
+## Leg (e) was RED at entry — `cargo deny check` on advisory-DB drift
+
+The first gate pass, on the UNMODIFIED entry tree `6ceae47`, read:
+
+```
+cargo build  --workspace --all-targets                       exit 0
+cargo clippy --workspace --all-targets --all-features
+             -- -D warnings                                  exit 0
+cargo fmt    --all -- --check                                exit 0
+cargo deny   check                                           exit 1
+  error[vulnerability]: `Debug` impls for client session values expose TLS secrets      RUSTSEC-2026-0346  rustls 0.23.45
+  error[vulnerability]: Buffered application data sent to outer server after ECH rejection  RUSTSEC-2026-0347  rustls 0.23.45
+  error[vulnerability]: Brotli certificate decompression can allocate up to 1 GiB before authentication  RUSTSEC-2026-0348  rustls 0.23.45
+  error[vulnerability]: Unauthenticated ServerHello can downgrade later connections to classical key exchange  RUSTSEC-2026-0349  rustls 0.23.45
+  error[unmaintained]: unsafe-libyaml is unmaintained                                     RUSTSEC-2024-0449  unsafe-libyaml 0.2.11
+  advisories FAILED, bans ok, licenses ok, sources ok
+```
+
+`Cargo.lock` is byte-identical between `79dfbde` (CI recorded `advisories ok`
+for run `38057389166`) and `6ceae47`; the RustSec database moved, not the tree.
+The four `rustls` entries each say `Solution: Upgrade to >=0.23.46`;
+`unsafe-libyaml` says `No safe upgrade is available!` and is reached ONLY through
+`serde_yaml 0.9.34+deprecated`, a direct dependency of `envoy-bin`,
+`envoy-config`, `envoy-admin`, `envoy-listener`, `envoy-filter` and
+`differential` — the PRODUCTION config parser, and a D-3.2 permitted foundation.
+
+The same first pass ran the whole workspace suite on `6ceae47` (pre-fix):
+`binaries 175, ok 170, FAILED 5, passed 2369 + failed 5 = 2374` — exactly the
+five Family-A host signatures below; fixture `0099` `ok`.
+
+**The remedy — `6b9b481` `deps: bump rustls 0.23.45 -> 0.23.46 …
+[ADR-0207]`** (the `RUSTSEC-2026-0190` / `-0285` precedent, `0cb1f67`):
+
+- `cargo update -p rustls` → `Updating rustls v0.23.45 -> v0.23.46`;
+  `Cargo.lock` numstat `2 2` — `rustls-webpki 0.103.15`, `aws-lc-rs 1.18.1`
+  and `aws-lc-sys 0.45.0` unchanged. Run with `pgrep -x cargo` = 0 (no sweep
+  holding the lock).
+- ONE scoped `deny.toml` `[advisories].ignore` entry for `RUSTSEC-2024-0449`
+  (`6 0`), annotated with the path and `ADR-0207`. Replacing `serde_yaml` is a
+  doctrine-level, fixture-re-baselining change and is its own phase.
+- `ADR-0207` in `DECISIONS.md` (`32 0`), placed newest-first above `ADR-0206`.
+- Verified BEFORE committing: `cargo deny check` exit 0; build, clippy, fmt
+  exit 0; `envoy-tls` + `envoy-tcp` tests 38 passed 0 failed; the TLS
+  differential fixtures against real Envoy:
+
+```
+tls_downstream: test result: ok. 1 passed; 0 failed
+tls_upstream:   test result: ok. 1 passed; 0 failed
+tls_sni:        test result: ok. 1 passed; 0 failed
+tls_alpn:       test result: ok. 2 passed; 0 failed
+```
+
+PV-8 is therefore re-read precisely: the phase's OWN six task commits leave
+`Cargo.toml`, `Cargo.lock`, `.github` and `tests/differential/src/lib.rs`
+untouched (`git diff --numstat 6cd69df d7aeabe -- <those>` EMPTY); the only
+`Cargo.lock` change since is the out-of-phase `deps:` commit (`2 2`), plus
+`deny.toml` `6 0`.
+
+## Leg (e) — the five `cargo` commands, GRADED on the post-fix tree `6b9b481`
+
+⚠ **An exit-0 `build`/`clippy` on a warm cache is not evidence.** Before each
+of the two, all **22** tracked crate roots (list driven from `git ls-files`,
+never a glob — `touch` CREATES files) were given an **mtime-only `touch -m`**.
+`git status --porcelain` read EMPTY after the whole run.
+
+```
+cargo build  --workspace --all-targets                 exit 0   22 Compiling   Finished in 11.78s
+cargo clippy --workspace --all-targets --all-features
+             -- -D warnings                            exit 0   22 Checking    Finished in 2.41s
+             warning/error lines in build + clippy logs: 0 / 0
+cargo fmt    --all -- --check                          exit 0   (0 bytes of output)
+cargo deny   check                                     exit 0
+             advisories ok, bans ok, licenses ok, sources ok
+```
+
+(`cargo deny` also prints its five pre-existing `license-not-encountered`
+WARNINGS for unmatched allowances in `deny.toml`; they predate this phase.)
+
+**Clippy NEGATIVE CONTROL** (a 2.41 s pass is incremental reuse, so it was
+proved to lint): a four-line `pub fn clippy_negative_control_probe() -> bool {
+let v = vec![1u8]; v.len() == 0 }` appended to
+`crates/envoy-accesslog/src/filter.rs`, same clippy command:
+
+```
+    Checking envoy-accesslog v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-accesslog)
+error: length comparison to zero
+error: useless use of `vec!`
+error: could not compile `envoy-accesslog` (lib) due to 2 previous errors
+```
+
+Restored with `git checkout --`, **md5-verified** (`RESTORED-md5-ok`, `git
+status --porcelain` empty), clippy re-run exit 0.
+
+## Legs (a) and (b) — the differential corpus, on `6b9b481`
+
+The harness runs the DEBUG `envoy-bin` (md5 `938e23ab4a1c8afc547dff857ac030b2`
+after the build). Redirected to a file (never through `tail`), ANSI-stripped and
+censused by regex `test result: (ok|FAILED)\. (\d+) passed; (\d+) failed`, `ok`
+and `FAILED` rows counted separately:
+
+```
+$ cargo test --workspace --no-fail-fast        (exit 101, real 6m41.873s)
+log bytes 265721   test-result rows 175   ok 169   FAILED 6
+passed 2368   failed 6   passed + failed = 2374   Running + Doc-tests lines 175 (16 Doc-tests)
+```
+
+**`binaries = 175` and `passed + failed = 2374` reproduce EXACTLY** — the
+state-3 local run, `PLAN.md`'s prediction and the CI identity on `79dfbde`
+(`binaries=175 passed=2374 failed=0`). The `rustls` bump moved no test count.
+
+### Leg (a) — fixture `0099`, this phase's witness
+
+```
+     Running tests/accesslog_not_health_check_filter.rs (target/debug/deps/accesslog_not_health_check_filter-90eadcd4247be2a5)
+test accesslog_not_health_check_filter ... ok
+```
+
+GREEN against both real proxies (also GREEN in the pre-fix pass). Its two
+configs differ in exactly the four lines the fixture README documents (upstream's `admin:` block, the `0.0.0.0` vs `127.0.0.1` bind,
+upstream's `generate_request_id: false`, and the per-proxy log path); the
+`filter:` block is byte-identical.
+
+### Leg (b) — the other fixtures, and the six local reds
+
+From the `---- <name> stdout ----` markers:
+
+```
+access_log_h2_rcd_upstream_reset
+access_log_h2_uc_upstream_reset
+access_log_rcd_upstream_reset
+access_log_rf_upstream_reset
+admin_config_dump_server_info
+xds_file_based_lds_fixture
+```
+
+**Classified by ISOLATION on this tree, each alone with a 20 s settle gap:**
+
+```
+access_log_h2_rcd_upstream_reset | test result: FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset  | test result: FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset    | test result: FAILED. 0 passed; 1 failed   envoy rcd "…immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:…"
+access_log_rf_upstream_reset     | test result: FAILED. 0 passed; 1 failed   envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"
+admin_config_dump_server_info    | test result: FAILED. 0 passed; 1 failed   admin body rule: /clusters
+xds_file_based_lds_fixture       | test result: ok. 1 passed; 0 failed   (twice, 2 of 2)
+```
+
+- **Family A (five, fail ALONE, deterministic host signatures)** — exactly the
+  five state 3 and the PLAN-write recorded, with the same signatures: upstream
+  Envoy's IPv6 upstream address is `Network is unreachable` on this host
+  (`UF`), and the `/clusters` admin rule depends on the Docker-bridge backend.
+  They also failed in the PRE-fix pass on `6ceae47`, so the `rustls` bump did
+  not cause them; CI on native Linux reported `failed=0` for them at `79dfbde`.
+- **Family B (one, passes ALONE 2 of 2)** — `xds_file_based_lds_fixture`
+  panicked on the REFERENCE side: `fixture passes: upstream Envoy never became
+  accept-ready … 127.0.0.1:55614 not accept-ready within 10s: Connection
+  refused (os error 111)`. No envoy-rust code is on that path; it is the
+  parallel-load readiness-race family. State 3's two Family-B members
+  (`admin_drain_listeners`, `v4e_empty_envelope_…`) passed in this run — the
+  member set varies run-to-run, as expected of a load race.
+
+No control worktree was built: Family A is reproduced by the pre-fix run on
+`6ceae47` and by every prior record; Family B passes alone. CI is
+authoritative.
+
+## Leg (c) — conformance
+
+**The local h2spec gate self-skips and is worth nothing here.** `which h2spec`
+exit 1, `tools/` does not exist, so `h2spec_pass_rate_gate ... ok` is the
+vacuous `h2spec not found` early-return. **Leg (c) is CI-AUTHORITATIVE**: CI
+installs the pinned h2spec 2.6.0, and the positive control is `h2spec not found`
+= 0 in the ANSI-stripped CI job log — recorded for `79dfbde` at state 3 and
+re-checked on this advance's own push by the follow-up CI record.
+`known-failures.txt` was NOT touched.
+
+## Leg (d) — fuzzing
+
+**Phase 116 added NO fuzz target** — verified: `git diff --name-status
+6cd69df..HEAD -- '*fuzz*'` is EMPTY. All five pre-existing targets were run at
+the CI contract (`cargo +nightly fuzz run <target> -- -max_total_time=30`, from
+the CRATE directory; `cargo-fuzz 0.13.2`), with the seed-corpus line asserted:
+
+```
+parse_bootstrap        | exit 0 | seed corpus: files: 15759 | Done 122403 runs in 100 second(s)   | crash lines 0
+jwt_parse              | exit 0 | seed corpus: files: 10921 | Done 9080209 runs in 31 second(s)   | crash lines 0
+cdn_loop_parse         | exit 0 | seed corpus: files: 1904  | Done 10346434 runs in 31 second(s)  | crash lines 0
+accesslog_format_parse | exit 0 | seed corpus: files: 4495  | Done 6458006 runs in 31 second(s)   | crash lines 0
+grpc_health_decode     | exit 0 | seed corpus: files: 278   | Done 39440354 runs in 31 second(s)  | crash lines 0
+```
+
+`parse_bootstrap` covers this phase's new config surface (the
+`not_health_check_filter` arm and its hand-rolled map-only `Deserialize`). Its
+100 s wall time is the 30 s budget plus the initial pass over a 15759-file
+local corpus. Corpus sizes are LOCAL, mostly gitignored; the TRACKED seed counts
+are **67 / 3 / 0 / 11 / 1** — `cdn_loop_parse` still has **0** tracked seeds
+(`CF-75-5`, open). `git status --porcelain` empty afterwards.
+
+## The SPEC's deliverables, checked on disk
+
+1. `pub fn answered_by_health_check(details: Option<&str>) -> bool` —
+   `crates/envoy-filter/src/health_check.rs:44`; BOTH HCMs call it twice (the
+   `downstream_rq_Nxx` exclusion and the `should_log` argument):
+   `envoy-http1/src/hcm.rs:1553,1614`, `envoy-http2/src/hcm.rs:1132,1244`.
+2. `LogFilter::NotHealthCheck` — `crates/envoy-accesslog/src/filter.rs:113`,
+   evaluated as `LogFilter::NotHealthCheck => !is_health_check` (`:209`).
+3. `AccessLogFilter.not_health_check_filter: Option<NotHealthCheckFilter>` and
+   `pub struct NotHealthCheckFilter {}` — `crates/envoy-config/src/bootstrap.rs:764,772`.
+4. Fixture `0099` GREEN above.
+5. `BEHAVIOR_CONTRACT.md` carries exactly one `### Phase 116 (ADR-0205/0206)`
+   section.
+
+## Doctrine checks
+
+```
+#![forbid(unsafe_code)] in all 14 crates/*/src/{lib,main}.rs: 14 present, 0 missing
+over `git diff -U0 6cd69df..HEAD -- crates tests`, added lines:
+  #[allow( 0   #[expect( 0   unsafe 0   #[ignore 0   todo! 0   unimplemented! 0   dbg! 0
+  POSITIVE CONTROL, same probe: #[test] 11 + #[tokio::test 3 = 14   (= PLAN.md's 14 new tests)
+```
+
+## Size, re-measured
+
+```
+git diff --shortstat 6cd69df d7aeabe -- . ':(exclude)docs/'
+  12 files changed, 1154 insertions(+), 176 deletions(-)   NET 978   (1.000x the MEASURED 978)
+```
+
+Identical to state 3. (Measured to `HEAD` instead, the out-of-phase `deps:`
+commit adds `Cargo.lock` `2 2` and `deny.toml` `6 0`; it is not phase code.)
+
+## CI on the `deps:` commit `6b9b481`
+
+Run `38713344450`, attempt 1: `fuzz` job `success` (13 steps); `build + test +
+lint` job `failure` (15 steps — a real runner, not starvation) at the `test`
+step, on ONE test: `happy_path_rds_listener_serves_and_reports`
+(`crates/envoy-bin/tests/xds_file_based_rds.rs:260`) — `envoy-bin admin ready:
+Os { code: 111, kind: ConnectionRefused … }`, `test result: FAILED. 7 passed; 1
+failed`. Classified BEFORE re-running: `git diff --stat 6ceae47 6b9b481 --
+crates tests .github` is EMPTY (the commit moves only `rustls`, which no admin
+listener touches), the signature is the `CF-75-6` `reserve_port()` startup-race
+family, and the binary passes ALONE locally 2 of 2 (`8 passed; 0 failed`).
+`gh run rerun 38713344450 --failed` was issued and **attempt 2 is `success`**
+(`build + test + lint` job `116356649016`, 15 steps; `fuzz` 13 steps). From the
+ANSI-stripped log (737,881 raw → 705,740 stripped bytes), by regex: **175**
+`test result` rows, **175** `ok`, **0** `FAILED` — **`binaries=175 passed=2374
+failed=0`, the identity UNMOVED by the `rustls` bump**; `advisories ok`, `bans
+ok`, `licenses ok`, `sources ok` (1 each); **`h2spec not found` = 0** against 29
+`h2spec` mentions (leg (c)'s positive control); `accesslog_not_health_check_filter
+... ok` present; `rustls v0.23.46` compiled.
+
+## What this session did NOT do
+
+- **No phase code, test or fixture changed.** The one clippy negative-control
+  mutation was restored and md5-verified before anything else ran.
+- **`ROADMAP.md` untouched**; row `116` remains `planned`.
+- **ONE ADR (`ADR-0207`), for the advisory remedy only**; no carry-forward
+  consumed, nothing fixed — `CF-116-1` … `-3`, `CF-115-1`, `-2`, `-4` … `-16`,
+  the phase-115 Minors, `CF-75-5` and the phase-112 ALPN rider stay banked.
+- **`known-failures.txt` untouched.** No subagent dispatched. No §5 state
+  chained: the next unit is the §5 STATE-5 CODE REVIEW, a separate session.
